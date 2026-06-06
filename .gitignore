@@ -14,8 +14,10 @@ models/*.task
 models/*.pt
 *.pt
 
-# Scanner output — local only
+# Scanner output and test sets — local only (may contain biometric copies)
 photo_matches/
+test_photo_matches/
+test_photos/
 matches/
 output/
 

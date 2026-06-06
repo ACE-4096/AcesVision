@@ -157,8 +157,149 @@ between recognitions per feed), `FACE_ID_RECENCY` (seconds), `FACE_ID_CELL`
 > ESP32-CAMs are low-res and grainy — use `FACE_ID_ENGINE=dlib` for the network
 > feeds; LBPH struggles with that image quality.
 
+---
+
+## Use Case A: scan your phone photo library for your face
+
+`scan_photos.py` scans any folder (recursively) and finds every image
+containing your enrolled face.  No cloud, no upload, runs entirely on CPU.
+
+### Install the extra dep (HEIC/HEIF for iPhone photos)
+
+```bash
+source .venv/bin/activate
+pip install pillow-heif          # already in requirements.txt
+```
+
+### Run it
+
+```bash
+source .venv/bin/activate
+
+# Scan a folder and symlink matches to ./photo_matches/matches/
+python scan_photos.py --source /path/to/DCIM
+
+# Stricter match + hard-copy + 8 parallel workers
+python scan_photos.py --source /path/to/DCIM --tolerance 0.50 --jobs 8 --copy
+
+# Custom output directory
+python scan_photos.py --source /path/to/DCIM --output ~/Desktop/my_photos
+```
+
+Flags:
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--source <dir>` | auto-detect GVFS | Directory to scan (recurse). Omit to try auto-detecting a phone mount. |
+| `--output <dir>` | `./photo_matches` | Where to write manifest + matches/ |
+| `--tolerance <float>` | `0.6` | dlib distance — **lower = stricter**. 0.5 tight/precise, 0.6 relaxed/high recall |
+| `--jobs <N>` | half CPU count | Parallel encoding workers |
+| `--copy` | (symlink) | Hard-copy matched images instead of symlinking |
+
+Output:
+- `<output>/manifest.json` — list of all scanned images with `{path, matched, best_distance, num_faces}`
+- `<output>/matches/` — symlinks (or copies) of every matched image
+
+---
+
+## Mounting your phone over USB
+
+The scanner only needs a mounted folder passed to `--source`.  The steps below
+produce that mount point.
+
+### iPhone (HEIC photos)
+
+**Option A — ifuse / libimobiledevice (recommended for scripting)**
+
+```bash
+# Install once
+sudo apt install libimobiledevice-utils ifuse
+
+# Pair the phone (trust prompt appears on screen)
+idevicepair pair
+
+# Mount
+mkdir -p ~/iphone-dcim
+ifuse ~/iphone-dcim
+
+# Scan
+python scan_photos.py --source ~/iphone-dcim/DCIM
+
+# Unmount when done
+fusermount -u ~/iphone-dcim
+```
+
+**Option B — GVFS / Nautilus auto-mount (plug-and-go)**
+
+1. Plug in the iPhone via USB.
+2. Unlock the phone and tap "Trust" when prompted.
+3. Nautilus mounts it automatically under:
+
+   ```
+   /run/user/<uid>/gvfs/afc:host=<uuid>/
+   ```
+
+   Find the exact path:
+   ```bash
+   ls /run/user/$(id -u)/gvfs/
+   # look for afc:host=... entry, then:
+   ls "/run/user/$(id -u)/gvfs/afc:host=.../DCIM"
+   ```
+
+4. Run the scanner:
+   ```bash
+   python scan_photos.py --source "/run/user/$(id -u)/gvfs/afc:host=.../DCIM"
+   ```
+
+   Or just omit `--source` and the scanner will try to auto-detect it:
+   ```bash
+   python scan_photos.py
+   ```
+
+Note: iPhone photos are in **HEIC format** — `pillow-heif` handles them
+transparently.  JPEG/PNG (AirDropped or Screenshots) also work.
+
+### Android (JPEG / mixed)
+
+Android phones mount via **MTP** and are exposed by GVFS:
+
+```
+/run/user/<uid>/gvfs/mtp:host=<model>/
+```
+
+Find your device:
+```bash
+ls /run/user/$(id -u)/gvfs/
+```
+
+Then scan:
+```bash
+python scan_photos.py --source "/run/user/$(id -u)/gvfs/mtp:host=.../Internal storage/DCIM"
+```
+
+Android photos are usually JPEG, so pillow-heif is not strictly needed, but
+having it installed causes no harm.
+
+### KDE Connect (wireless, no cable)
+
+1. Install KDE Connect on both Linux and the phone.
+2. Open the phone's DCIM in **Files → Remote Devices** on the phone side, or
+   use the KDE Connect CLI to request the browse session.
+3. The phone will appear under `~/.local/share/kdeconnect/` (SFTP mount) or
+   under `/run/user/<uid>/gvfs/` after the SFTP plugin activates.
+4. Pass that path to `--source`.
+
+---
+
 ## Notes
 
 - A child's face changes fast — re-enrol every few months.
 - Everything runs locally; no images leave the machine.
 - `cv2.face` requires **opencv-contrib-python**, not plain `opencv-python`.
+- Biometric data (`known_faces/`) is gitignored — it never leaves this machine
+  and is not committed to the repository.  If you lose it, re-run `enroll.py`.
+- Model binaries (`models/`) are also gitignored.  Re-download with:
+  ```bash
+  curl -sL -o models/face_detection_yunet.onnx \
+    https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx
+  ```
