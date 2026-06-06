@@ -399,11 +399,13 @@ Examples:
     parser.add_argument(
         "--tolerance",
         type=float,
-        default=0.6,
+        default=0.50,
         help=(
             "dlib distance threshold — lower = stricter match. "
-            "0.6 is the dlib default (good recall); 0.5 is tight (high precision). "
-            "Default: 0.6"
+            "0.50 is calibrated against 2500 LFW impostors with the YuNet-first "
+            "pipeline: FAR=0%%, Recall=100%% (genuine max=0.452, impostor min=0.500). "
+            "Do not raise above 0.50 without re-calibrating — 0.60 accepts ~8%% of "
+            "strangers. See calibrate_threshold.py. Default: 0.50"
         ),
     )
     parser.add_argument(

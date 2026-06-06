@@ -74,8 +74,12 @@ def _yunet_locate(yn, arr_rgb):
 def _load_known_encodings(face_recognition):
     """Return (encodings, names) for every enrolled photo. Cached.
 
-    HOG first (fast, frontal); fall back to YuNet (~40ms, angle-robust) for
-    awkward poses, e.g. enrolled off an ESP32. No slow CNN path.
+    DETECTOR ORDER: YuNet first (angle-robust, ~40ms), HOG fallback.
+    This MUST match the detection order used in scan_photos._encode_image
+    and calibrate_threshold._encode_impostor so that enrolled embeddings
+    and query embeddings are produced from comparable bounding boxes.
+    Mixing HOG-enrolled vs YuNet-queried embeddings adds ~0.13 to genuine
+    distances and collapses the separation gap — ticket a3c3c709.
     """
     global _KNOWN_CACHE
     if _KNOWN_CACHE is not None:
@@ -88,9 +92,10 @@ def _load_known_encodings(face_recognition):
             if img.suffix.lower() not in IMG_EXT:
                 continue
             arr = face_recognition.load_image_file(str(img))
-            locs = face_recognition.face_locations(arr, model="hog")
+            # YuNet first — same order as scan_photos._encode_image query path
+            locs = _yunet_locate(yn, arr)
             if not locs:
-                locs = _yunet_locate(yn, arr)
+                locs = face_recognition.face_locations(arr, model="hog")
             if not locs:
                 print(f"[warn] no face in {img}, skipping")
                 continue
@@ -120,7 +125,11 @@ def _build_yunet():
             f"YuNet model missing at {YUNET_PATH}.\nDownload it:\n  curl -sL -o "
             f"{YUNET_PATH} https://github.com/opencv/opencv_zoo/raw/main/models/"
             "face_detection_yunet/face_detection_yunet_2023mar.onnx")
-    tol = float(os.environ.get("FACE_ID_TOLERANCE", "0.6"))
+    # 0.50: calibrated safe value (ticket a3c3c709, 2026-06-06).
+    # YuNet-first pipeline: genuine max=0.452, impostor min=0.500 (n=2500 LFW).
+    # Clean gap [0.452, 0.500]. FAR=0%/Recall=100% at 0.50.
+    # Prior default 0.60 accepted ~8.2% of strangers — do not restore.
+    tol = float(os.environ.get("FACE_ID_TOLERANCE", "0.50"))
     score = float(os.environ.get("FACE_ID_YUNET_SCORE", "0.6"))
     yn = cv2.FaceDetectorYN.create(str(YUNET_PATH), "", (320, 320), score, 0.3, 5000)
     encs, names = _load_known_encodings(face_recognition)
@@ -151,7 +160,8 @@ def _build_yunet():
 
 def _build_dlib(scale=None, model=None):
     import face_recognition
-    tol = float(os.environ.get("FACE_ID_TOLERANCE", "0.6"))
+    # 0.50: calibrated safe value — see _build_yunet comment + ticket a3c3c709.
+    tol = float(os.environ.get("FACE_ID_TOLERANCE", "0.50"))
     # 'hog' = fast, frontal-only. 'cnn' = slow (CPU) but handles odd angles,
     # caps, and uneven lighting — worth it for awkwardly-mounted room cameras.
     model = model or os.environ.get("FACE_ID_MODEL", "hog")
