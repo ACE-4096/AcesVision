@@ -1,0 +1,41 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Biometric data — NEVER commit enrolled face images
+known_faces/*/
+!known_faces/.gitkeep
+
+# Large model binaries — download steps in README
+models/*.onnx
+models/*.task
+models/*.pt
+*.pt
+
+# Scanner output — local only
+photo_matches/
+matches/
+output/
+
+# Local databases — runtime state
+*.db
+*.sqlite
+*.sqlite3
+
+# WiFi + other secrets
+esp32cam/CameraWebServer/secrets.h
+
+# Local configs with real paths/passwords (examples are committed)
+automations.json
+cameras.json
+
+# ESP32 compiled firmware (large binaries, reproducible from source)
+esp32cam/build/
+esp32cam/CameraWebServer/build/
+
+# macOS / IDE
+.DS_Store
+.idea/
+*.swp

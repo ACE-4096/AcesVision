@@ -1,0 +1,5 @@
+[
+  { "name": "Webcam", "index": 9 },
+  { "name": "Lounge", "url": "http://192.168.68.50:81/stream" },
+  { "name": "Door",   "url": "http://192.168.68.51:81/stream" }
+]

@@ -1,0 +1,29 @@
+[
+  {
+    "_comment": "PRESENCE: someone is recognised entering / leaving a room",
+    "event": "enter", "person": "Toby", "room": "Office",
+    "command": "notify-send 'Office' '{person} arrived at {time}'"
+  },
+  {
+    "event": "enter", "person": "*", "room": "Office",
+    "webhook": { "url": "http://homeassistant.local:8123/api/webhook/office_lights_on", "method": "POST" }
+  },
+  {
+    "event": "leave", "room": "Office",
+    "webhook": { "url": "http://homeassistant.local:8123/api/webhook/office_lights_off", "method": "POST" }
+  },
+
+  {
+    "_comment": "GESTURES: do the hand sign in front of any camera. {gesture} {person} {room} are substituted.",
+    "event": "gesture", "gesture": "Thumb_Up", "room": "Office",
+    "webhook": { "url": "http://homeassistant.local:8123/api/webhook/toggle_lights", "method": "POST" }
+  },
+  {
+    "event": "gesture", "gesture": "Open_Palm",
+    "command": "echo '{person} waved {gesture} in the {room} at {time}'"
+  },
+  {
+    "event": "gesture", "gesture": "Victory", "person": "Toby",
+    "command": "notify-send 'Gesture' 'Peace sign by {person} in {room}'"
+  }
+]
