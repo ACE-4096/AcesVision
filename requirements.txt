@@ -12,3 +12,35 @@ setuptools<81                 # face_recognition_models imports pkg_resources, r
 
 # HEIC/HEIF support for iPhone photos (scan_photos.py — ticket fc99f189)
 pillow-heif>=1.3.0
+
+# =============================================================================
+# Use Case B: video tracker + Gradio UI (track_video.py + app_track.py)
+# =============================================================================
+# These require the ROCm venv on the secondary drive (disk-full constraint):
+#
+#   VENV=/media/ace4096/3533a241-7f05-4541-99b3-e1b78ed866f8/venvs/face-id-rocm
+#
+# The ROCm venv was created there because the root filesystem is at capacity
+# and the ROCm torch wheel (~2GB) cannot fit in face-id/.venv.
+#
+# ROCm venv contents (installed 2026-06-07):
+#   torch==2.7.0+rocm6.3      (AMD RX 6600, HSA_OVERRIDE_GFX_VERSION=10.3.0)
+#   torchvision==0.22.0+rocm6.3
+#   ultralytics==8.4.60       (YOLOv8 + ByteTrack/BoTSORT)
+#   face_recognition==1.3.0   (dlib CPU encoding — no ROCm dlib)
+#   opencv-python-headless==4.13.0.92
+#   gradio==6.16.0
+#
+# Launch command (Use Case B Gradio UI):
+#   HSA_OVERRIDE_GFX_VERSION=10.3.0 \
+#     /media/ace4096/3533a241-7f05-4541-99b3-e1b78ed866f8/venvs/face-id-rocm/bin/python \
+#     app_track.py
+#
+# CLI tracker (no UI):
+#   HSA_OVERRIDE_GFX_VERSION=10.3.0 \
+#     /media/ace4096/3533a241-7f05-4541-99b3-e1b78ed866f8/venvs/face-id-rocm/bin/python \
+#     track_video.py <video.mp4> --annotated <out.mp4>
+#
+# Rollback snapshot (pre-ROCm swap, face-id .venv):
+#   torch==2.12.0+cu130, torchvision==0.27.0+cu130, ultralytics==8.4.58
+# =============================================================================
