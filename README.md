@@ -159,6 +159,83 @@ between recognitions per feed), `FACE_ID_RECENCY` (seconds), `FACE_ID_CELL`
 
 ---
 
+## Person-in-view alerter (`watch_person.py`)
+
+**The ask:** alert me whenever a person comes into view on a camera — using the
+DroidCam phone feed (`192.168.1.187`) and the Reolink security cameras — and tap
+the existing face recognition to say *who* it is.
+
+**How it works.** Detection is YOLOv8's `person` class, **not** the face engine —
+so it fires for strangers and backs of heads too (the `presence.py` path only
+reacts to *recognised enrolled* faces). On a debounced new arrival it runs the
+calibrated YuNet/dlib engine to label who (or "Unknown") and sends an alert via
+**desktop `notify-send` and/or Telegram** (with an annotated snapshot), tagged
+with which camera saw them. One thread per camera, each auto-reconnecting.
+
+```bash
+./watch.sh                                   # all cams in watch_cameras.json, else DroidCam
+./watch.sh --source 0                        # one local webcam
+./watch.sh --source http://192.168.1.187:4747/video
+./watch.sh --cameras watch_cameras.example.json
+WATCH_ALERT=desktop ./watch.sh               # pop-ups only (no Telegram)
+```
+
+### ⚠️ Runtime: it needs a torch-capable venv (two-venv split)
+
+`face-id/.venv` has working dlib/face_recognition but its **torch is broken**, so
+YOLO can't run there. `watch.sh` therefore runs the watcher under the
+**`cv-worker/.venv`** (working torch + ultralytics, AMD ROCm GPU) and shells out
+to `face-id/.venv` for the recognition step (`recognize_snapshot.py`). The
+launcher wires both automatically; override with `CV_WORKER_PYTHON` /
+`FACE_ID_PYTHON` if either venv moves. (The old ROCm venv on the external drive
+is gone — `cv-worker/.venv` is the live torch env.)
+
+### Cameras (`watch_cameras.json`)
+
+`cp watch_cameras.example.json watch_cameras.json` then edit. **This file holds
+camera passwords and is gitignored.** Each entry is one of:
+
+```json
+[
+  { "name": "DroidCam",   "url": "http://192.168.1.187:4747/video" },
+  { "name": "Front Door", "type": "reolink", "ip": "192.168.1.50",
+                          "user": "admin", "password": "secret",
+                          "stream": "sub", "channel": 1 },
+  { "name": "Lounge",     "url": "rtsp://user:pass@192.168.1.52:554/h264Preview_01_sub" },
+  { "name": "Webcam",     "index": 0 }
+]
+```
+
+- **Reolink** (`reolink.py`): builds `rtsp://…/h264Preview_<ch:02d>_<main|sub>`.
+  `stream:"sub"` = lower-res substream (lighter, ideal for detection),
+  `"main"` = full-res. `channel:1` for a standalone camera, the channel number
+  behind an NVR. Credentials are URL-encoded and **redacted in logs**. Older
+  firmware: add `"path":"Preview_01_sub"` to drop the `h264` prefix. `reolink.py`
+  also exposes `snapshot_url()` (HTTP JPEG CGI).
+- **DroidCam**: start the app on the phone; default MJPEG is `…:4747/video`
+  (fallback `…:4747/mjpegfeed`). This box and the phone share `192.168.1.0/24`.
+
+### Telegram (optional — desktop works with zero config)
+
+Reads `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` from the env, else a local
+(gitignored) `face-id/.env`, else `ops-hq/.env`. Use a **dedicated @BotFather
+bot** (token from BotFather, chat id from @userinfobot) — do **not** reuse the
+ops-hq poll-only gate bot. Leave creds unset and Telegram is silently skipped.
+
+### Tuning (env vars)
+
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `WATCH_ALERT` | `both` | `both` \| `telegram` \| `desktop` |
+| `WATCH_CONF` | `0.40` | YOLO person confidence (0–1) |
+| `WATCH_DETECT_EVERY` | `5` | run YOLO every N frames per camera |
+| `WATCH_MIN_SIGHTINGS` | `2` | detections before "arrived" (debounce) |
+| `WATCH_CLEAR_AFTER` | `15` | seconds with no person before "left" |
+| `WATCH_COOLDOWN` | `60` | min seconds between alerts per camera |
+| `WATCH_SNAPSHOT` | `1` | attach annotated frame to Telegram |
+
+---
+
 ## Use Case A: scan your phone photo library for your face
 
 `scan_photos.py` scans any folder (recursively) and finds every image
