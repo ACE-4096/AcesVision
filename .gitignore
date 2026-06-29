@@ -41,3 +41,7 @@ esp32cam/CameraWebServer/build/
 .DS_Store
 .idea/
 *.swp
+
+# local secrets for watch_person.py (Telegram creds)
+.env
+watch_cameras.json
