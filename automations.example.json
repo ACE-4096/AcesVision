@@ -25,5 +25,33 @@
   {
     "event": "gesture", "gesture": "Victory", "person": "Toby",
     "command": "notify-send 'Gesture' 'Peace sign by {person} in {room}'"
+  },
+
+  {
+    "_comment": "AceRGB LIGHTING — drive the desk/rig lights with `ledctl` (loose-coupled; needs acergbd running + ~/bin on PATH). Gestures = deliberate control:",
+    "event": "gesture", "gesture": "Pointing_Up",
+    "command": "ledctl next-theme"
+  },
+  {
+    "event": "gesture", "gesture": "Closed_Fist",
+    "command": "ledctl off"
+  },
+  {
+    "event": "gesture", "gesture": "Thumb_Down",
+    "command": "ledctl brightness 30"
+  },
+  {
+    "_comment": "Load a SAVED theme by name (create it first: `ledctl theme save focus`).",
+    "event": "gesture", "gesture": "ILoveYou",
+    "command": "ledctl theme focus"
+  },
+  {
+    "_comment": "PRESENCE can drive lighting too — e.g. bring the rig up when you arrive, off when you leave:",
+    "event": "enter", "person": "Toby", "room": "Office",
+    "command": "ledctl mode gradient"
+  },
+  {
+    "event": "leave", "room": "Office",
+    "command": "ledctl off"
   }
 ]
