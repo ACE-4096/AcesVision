@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "models": [
+    {
+      "id": "yolo26n",
+      "label": "YOLO26 Nano (recommended)",
+      "file": "yolo26n.pt",
+      "sha256": "9b09cc8bf347f0fc8a5f7657480587f25db09b34bf33b0652110fb03a8ad4fef",
+      "provider": "Ultralytics",
+      "license": "AGPL-3.0 or Ultralytics Enterprise",
+      "task": "COCO object detection and ByteTrack tracking",
+      "benchmark": {"gpu": "AMD Radeon RX 6600", "median_wall_ms": 19.25, "median_inference_ms": 7.74}
+    },
+    {
+      "id": "yolo11n",
+      "label": "YOLO11 Nano",
+      "file": "yolo11n.pt",
+      "sha256": "0ebbc80d4a7680d14987a577cd21342b65ecfd94632bd9a8da63ae6417644ee1",
+      "provider": "Ultralytics",
+      "license": "AGPL-3.0 or Ultralytics Enterprise",
+      "task": "COCO object detection and ByteTrack tracking",
+      "benchmark": {"gpu": "AMD Radeon RX 6600", "median_wall_ms": 18.31, "median_inference_ms": 6.48}
+    },
+    {
+      "id": "yolov8n",
+      "label": "YOLOv8 Nano (migration fallback)",
+      "file": "yolov8n.pt",
+      "sha256": "f59b3d833e2ff32e194b5bb8e08d211dc7c5bdf144b90d2c8412c47ccfc83b36",
+      "provider": "Ultralytics",
+      "license": "AGPL-3.0 or Ultralytics Enterprise",
+      "task": "COCO object detection and ByteTrack tracking",
+      "benchmark": {"gpu": "AMD Radeon RX 6600", "median_wall_ms": 16.74, "median_inference_ms": 4.49}
+    }
+  ]
+}
