@@ -81,13 +81,14 @@ class VisionPipeline(threading.Thread):
         processor: Callable[[Any, SourceSpec, int, float], SceneFrame],
         outputs: list[FrameOutput] | None = None,
         *,
-        opener: Callable[[SourceSpec], Any] = open_source,
+        opener: Callable[[SourceSpec], Any] | None = None,
         retry_min_s: float = 0.5,
         retry_max_s: float = 10.0,
     ):
         super().__init__(daemon=True, name="vision-capture")
         self.processor = processor
-        self.opener = opener
+        self._open_error = ""
+        self.opener = opener or self._default_opener
         self.retry_min_s = retry_min_s
         self.retry_max_s = retry_max_s
         self._source = source
@@ -109,6 +110,13 @@ class VisionPipeline(threading.Thread):
         self._workers = [_OutputWorker(out) for out in (outputs or [])]
         self._workers_lock = threading.Lock()
         self._started_workers = False
+
+    def _default_opener(self, source):
+        """open_source, with the open failure reason routed into pipeline state."""
+        return open_source(source, on_error=self._note_open_error)
+
+    def _note_open_error(self, reason):
+        self._open_error = str(reason)
 
     def add_output(self, output: FrameOutput) -> None:
         worker = _OutputWorker(output)
@@ -195,14 +203,18 @@ class VisionPipeline(threading.Thread):
 
                 if cap is None or not cap.isOpened():
                     self._set_state(status="reconnecting")
+                    self._open_error = ""
                     cap = self.opener(source)
                     opened_generation = generation
                     if cap is None or not cap.isOpened():
                         if cap is not None:
                             cap.release()
                         cap = None
+                        # Prefer the specific reason (busy vs missing) over the
+                        # generic one; the generic text hid device contention.
+                        reason = self._open_error or "is unavailable or in use"
                         self._set_state(
-                            error=f"{source.safe_label()} is unavailable or in use"
+                            error=f"{source.safe_label()} {reason}"
                         )
                         if self._stop_event.wait(retry_s):
                             break

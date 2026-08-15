@@ -1,11 +1,16 @@
+import errno
+import os
+import tempfile
 import threading
 import time
 import unittest
 from collections import namedtuple
-from unittest.mock import Mock
+from pathlib import Path
+from unittest.mock import Mock, patch
 
 import numpy as np
 
+import camera
 import gesture_catalog
 from acesvision.contracts import SceneFrame, SourceSpec
 from acesvision.events import GestureEventOutput
@@ -553,6 +558,15 @@ def hand_landmarks(extended=("middle",), wrist=(0.5, 0.9)):
         points[tip] = Landmark(wrist[0], wrist[1] - tip_distance)
     return points
 
+class FakeDevice:
+    """Stand-in for discovery.WebcamDevice with only the fields camera.py uses."""
+
+    def __init__(self, index, kind, path=None, name="Fake Cam"):
+        self.index = index
+        self.kind = kind
+        self.path = path or f"/dev/video{index}"
+        self.name = name
+
 class GestureCatalogTests(unittest.TestCase):
     def test_vocabulary_carries_the_ported_middle_finger(self):
         self.assertIn("Middle_Finger", gesture_catalog.GESTURE_IDS)
@@ -624,6 +638,234 @@ class GestureCatalogTests(unittest.TestCase):
         rows = classify_hands(open_palm, [[Category("Open_Palm", 0.1)]],
                               100, 100, 0.5)
         self.assertEqual(rows, [])
+
+class CameraDiscoveryTests(unittest.TestCase):
+    """camera.py must own no device list of its own — discovery.py is the SSoT."""
+
+    def test_no_hard_coded_candidate_list_survives(self):
+        self.assertFalse(hasattr(camera, "CANDIDATES"))
+
+    def test_candidates_come_from_discovery_colour_first_ir_last(self):
+        devices = [
+            FakeDevice(20, "virtual", name="OBS Virtual Camera"),
+            FakeDevice(3, "infrared", name="IR Camera"),
+            FakeDevice(1, "colour", name="UVC WebCam"),
+            FakeDevice(5, "camera", name="Unclassified"),
+        ]
+        ordered = camera.candidate_devices(devices)
+        self.assertEqual([d.path for d in ordered],
+                         ["/dev/video1", "/dev/video5", "/dev/video3"])
+
+    def test_infrared_node_is_reachable(self):
+        # The old CANDIDATES list omitted video3 entirely, which made the IR
+        # sensor unreachable and blocked the colour+IR liveness design.
+        ordered = camera.candidate_devices([FakeDevice(3, "infrared")])
+        self.assertEqual([d.path for d in ordered], ["/dev/video3"])
+
+    def test_metadata_and_virtual_nodes_are_never_probed(self):
+        # Metadata nodes are already filtered by discovery (interface index != 0);
+        # camera.py additionally drops loopback/virtual outputs.
+        probed = []
+
+        def opener(device, manual_exposure=False):
+            probed.append(device)
+            return _fake_colour_capture(), _colour_frame()
+
+        cap = camera.open_camera(
+            devices=[FakeDevice(20, "virtual"), FakeDevice(1, "colour")],
+            opener=opener,
+            status=lambda device: camera.DEVICE_AVAILABLE,
+        )
+        self.assertIsNotNone(cap)
+        self.assertEqual(probed, ["/dev/video1"])
+
+class CameraStatusTests(unittest.TestCase):
+    def test_status_distinguishes_missing_busy_and_available(self):
+        def missing(path, flags):
+            raise FileNotFoundError(path)
+
+        def busy(path, flags):
+            raise OSError(errno.EBUSY, "Device or resource busy")
+
+        closed = []
+        self.assertEqual(camera.device_status(9, opener=missing),
+                         camera.DEVICE_MISSING)
+        self.assertEqual(camera.device_status(1, opener=busy), camera.DEVICE_BUSY)
+        self.assertEqual(
+            camera.device_status(1, opener=lambda path, flags: 7,
+                                 closer=closed.append),
+            camera.DEVICE_AVAILABLE)
+        self.assertEqual(closed, [7])   # the probe never leaks a descriptor
+
+    def test_holders_are_read_from_proc(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            device = root / "video-node"
+            device.write_text("")
+            proc = root / "proc"
+            for pid, name, target in ((4242, "obs", device),
+                                      (4243, "bash", root / "other")):
+                if not target.exists():
+                    target.write_text("")
+                fds = proc / str(pid) / "fd"
+                fds.mkdir(parents=True)
+                (proc / str(pid) / "comm").write_text(name + "\n")
+                (fds / "3").symlink_to(target)
+            holders = camera.device_holders(str(device), proc_root=str(proc))
+        self.assertEqual(holders, [(4242, "obs")])
+
+    def test_a_busy_device_is_not_reported_as_missing(self):
+        # The whole point: "held by OBS" and "does not exist" need different fixes.
+        with patch.object(camera, "device_status",
+                          return_value=camera.DEVICE_AVAILABLE), \
+             patch.object(camera, "device_holders", return_value=[(99, "obs")]):
+            status, detail = camera.explain_failure("/dev/video1")
+        self.assertEqual(status, camera.DEVICE_BUSY)
+        self.assertIn("obs", detail)
+        self.assertIn("/dev/video1", detail)
+
+def _colour_frame():
+    frame = np.zeros((8, 8, 3), dtype="uint8")
+    frame[:, :, 2] = 200          # strong red channel -> chroma above CHROMA_MIN
+    return frame
+
+def _grey_frame():
+    return np.full((8, 8, 3), 120, dtype="uint8")
+
+def _fake_colour_capture():
+    return FakeCapture([(True, "frame")])
+
+class CameraOpenTests(unittest.TestCase):
+    def setUp(self):
+        self._saved = os.environ.pop("FACE_ID_CAM", None)
+
+    def tearDown(self):
+        if self._saved is not None:
+            os.environ["FACE_ID_CAM"] = self._saved
+
+    def _opener(self, frames):
+        """frames: {device -> frame or None}."""
+        def opener(device, manual_exposure=False):
+            frame = frames.get(device)
+            if frame is None:
+                return None, None
+            return FakeCapture([(True, "frame")]), frame
+        return opener
+
+    def test_colour_is_preferred_over_infrared(self):
+        cap = camera.open_camera(
+            devices=[FakeDevice(1, "colour"), FakeDevice(3, "infrared")],
+            opener=self._opener({"/dev/video1": _colour_frame(),
+                                 "/dev/video3": _grey_frame()}),
+            status=lambda device: camera.DEVICE_AVAILABLE)
+        self.assertIsNotNone(cap)
+
+    def test_busy_colour_falls_back_to_infrared_and_says_why(self):
+        with patch("builtins.print") as printed:
+            cap = camera.open_camera(
+                devices=[FakeDevice(1, "colour"), FakeDevice(3, "infrared")],
+                opener=self._opener({"/dev/video3": _grey_frame()}),
+                status=lambda device: camera.DEVICE_AVAILABLE,
+                explain=lambda device: (camera.DEVICE_BUSY,
+                                        f"{device} is held by obs (pid 7)"))
+        self.assertIsNotNone(cap)
+        message = " ".join(str(call) for call in printed.call_args_list)
+        self.assertIn("held by obs", message)
+
+    def test_all_devices_busy_raises_busy_not_not_found(self):
+        with self.assertRaises(camera.CameraBusyError) as caught:
+            camera.open_camera(
+                devices=[FakeDevice(1, "colour")],
+                opener=self._opener({}),
+                status=lambda device: camera.DEVICE_AVAILABLE,
+                explain=lambda device: (camera.DEVICE_BUSY,
+                                        f"{device} is held by obs (pid 7)"))
+        self.assertIn("held by obs", str(caught.exception))
+        self.assertNotIn("No working camera found", str(caught.exception))
+
+    def test_no_devices_at_all_raises_not_found(self):
+        with self.assertRaises(camera.CameraNotFoundError):
+            camera.open_camera(devices=[], opener=self._opener({}),
+                               status=lambda device: camera.DEVICE_AVAILABLE)
+
+    def test_forced_busy_device_raises_instead_of_substituting_another(self):
+        # An explicit choice that is merely contended must not be silently
+        # swapped for a different camera.
+        with self.assertRaises(camera.CameraBusyError):
+            camera.open_camera(
+                preferred="/dev/video1",
+                devices=[FakeDevice(3, "infrared")],
+                opener=self._opener({"/dev/video3": _grey_frame()}),
+                status=lambda device: camera.DEVICE_AVAILABLE,
+                explain=lambda device: (camera.DEVICE_BUSY,
+                                        f"{device} is held by obs (pid 7)"))
+
+    def test_forced_missing_device_falls_back_to_discovery(self):
+        # Previously a stale path raised with no fallback and sources.py turned
+        # that into None: total silent failure.
+        cap = camera.open_camera(
+            preferred="/dev/video9",
+            devices=[FakeDevice(1, "colour")],
+            opener=self._opener({"/dev/video1": _colour_frame()}),
+            status=lambda device: (camera.DEVICE_MISSING
+                                   if device == "/dev/video9"
+                                   else camera.DEVICE_AVAILABLE))
+        self.assertIsNotNone(cap)
+
+    def test_face_id_cam_override_still_works(self):
+        os.environ["FACE_ID_CAM"] = "3"
+        opened = []
+
+        def opener(device, manual_exposure=False):
+            opened.append(device)
+            return FakeCapture([(True, "frame")]), _grey_frame()
+
+        cap = camera.open_camera(devices=[FakeDevice(1, "colour")], opener=opener,
+                                 status=lambda device: camera.DEVICE_AVAILABLE)
+        self.assertIsNotNone(cap)
+        self.assertEqual(opened, [3])   # honoured exactly, no colour filtering
+
+    def test_unparsable_override_is_ignored_not_fatal(self):
+        os.environ["FACE_ID_CAM"] = "not-a-device"
+        cap = camera.open_camera(
+            devices=[FakeDevice(1, "colour")],
+            opener=self._opener({"/dev/video1": _colour_frame()}),
+            status=lambda device: camera.DEVICE_AVAILABLE)
+        self.assertIsNotNone(cap)
+
+class SourceFailureReportingTests(unittest.TestCase):
+    def test_busy_camera_reason_is_reported_not_swallowed(self):
+        source = SourceSpec.from_mapping({"id": "webcam", "type": "webcam"})
+        reasons = []
+
+        def raiser(device):
+            raise camera.CameraBusyError("/dev/video1 is held by obs (pid 7)")
+
+        self.assertIsNone(open_source(source, webcam_opener=raiser,
+                                      on_error=reasons.append))
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("held by obs", reasons[0])
+
+    def test_pipeline_surfaces_the_specific_reason(self):
+        source = SourceSpec.from_mapping({"id": "webcam", "type": "webcam"})
+
+        def fake_open_source(spec, on_error=None):
+            if on_error:
+                on_error("/dev/video1 is held by obs (pid 7)")
+            return None
+
+        with patch("acesvision.pipeline.open_source", fake_open_source):
+            pipeline = VisionPipeline(source, lambda *a: None, [],
+                                      retry_min_s=0.001, retry_max_s=0.002)
+            pipeline.start()
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                if "held by obs" in pipeline.state().last_error:
+                    break
+                time.sleep(0.01)
+            pipeline.stop()
+            pipeline.join(1.0)
+        self.assertIn("held by obs", pipeline.state().last_error)
 
 if __name__ == "__main__":
     unittest.main()
