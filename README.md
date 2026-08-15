@@ -1,14 +1,24 @@
 # face-id
 
 Webcam face recognition — detects faces, draws bounding boxes, and labels you
-and your child (or "Unknown"). Two interchangeable engines:
+and your child (or "Unknown").
 
-| Engine | Script | What it is |
-|--------|--------|-----------|
-| **LBPH + Haar** | `lbph_recognize.py` | The **2015/2016 OpenCV** approach — your original system, cleaned up. `cv2.face.LBPHFaceRecognizer` + Haar cascade. |
-| **dlib / face_recognition** | `recognize.py` | The modern stack (dlib HOG detector + ResNet encoder). More accurate, especially for a child's face. |
+**AcesVision is the supported entry point.** The recognition engines live in
+`engine.py` and are selected with `FACE_ID_ENGINE`:
 
-Both read the same enrolled photos and both already work in this venv.
+| Engine | `FACE_ID_ENGINE` | What it is |
+|--------|------------------|-----------|
+| **YuNet** | `yunet` (default) | OpenCV DNN face detector. |
+| **dlib / face_recognition** | `dlib` | HOG detector + ResNet encoder. Most reliable, especially for telling a parent and child apart. |
+| **LBPH + Haar** | `lbph` | The **2015/2016 OpenCV** approach. Light, no GPU, trains instantly, but sensitive to lighting and pose. |
+
+All three read the same enrolled photos from `known_faces/`.
+
+> **Retired 2026-08-15.** The standalone CLI demos `recognize.py`,
+> `lbph_recognize.py`, `obs_virtualcam.py` and `server.py` were removed. They
+> wrapped what `engine.py` and AcesVision now provide directly. Recoverable at
+> any time: `git show db88c10:recognize.py` (or `git revert` the retirement
+> commit).
 
 ## AcesVision (in development)
 
@@ -85,17 +95,13 @@ one clear face per image.)
 
 ## 2. Run recognition
 
-Your 2016 LBPH system:
 ```bash
-python lbph_recognize.py
+python -m acesvision.gui                       # YuNet (default)
+FACE_ID_ENGINE=dlib python -m acesvision.gui   # most accurate
+FACE_ID_ENGINE=lbph python -m acesvision.gui   # the 2016 approach
 ```
 
-Or the more accurate dlib version:
-```bash
-python recognize.py
-```
-
-Green box = recognised (with confidence), red = Unknown. **Q** to quit.
+Green box = recognised (with confidence), red = Unknown.
 
 ## Tuning (env vars)
 
@@ -112,26 +118,19 @@ Green box = recognised (with confidence), red = Unknown. **Q** to quit.
 
 Example:
 ```bash
-FACE_ID_CAM=10 FACE_ID_LBPH_THRESH=60 python lbph_recognize.py
+FACE_ID_CAM=1 FACE_ID_ENGINE=lbph FACE_ID_LBPH_THRESH=60 python -m acesvision.gui
 ```
-
-## LBPH vs dlib — which to use?
-
-- **LBPH** is what you built in 2016: light, no GPU, trains instantly. But it's
-  sensitive to lighting/pose and the confidence numbers need tuning per setup.
-- **dlib** (`recognize.py`) is markedly more reliable, particularly for telling
-  a parent and child apart. If accuracy matters more than nostalgia, use it.
 
 ## OBS integration (overlay boxes on your OBS webcam feed)
 
-`obs_virtualcam.py` reads the real webcam, draws the recognition boxes, and
-republishes the result to a **virtual camera**. OBS then adds that virtual
-camera as a normal source — boxes baked in. This is far more robust than an
-in-OBS Python script (which would have to load dlib/opencv into OBS's embedded
-Python).
+AcesVision's `ObsVirtualCameraOutput` (`acesvision/outputs.py`) republishes the
+annotated frames to a **virtual camera**. OBS then adds that virtual camera as
+a normal source — boxes baked in. Because AcesVision owns the one camera handle
+and fans out to its outputs, the GUI preview and the OBS feed run from a single
+capture.
 
 ```
-real webcam  ->  obs_virtualcam.py (detect + draw)  ->  /dev/video20 (loopback)  ->  OBS
+real webcam  ->  AcesVision (capture + detect + draw)  ->  /dev/video20 (loopback)  ->  OBS
 ```
 
 ### One-time setup (needs sudo — kernel module)
@@ -154,12 +153,13 @@ printf 'options v4l2loopback video_nr=20 card_label="FaceID Cam" exclusive_caps=
 
 ```bash
 source .venv/bin/activate
-python obs_virtualcam.py                       # LBPH (default)
+python -m acesvision --obs                     # YuNet (default)
 # or the more accurate engine:
-FACE_ID_ENGINE=dlib python obs_virtualcam.py
-# pin the loopback target explicitly if auto-detect picks the wrong one:
-FACE_ID_VCAM=/dev/video20 python obs_virtualcam.py
+FACE_ID_ENGINE=dlib python -m acesvision --obs
 ```
+
+Enable the OBS output from the GUI's Outputs screen, or pass `--obs` to the
+headless runner.
 
 ### Wire it into OBS
 
