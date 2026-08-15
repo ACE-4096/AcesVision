@@ -1,4 +1,5 @@
 import errno
+import json
 import os
 import tempfile
 import threading
@@ -12,6 +13,7 @@ import numpy as np
 
 import camera
 import gesture_catalog
+from acesvision import connectors
 from acesvision.contracts import SceneFrame, SourceSpec
 from acesvision.events import GestureEventOutput
 from acesvision.discovery import (
@@ -524,7 +526,11 @@ class PolicyTests(unittest.TestCase):
             self.assertEqual(loaded, [rule])
             text = path.read_text()
             self.assertIn('"version": 1', text)
-            self.assertIn('"dry_run": true', text)
+            # dry_run lives on the rule now, not on the file. Asserted against
+            # the parsed structure so this cannot pass on the old global key.
+            payload = json.loads(text)
+            self.assertNotIn("dry_run", payload)
+            self.assertIs(payload["rules"][0]["dry_run"], True)
 
 
 class GuiStyleTests(unittest.TestCase):
@@ -1220,6 +1226,582 @@ class HeadlessRunnerTests(unittest.TestCase):
         output.publish(SceneFrame(source, 0, 0.0, np.zeros((2, 2, 3)),
                                   gestures=[Gesture("Victory", 0.9, 0, 0, 5, 5)]))
         self.assertEqual(events, [])
+
+
+# ---------------------------------------------------------------------------
+# Connector dispatch — the action-execution path that did not exist.
+# ---------------------------------------------------------------------------
+
+
+class FakeSession:
+    """Stands in for a D-Bus connection. Records calls, replays a script.
+
+    ``script`` maps a member name to a list of responses consumed in order; the
+    last entry repeats. A response that is an Exception instance is raised, so
+    every failure mode is expressible without a bus.
+    """
+
+    def __init__(self, script):
+        self.script = {member: list(responses)
+                       for member, responses in script.items()}
+        self.calls = []
+        self.closed = False
+
+    def call(self, member, signature="", body=(), action=""):
+        self.calls.append((member, signature, tuple(body)))
+        responses = self.script.get(member)
+        if responses is None:
+            raise connectors.MethodFailedError(
+                f"unscripted member {member}", connector="acergb", action=action)
+        response = responses[0] if len(responses) == 1 else responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    def members(self):
+        return [member for member, _signature, _body in self.calls]
+
+    def close(self):
+        self.closed = True
+
+
+class FakeTransport:
+    def __init__(self, script):
+        self.session = FakeSession(script)
+        self.opened = 0
+
+    def open(self, action=""):
+        self.opened += 1
+        return self.session
+
+
+class ExplodingTransport:
+    """Raises when opened — how a missing bus or missing library presents."""
+
+    def __init__(self, error):
+        self.error = error
+
+    def open(self, action=""):
+        raise self.error
+
+
+def ticking_clock(step=0.1):
+    state = {"now": 0.0}
+
+    def clock():
+        now = state["now"]
+        state["now"] = now + step
+        return now
+    return clock
+
+
+def acergb(script, **kwargs):
+    transport = FakeTransport(script)
+    kwargs.setdefault("sleep", lambda _seconds: None)
+    return connectors.AceRgbConnector(transport=transport, **kwargs), transport
+
+
+class ConnectorDispatchTests(unittest.TestCase):
+    def test_next_theme_polls_is_ready_before_calling_next_theme(self):
+        # IsReady is the readiness signal. Readiness is never inferred from the
+        # NextTheme string, so IsReady must come first, every time.
+        connector, transport = acergb({
+            "IsReady": [(True,)], "NextTheme": [("purple",)],
+        })
+        detail = connector.execute("next_theme")
+        self.assertEqual(transport.session.members(), ["IsReady", "NextTheme"])
+        self.assertIn("purple", detail)
+        self.assertTrue(transport.session.closed)
+
+    def test_off_is_confirmed_by_reading_state_back(self):
+        connector, transport = acergb({
+            "IsReady": [(True,)], "Off": [()], "CurrentTheme": [("",)],
+        })
+        detail = connector.execute("off")
+        self.assertEqual(transport.session.members(),
+                         ["IsReady", "Off", "CurrentTheme"])
+        self.assertIn("accepted", detail)
+
+    def test_brightness_sends_a_typed_double(self):
+        connector, transport = acergb({
+            "IsReady": [(True,)], "SetBrightness": [()],
+        })
+        connector.execute("brightness", {"level": 0.4})
+        self.assertEqual(transport.session.calls[-1], ("SetBrightness", "d", (0.4,)))
+
+    def test_brightness_rejects_out_of_range_and_non_numeric_levels(self):
+        for level in (1.5, -0.1, "bright", None):
+            connector, transport = acergb({
+                "IsReady": [(True,)], "SetBrightness": [()],
+            })
+            with self.assertRaises(connectors.InvalidParameterError):
+                connector.execute("brightness", {"level": level})
+            self.assertNotIn("SetBrightness", transport.session.members())
+
+    def test_unsupported_action_never_touches_the_bus(self):
+        connector, transport = acergb({"IsReady": [(True,)]})
+        with self.assertRaises(connectors.UnsupportedActionError):
+            connector.execute("explode")
+        self.assertEqual(transport.opened, 0)
+
+    def test_registry_dispatch_returns_a_result_not_an_exception(self):
+        connector, _transport = acergb({
+            "IsReady": [(True,)], "NextTheme": [("rainbow",)],
+        })
+        registry = connectors.ConnectorRegistry([connector])
+        result = registry.dispatch("acergb", "next_theme")
+        self.assertTrue(result.ok)
+        self.assertIsNone(result.error_kind)
+        self.assertIn("rainbow", result.detail)
+
+    def test_unwired_connector_reports_loudly_instead_of_doing_nothing(self):
+        # pipewire.mute is bound by the Shush rule and has no executor yet.
+        # Silence here is exactly the failure mode this whole module exists to
+        # remove, so it must come back as a named failure.
+        registry = connectors.default_registry()
+        result = registry.dispatch("pipewire", "mute")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_kind, "not_implemented")
+        self.assertIn("acergb", result.detail)
+        self.assertFalse(registry.supports("pipewire", "mute"))
+        self.assertTrue(registry.supports("acergb", "next_theme"))
+
+    def test_registry_is_open_to_new_connectors_without_touching_dispatch(self):
+        class FakePipewire:
+            name = "pipewire"
+
+            @staticmethod
+            def actions():
+                return ("mute",)
+
+            @staticmethod
+            def execute(action, params=None):
+                return "muted"
+
+        registry = connectors.default_registry().register(FakePipewire())
+        self.assertEqual(registry.names(), ["acergb", "pipewire"])
+        self.assertTrue(registry.dispatch("pipewire", "mute").ok)
+
+    def test_connector_actions_match_the_policy_catalog(self):
+        # Drift guard: policy.CONNECTORS["acergb"] is the declaration, the
+        # connector is the implementation. They must not diverge silently.
+        self.assertEqual(sorted(connectors.AceRgbConnector.actions()),
+                         sorted(CONNECTORS["acergb"]))
+
+    def test_bindings_that_name_acergb_are_all_executable(self):
+        registry = connectors.default_registry()
+        bound = [(name, pair) for name, pair
+                 in gesture_catalog.CONNECTOR_BINDINGS.items()
+                 if pair[0] == "acergb"]
+        self.assertTrue(bound)
+        for name, (connector, action) in bound:
+            self.assertTrue(registry.supports(connector, action), name)
+
+
+class ConnectorErrorModeTests(unittest.TestCase):
+    """Every failure mode is distinguishable and none of them look like success.
+
+    The predecessor shelled out ``ledctl theme next``; on 2026-08-15 that binary
+    was a stale build that printed usage and exited 0. Loudness is the feature.
+    """
+
+    def dispatch(self, connector):
+        return connectors.ConnectorRegistry([connector]).dispatch(
+            "acergb", "next_theme")
+
+    def test_daemon_absent_is_reported_as_daemon_absent(self):
+        absent = connectors.DaemonUnavailableError(
+            "org.acergb.Daemon is not on the session bus", connector="acergb")
+        connector, transport = acergb({"IsReady": [absent]})
+        result = self.dispatch(connector)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_kind, "daemon_absent")
+        self.assertNotIn("NextTheme", transport.session.members())
+
+    def test_daemon_not_ready_is_polled_and_never_calls_the_method(self):
+        connector, transport = acergb(
+            {"IsReady": [(False,)], "NextTheme": [("purple",)]},
+            ready_timeout_s=0.2, clock=ticking_clock(0.1))
+        result = self.dispatch(connector)
+        self.assertEqual(result.error_kind, "not_ready")
+        self.assertEqual(transport.session.members(), ["IsReady", "IsReady"])
+
+    def test_readiness_that_arrives_late_still_succeeds(self):
+        connector, transport = acergb(
+            {"IsReady": [(False,), (False,), (True,)],
+             "NextTheme": [("warm",)]},
+            ready_timeout_s=5.0, clock=ticking_clock(0.1))
+        result = self.dispatch(connector)
+        self.assertTrue(result.ok)
+        self.assertEqual(transport.session.members(),
+                         ["IsReady", "IsReady", "IsReady", "NextTheme"])
+
+    def test_method_error_is_reported_as_method_error(self):
+        broken = connectors.MethodFailedError(
+            "NextTheme failed (org.freedesktop.DBus.Error.UnknownMethod)",
+            connector="acergb")
+        connector, _transport = acergb({"IsReady": [(True,)], "NextTheme": [broken]})
+        self.assertEqual(self.dispatch(connector).error_kind, "method_error")
+
+    def test_timeout_is_reported_as_timeout(self):
+        slow = connectors.ConnectorTimeoutError("NextTheme did not answer",
+                                                connector="acergb")
+        connector, _transport = acergb({"IsReady": [(True,)], "NextTheme": [slow]})
+        self.assertEqual(self.dispatch(connector).error_kind, "timeout")
+
+    def test_empty_next_theme_is_a_failure_not_a_success(self):
+        # NextTheme returns "" when nothing was applied. The daemon already
+        # said IsReady, so this is *not* a readiness problem and must not be
+        # reported as one — and it must certainly not read as success.
+        connector, _transport = acergb({"IsReady": [(True,)], "NextTheme": [("",)]})
+        result = self.dispatch(connector)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_kind, "no_effect")
+        self.assertNotEqual(result.error_kind, "not_ready")
+
+    def test_missing_bus_is_reported_as_bus_absent(self):
+        connector = connectors.AceRgbConnector(transport=ExplodingTransport(
+            connectors.BusUnavailableError("no session bus address")))
+        self.assertEqual(self.dispatch(connector).error_kind, "bus_absent")
+
+    def test_missing_client_library_is_reported_as_transport_missing(self):
+        connector = connectors.AceRgbConnector(transport=ExplodingTransport(
+            connectors.TransportUnavailableError("jeepney is not installed")))
+        self.assertEqual(self.dispatch(connector).error_kind, "transport_missing")
+
+    def test_an_unexpected_exception_is_surfaced_not_swallowed(self):
+        connector = connectors.AceRgbConnector(
+            transport=ExplodingTransport(RuntimeError("socket exploded")))
+        result = self.dispatch(connector)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_kind, "unexpected")
+        self.assertIn("socket exploded", result.detail)
+
+    def test_every_produced_kind_is_declared(self):
+        declared = set(connectors.ERROR_KINDS)
+        produced = {cls.kind for cls in (
+            connectors.TransportUnavailableError,
+            connectors.BusUnavailableError,
+            connectors.DaemonUnavailableError,
+            connectors.DaemonNotReadyError,
+            connectors.MethodFailedError,
+            connectors.ConnectorTimeoutError,
+            connectors.ActionHadNoEffectError,
+            connectors.UnsupportedActionError,
+            connectors.InvalidParameterError,
+        )} | {"not_implemented", "unexpected"}
+        self.assertEqual(produced, declared)
+
+
+class DBusErrorMappingTests(unittest.TestCase):
+    """The real jeepney session maps D-Bus error names onto typed failures."""
+
+    def session(self, reply):
+        connection = Mock()
+        connection.send_and_get_reply.return_value = reply
+        address = Mock(bus_name="org.acergb.Daemon")
+        return connectors.JeepneySession(connection, address, 1.0,
+                                         connector="acergb")
+
+    @staticmethod
+    def error_reply(name, text="boom"):
+        from jeepney import MessageType
+
+        reply = Mock()
+        reply.header.message_type = MessageType.error
+        reply.header.fields = {4: name}
+        reply.body = (text,)
+        return reply
+
+    def test_service_unknown_becomes_daemon_absent(self):
+        session = self.session(
+            self.error_reply("org.freedesktop.DBus.Error.ServiceUnknown"))
+        with self.assertRaises(connectors.DaemonUnavailableError):
+            session.call("NextTheme")
+
+    def test_no_reply_becomes_timeout(self):
+        session = self.session(
+            self.error_reply("org.freedesktop.DBus.Error.NoReply"))
+        with self.assertRaises(connectors.ConnectorTimeoutError):
+            session.call("NextTheme")
+
+    def test_unknown_method_becomes_method_error(self):
+        # The stale-binary class: a daemon that does not export the member.
+        # A shell-out printed usage and exited 0; D-Bus cannot.
+        session = self.session(
+            self.error_reply("org.freedesktop.DBus.Error.UnknownMethod"))
+        with self.assertRaises(connectors.MethodFailedError) as caught:
+            session.call("NextTheme")
+        self.assertIn("UnknownMethod", str(caught.exception))
+
+    def test_socket_timeout_becomes_timeout(self):
+        connection = Mock()
+        connection.send_and_get_reply.side_effect = TimeoutError("timed out")
+        session = connectors.JeepneySession(connection, Mock(), 0.5,
+                                            connector="acergb")
+        with self.assertRaises(connectors.ConnectorTimeoutError):
+            session.call("NextTheme")
+
+    def test_successful_reply_returns_the_body(self):
+        from jeepney import MessageType
+
+        reply = Mock()
+        reply.header.message_type = MessageType.method_return
+        reply.body = ("cool",)
+        self.assertEqual(self.session(reply).call("CurrentTheme"), ("cool",))
+
+    def test_absent_bus_address_becomes_bus_absent(self):
+        transport = connectors.JeepneyTransport(
+            "org.acergb.Daemon", "/org/acergb/Daemon", "org.acergb.Daemon",
+            connector="acergb")
+        with patch("jeepney.io.blocking.open_dbus_connection",
+                   side_effect=KeyError("DBUS_SESSION_BUS_ADDRESS")):
+            with self.assertRaises(connectors.BusUnavailableError):
+                transport.open()
+
+
+# ---------------------------------------------------------------------------
+# Per-rule dry_run
+# ---------------------------------------------------------------------------
+
+
+class RecordingExecutor:
+    def __init__(self, result=None):
+        self.result = result
+        self.calls = []
+
+    def dispatch(self, connector, action, params=None):
+        self.calls.append((connector, action, dict(params or {})))
+        return self.result or connectors.ExecutionResult(
+            connector, action, True, "did the thing")
+
+    @staticmethod
+    def supports(connector, action):
+        return True
+
+    @staticmethod
+    def names():
+        return ["acergb"]
+
+
+class PerRuleDryRunTests(unittest.TestCase):
+    EVENT = {"gesture": "Victory", "actor": "Toby", "source": "webcam"}
+
+    def test_rules_default_to_dry_run(self):
+        self.assertTrue(Rule.create("Victory", "acergb", "next_theme").dry_run)
+
+    def test_the_engine_has_no_global_dry_run(self):
+        # Regression guard. The global was the bug: the only way to arm one
+        # rule was to arm every rule, including any sensitive one added later.
+        engine = RuleEngine([])
+        self.assertFalse(hasattr(engine, "dry_run"))
+        with self.assertRaises(TypeError):
+            RuleEngine([], dry_run=False)
+
+    def test_a_dry_run_rule_never_reaches_the_executor(self):
+        executor = RecordingExecutor()
+        rule = Rule.create("Victory", "acergb", "next_theme")
+        decision = RuleEngine([rule], executor=executor).evaluate(self.EVENT)[0]
+        self.assertEqual(decision.outcome, "dry_run")
+        self.assertFalse(decision.ok)
+        self.assertEqual(executor.calls, [])
+
+    def test_an_armed_rule_executes_and_reports_what_happened(self):
+        executor = RecordingExecutor()
+        rule = Rule.create("Victory", "acergb", "next_theme", dry_run=False)
+        decision = RuleEngine([rule], executor=executor).evaluate(self.EVENT)[0]
+        self.assertEqual(decision.outcome, "executed")
+        self.assertTrue(decision.ok)
+        self.assertEqual(decision.reason, "did the thing")
+        self.assertEqual(executor.calls, [("acergb", "next_theme", {})])
+
+    def test_a_failed_action_shows_up_in_the_decision(self):
+        executor = RecordingExecutor(connectors.ExecutionResult(
+            "acergb", "next_theme", False, "daemon is not on the bus",
+            error_kind="daemon_absent"))
+        rule = Rule.create("Victory", "acergb", "next_theme", dry_run=False)
+        decision = RuleEngine([rule], executor=executor).evaluate(self.EVENT)[0]
+        self.assertEqual(decision.outcome, "failed")
+        self.assertEqual(decision.error_kind, "daemon_absent")
+        self.assertFalse(decision.ok)
+        self.assertIn("daemon_absent", decision.describe())
+
+    def test_arming_one_rule_leaves_the_others_dry_run(self):
+        executor = RecordingExecutor()
+        armed = Rule.create("Victory", "acergb", "next_theme", dry_run=False)
+        untouched = Rule.create("Victory", "acergb", "off")
+        decisions = RuleEngine([armed, untouched],
+                               executor=executor).evaluate(self.EVENT)
+        self.assertEqual([d.outcome for d in decisions], ["executed", "dry_run"])
+        self.assertEqual(executor.calls, [("acergb", "next_theme", {})])
+
+    def test_an_armed_rule_without_an_executor_stops_at_approved(self):
+        rule = Rule.create("Victory", "acergb", "next_theme", dry_run=False)
+        decision = RuleEngine([rule]).evaluate(self.EVENT)[0]
+        self.assertEqual(decision.outcome, "approved")
+        self.assertFalse(decision.ok)
+
+    def test_policy_gates_still_win_over_arming(self):
+        # Arming does not buy past the deny-by-default gates.
+        armed = Rule.create("Open_Palm", "kde", "next_desktop", dry_run=False)
+        executor = RecordingExecutor()
+        decision = RuleEngine([armed], executor=executor).evaluate({
+            "gesture": "Open_Palm", "actor": None, "source": "webcam"})[0]
+        self.assertEqual(decision.outcome, "blocked")
+        self.assertEqual(executor.calls, [])
+
+    def test_dry_run_is_persisted_per_rule_with_no_global_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rules.json"
+            store = RuleStore(path)
+            store.save([Rule.create("Victory", "acergb", "next_theme",
+                                    dry_run=False),
+                        Rule.create("Victory", "acergb", "off")])
+            payload = json.loads(path.read_text())
+            self.assertNotIn("dry_run", payload)           # no global any more
+            self.assertEqual([rule["dry_run"] for rule in payload["rules"]],
+                             [False, True])
+            self.assertEqual([rule.dry_run for rule in store.load()],
+                             [False, True])
+
+    def test_legacy_files_load_as_dry_run(self):
+        # The founder's live rules.json predates this field. It must stay
+        # dry-run, and the stale global must not arm anything either.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rules.json"
+            path.write_text(json.dumps({"version": 1, "dry_run": False, "rules": [
+                {"id": "a", "gesture": "Open_Palm", "connector": "mpris",
+                 "action": "play_pause", "actor": "*", "source": "*",
+                 "enabled": True, "require_liveness": False,
+                 "require_confirmation": False},
+            ]}))
+            rules = RuleStore(path).load()
+            self.assertEqual([rule.dry_run for rule in rules], [True])
+
+    def test_the_live_rule_file_is_still_dry_run(self):
+        live = Path.home() / ".config" / "acesvision" / "rules.json"
+        if not live.exists():
+            self.skipTest("no live rules.json on this machine")
+        rules = RuleStore(live).load(strict=False)
+        armed = [f"{rule.connector}.{rule.action}"
+                 for rule in rules if not rule.dry_run]
+        self.assertEqual(armed, [], f"live rules were armed: {armed}")
+
+
+class GuiConnectorTests(unittest.TestCase):
+    def backend(self, executor):
+        from acesvision.gui import VisionBackend
+
+        return VisionBackend(initialize_models=False, load_saved_rules=False,
+                             executor=executor)
+
+    def test_a_failed_action_reaches_the_error_banner(self):
+        executor = RecordingExecutor(connectors.ExecutionResult(
+            "acergb", "next_theme", False, "daemon is not on the bus",
+            error_kind="daemon_absent"))
+        backend = self.backend(executor)
+        backend._rules = [Rule.create("Victory", "acergb", "next_theme",
+                                      dry_run=False)]
+        backend.rule_engine.rules = list(backend._rules)
+        backend._receive_gesture({"gesture": "Victory", "actor": "Toby",
+                                  "source": "webcam"})
+        self.assertIn("daemon_absent", backend.lastError)
+        self.assertIn("failed", backend.lastDecision)
+
+    def test_a_dry_run_decision_leaves_the_error_banner_clean(self):
+        backend = self.backend(RecordingExecutor())
+        backend._rules = [Rule.create("Victory", "acergb", "next_theme")]
+        backend.rule_engine.rules = list(backend._rules)
+        backend._receive_gesture({"gesture": "Victory", "actor": "Toby",
+                                  "source": "webcam"})
+        self.assertEqual(backend.lastError, "")
+        self.assertIn("dry_run", backend.lastDecision)
+
+    def test_arming_is_per_rule_and_persisted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = self.backend(RecordingExecutor())
+            backend.rule_store = RuleStore(Path(directory) / "rules.json")
+            first = Rule.create("Victory", "acergb", "next_theme")
+            second = Rule.create("Victory", "acergb", "off")
+            backend._rules = [first, second]
+            backend.setRuleDryRun(first.id, False)
+            self.assertEqual([rule["dryRun"] for rule in backend.rules],
+                             [False, True])
+            self.assertEqual(
+                [rule.dry_run for rule in backend.rule_store.load()],
+                [False, True])
+            self.assertEqual([rule.dry_run for rule in backend.rule_engine.rules],
+                             [False, True])
+
+    def test_the_gui_reports_which_connectors_can_actually_execute(self):
+        from acesvision.gui import VisionBackend
+
+        backend = VisionBackend(initialize_models=False, load_saved_rules=False)
+        self.assertEqual(backend.executableConnectors, ["acergb"])
+        backend._rules = [Rule.create("Shush", "pipewire", "mute"),
+                          Rule.create("Victory", "acergb", "next_theme")]
+        self.assertEqual([rule["executable"] for rule in backend.rules],
+                         [False, True])
+
+
+class HeadlessConnectorTests(unittest.TestCase):
+    """The headless path must work with no Qt anywhere in it."""
+
+    def test_the_connector_module_imports_without_qt(self):
+        import subprocess
+        import sys
+
+        script = (
+            "import sys\n"
+            "sys.modules['PySide6'] = None\n"
+            "import acesvision.connectors as c\n"
+            "import acesvision.policy, acesvision.__main__\n"
+            "assert 'PySide6.QtCore' not in sys.modules\n"
+            "print(c.default_registry().names())\n"
+        )
+        completed = subprocess.run([sys.executable, "-c", script],
+                                   cwd=str(Path(__file__).parent),
+                                   capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("acergb", completed.stdout)
+
+    def test_the_runner_loads_rules_and_wires_the_registry(self):
+        from acesvision.__main__ import build_parser, build_rule_engine
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rules.json"
+            store = RuleStore(path)
+            store.save([Rule.create("Victory", "acergb", "next_theme")])
+            executor = RecordingExecutor()
+            engine, rejected = build_rule_engine(
+                build_parser().parse_args([]), store=RuleStore(path),
+                executor=executor)
+            self.assertEqual(rejected, [])
+            self.assertIs(engine.executor, executor)
+            self.assertEqual([rule.dry_run for rule in engine.rules], [True])
+
+    def test_no_rules_flag_loads_nothing(self):
+        from acesvision.__main__ import build_parser, build_rule_engine
+
+        engine, rejected = build_rule_engine(
+            build_parser().parse_args(["--no-rules"]))
+        self.assertEqual((engine.rules, rejected), ([], []))
+
+    def test_decisions_are_printed_including_failures(self):
+        from acesvision.__main__ import _printing_callback
+
+        executor = RecordingExecutor(connectors.ExecutionResult(
+            "acergb", "next_theme", False, "daemon is not on the bus",
+            error_kind="daemon_absent"))
+        engine = RuleEngine(
+            [Rule.create("Victory", "acergb", "next_theme", dry_run=False)],
+            executor=executor)
+        lines = []
+        with patch("builtins.print", lines.append):
+            _printing_callback(engine)({"gesture": "Victory", "actor": "Toby",
+                                        "source": "webcam"})
+        self.assertTrue(any("daemon_absent" in line for line in lines))
+        self.assertTrue(any(line.startswith("[decision]!!") for line in lines))
 
 
 if __name__ == "__main__":

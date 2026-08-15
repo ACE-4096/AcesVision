@@ -113,7 +113,9 @@ ApplicationWindow {
                             font.pixelSize: 11
                         }
                         Text {
-                            text: "Actions: dry-run"
+                            text: "Connectors: " + (vision.executableConnectors.length
+                                ? vision.executableConnectors.join(", ")
+                                : "none wired")
                             color: window.textMuted
                             font.pixelSize: 11
                         }
@@ -552,7 +554,11 @@ ApplicationWindow {
                             Text { text: "Event output"; color: window.textMain; font.bold: true }
                             Text { text: vision.lastGesture; color: window.textMuted }
                             Text { text: vision.lastDecision; color: window.textMuted }
-                            Text { text: "Dry-run only. No connector can execute from this build."; color: window.warning }
+                            Text {
+                                text: "Rules are dry-run until armed one at a time. "
+                                    + "Failures show above and in the error banner."
+                                color: window.warning
+                            }
                         }
                     }
 
@@ -564,7 +570,7 @@ ApplicationWindow {
                             anchors.fill: parent
                             anchors.margins: 14
                             spacing: 10
-                            Text { text: "Add dry-run rule"; color: window.textMain; font.bold: true }
+                            Text { text: "Add rule (starts dry-run)"; color: window.textMain; font.bold: true }
                             RowLayout {
                                 Layout.fillWidth: true
                                 // Catalog-backed, not free text: a mistyped
@@ -636,9 +642,18 @@ ApplicationWindow {
                                         font.bold: true
                                     }
                                     Text {
-                                        text: "Actor: " + modelData.actor + " | Risk: " + modelData.risk + " | Dry-run"
-                                        color: window.textMuted
+                                        text: "Actor: " + modelData.actor
+                                            + " | Risk: " + modelData.risk
+                                            + " | " + (modelData.dryRun ? "Dry-run" : "ARMED")
+                                            + (modelData.executable ? "" : " | no executor")
+                                        color: modelData.dryRun ? window.textMuted : window.warning
                                     }
+                                }
+                                // Per-rule arming. Nothing else flips dry_run.
+                                Button {
+                                    text: modelData.dryRun ? "Arm" : "Disarm"
+                                    enabled: modelData.executable || !modelData.dryRun
+                                    onClicked: vision.setRuleDryRun(modelData.id, !modelData.dryRun)
                                 }
                                 Button { text: "Remove"; onClicked: vision.removeRule(modelData.id) }
                             }

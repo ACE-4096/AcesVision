@@ -3,6 +3,12 @@ opencv-contrib-python>=4.9    # 'contrib' = includes cv2.face (LBPH). NOT plain 
 numpy
 PySide6==6.11.1               # AcesVision Qt 6/QML desktop GUI
 
+# AcesVision -> AceRGB typed D-Bus connector (acesvision/connectors.py).
+# Pure Python, zero dependencies, no libdbus, no glib, no Qt — the headless
+# runner must stay importable without a GUI stack, which rules out
+# PySide6.QtDBus even though PySide6 is already here for the GUI.
+jeepney>=0.8
+
 # OBS virtual-camera bridge (obs_virtualcam.py). Also needs the v4l2loopback
 # kernel module installed via apt + modprobe — see README "OBS integration".
 pyvirtualcam

@@ -5,6 +5,7 @@ import argparse
 import json
 import sys
 import threading
+from dataclasses import replace as dataclass_replace
 from pathlib import Path
 
 from PySide6.QtCore import Property, QObject, QTimer, Signal, Slot, QUrl
@@ -13,6 +14,7 @@ from PySide6.QtQml import QQmlApplicationEngine
 
 from gesture_catalog import ANY_ACTOR, GESTURE_IDS
 
+from .connectors import default_registry
 from .contracts import SceneFrame, SourceSpec
 from .events import GestureEventOutput
 from .discovery import discover_webcams, preferred_webcam, scan_droidcam
@@ -50,7 +52,7 @@ class VisionBackend(QObject):
     droidScanFinished = Signal(str)
 
     def __init__(self, preview_port=8765, initialize_models=True,
-                 load_saved_rules=True, parent=None):
+                 load_saved_rules=True, executor=None, parent=None):
         super().__init__(parent)
         self._status = "starting"
         discovered_webcams = discover_webcams()
@@ -64,6 +66,7 @@ class VisionBackend(QObject):
         self._overlay = "minimal"
         self._last_gesture = "No gesture events yet"
         self._last_decision = "No rule decisions yet"
+        self._last_outcome = "no decision"
         self._capture_fps = 0.0
         self._inference_fps = 0.0
         self._inference_ms = 0.0
@@ -104,7 +107,11 @@ class VisionBackend(QObject):
         except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
             self._rules = []
             self._last_decision = f"Saved rules not loaded: {exc}"
-        self.rule_engine = RuleEngine(self._rules, dry_run=True)
+        # No engine-wide dry_run any more. Each rule carries its own, and every
+        # rule loaded from a file written before that change defaults to True,
+        # so nothing gets armed by this wiring.
+        self.executor = default_registry() if executor is None else executor
+        self.rule_engine = RuleEngine(self._rules, executor=self.executor)
         self._obs = None
         self._webcams = [device.as_dict() for device in discovered_webcams]
         self._droid_cams = []
@@ -151,18 +158,25 @@ class VisionBackend(QObject):
         decisions = self.rule_engine.evaluate(event)
         if decisions:
             decision = decisions[-1]
-            self._last_decision = (
-                f"{decision.outcome}: {decision.connector}.{decision.action}, "
-                f"{decision.reason}"
-            )
+            self._last_decision = decision.describe()
+            self._last_outcome = decision.outcome
             self.decisionChanged.emit()
+            # A failed action is a first-class visible failure, not a log line.
+            # The whole point of the typed connector is that a dead daemon
+            # cannot look like success the way Popen("ledctl ...") did.
+            if decision.outcome == "failed":
+                self._error = (
+                    f"Action failed [{decision.error_kind}]: "
+                    f"{decision.connector}.{decision.action} — {decision.reason}"
+                )
+                self.errorChanged.emit()
         self.gestureFromWorker.emit(json.dumps(event, sort_keys=True))
 
     @Slot(str)
     def _set_gesture(self, event_json):
         event = json.loads(event_json)
         actor = event.get("actor") or "unknown actor"
-        self._last_gesture = f"{event['gesture']} by {actor} (dry-run)"
+        self._last_gesture = f"{event['gesture']} by {actor} ({self._last_outcome})"
         self.gestureChanged.emit()
 
     @Slot()
@@ -249,11 +263,18 @@ class VisionBackend(QObject):
             "connector": rule.connector,
             "action": rule.action,
             "risk": rule.risk,
+            "dryRun": rule.dry_run,
+            "executable": self.executor.supports(rule.connector, rule.action),
         } for rule in self._rules]
 
     @Property(str, notify=decisionChanged)
     def lastDecision(self):
         return self._last_decision
+
+    @Property("QVariantList", constant=True)
+    def executableConnectors(self):
+        """Connectors that have a real executor. Everything else is declared only."""
+        return self.executor.names()
 
     @Property(float, notify=performanceChanged)
     def captureFps(self):
@@ -501,6 +522,29 @@ class VisionBackend(QObject):
             self.errorChanged.emit()
             return
         self._rules.append(rule)
+        self.rule_engine.rules = list(self._rules)
+        self._save_rules()
+        self.rulesChanged.emit()
+
+    @Slot(str, bool)
+    def setRuleDryRun(self, rule_id, dry_run):
+        """Arm or disarm one rule. This is the whole mechanism, per rule.
+
+        Nothing calls it at start-up and nothing arms a rule as a side effect
+        of anything else — the founder's saved rules stay dry-run until this is
+        invoked on a named rule id.
+        """
+        updated = []
+        changed = False
+        for rule in self._rules:
+            if rule.id == rule_id and rule.dry_run != bool(dry_run):
+                updated.append(dataclass_replace(rule, dry_run=bool(dry_run)))
+                changed = True
+            else:
+                updated.append(rule)
+        if not changed:
+            return
+        self._rules = updated
         self.rule_engine.rules = list(self._rules)
         self._save_rules()
         self.rulesChanged.emit()
