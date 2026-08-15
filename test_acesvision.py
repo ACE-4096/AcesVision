@@ -567,6 +567,46 @@ def hand_landmarks(extended=("middle",), wrist=(0.5, 0.9)):
     return points
 
 
+def pointing_hand(tip, wrist=(0.5, 0.95), extended="index"):
+    """21 landmarks for a one-finger hand with that fingertip at ``tip``.
+
+    pip and mcp sit on the wrist->tip line at 1/2 and 1/4 of the way, so the
+    named finger reads as extended (tip farther from the wrist than the pip)
+    and, whenever ``tip`` is above the wrist, as pointing up (tip above pip
+    above mcp). Every other finger is curled in toward the wrist.
+
+    Coordinates are MediaPipe-normalised 0..1, like the real landmarks.
+    """
+    def along(fraction):
+        return Landmark(wrist[0] + (tip[0] - wrist[0]) * fraction,
+                        wrist[1] + (tip[1] - wrist[1]) * fraction)
+
+    points = [Landmark(*wrist) for _ in range(21)]
+    for finger, (tip_index, pip_index) in gesture_catalog._FINGERS.items():
+        if finger == extended:
+            points[tip_index] = Landmark(*tip)
+            points[pip_index] = along(0.5)
+        else:
+            points[pip_index] = along(0.20)
+            points[tip_index] = along(0.10)   # curled: nearer the wrist
+    points[gesture_catalog._INDEX_MCP] = along(0.25)
+    return points
+
+
+def open_hand(tip, wrist=(0.5, 0.95)):
+    """All four fingers extended toward ``tip`` — an open palm, not a shush."""
+    def along(fraction):
+        return Landmark(wrist[0] + (tip[0] - wrist[0]) * fraction,
+                        wrist[1] + (tip[1] - wrist[1]) * fraction)
+
+    points = [Landmark(*wrist) for _ in range(21)]
+    for tip_index, pip_index in gesture_catalog._FINGERS.values():
+        points[tip_index] = Landmark(*tip)
+        points[pip_index] = along(0.5)
+    points[gesture_catalog._INDEX_MCP] = along(0.25)
+    return points
+
+
 class FakeDevice:
     """Stand-in for discovery.WebcamDevice with only the fields camera.py uses."""
 
@@ -594,11 +634,11 @@ class GestureCatalogTests(unittest.TestCase):
         self.assertEqual(gesture_catalog.normalise_gesture("ILOVEYOU"), "ILoveYou")
 
     def test_unknown_gesture_is_named_and_rejected(self):
-        self.assertIsNone(gesture_catalog.normalise_gesture("shush"))
-        self.assertFalse(gesture_catalog.is_known_gesture("shush"))
+        self.assertIsNone(gesture_catalog.normalise_gesture("wave"))
+        self.assertFalse(gesture_catalog.is_known_gesture("wave"))
         with self.assertRaises(ValueError) as caught:
-            gesture_catalog.require_gesture("shush")
-        self.assertIn("shush", str(caught.exception))
+            gesture_catalog.require_gesture("wave")
+        self.assertIn("wave", str(caught.exception))
         self.assertIn("Open_Palm", str(caught.exception))   # lists the vocabulary
 
     def test_action_catalog_matches_acergb(self):
@@ -648,6 +688,206 @@ class GestureCatalogTests(unittest.TestCase):
         rows = classify_hands(open_palm, [[Category("Open_Palm", 0.1)]],
                               100, 100, 0.5)
         self.assertEqual(rows, [])
+
+
+# One 1000x1000 frame and one face box, shared by every shush test so the
+# arithmetic below is checkable by hand. The face spans x 400..600, y 300..560,
+# so its mouth point is (500, 300 + 0.72*260) = (500, 487.2) in pixels. Because
+# the frame is 1000 wide and tall, a normalised landmark of 0.487 is pixel 487.
+FRAME_W = FRAME_H = 1000
+FACE_BOX = Face(400, 300, 200, 260, "Toby", 0.2, True)
+
+AT_LIPS = (0.500, 0.490)          # dx 0.00, dy  +0.01  -> inside
+AT_CEILING = (0.500, 0.150)       # dx 0.00, dy  -1.30  -> the plain point up
+NEAR_EDGE_ABOVE = (0.500, 0.360)  # dx 0.00, dy  -0.49  -> just inside
+PAST_EDGE_ABOVE = (0.500, 0.350)  # dx 0.00, dy  -0.53  -> just outside
+NEAR_EDGE_SIDE = (0.405, 0.487)   # dx -0.48, dy  0.00  -> just inside
+PAST_EDGE_SIDE = (0.390, 0.487)   # dx -0.55, dy  0.00  -> just outside
+
+
+class ShushGestureTests(unittest.TestCase):
+    """The founder's shush: index finger up, held to the lips.
+
+    MediaPipe already labels that hand Pointing_Up, and Pointing_Up runs
+    `ledctl next-theme` in automations.json. Everything here exists to keep one
+    shush from also cycling the lighting themes.
+    """
+
+    def test_shush_is_registered_in_the_shared_vocabulary(self):
+        self.assertIn("Shush", gesture_catalog.GESTURE_IDS)
+        spec = gesture_catalog.gesture_by_id("Shush")
+        self.assertFalse(spec.builtin)   # landmark-derived, not a model label
+        self.assertEqual(len(gesture_catalog.GESTURES), 9)
+        # The seven MediaPipe built-ins are untouched by the addition.
+        self.assertEqual(
+            len([s for s in gesture_catalog.GESTURES if s.builtin]), 7)
+        # The QML combo box and the applet read this same tuple.
+        self.assertEqual(gesture_catalog.catalog_json()["gestures"][-1],
+                         {"id": "Shush", "label": "Shush (finger to lips)",
+                          "builtin": False})
+
+    def test_the_previously_unfireable_rule_name_now_resolves(self):
+        # rules.json carried gesture "shush" against no such gesture. It is a
+        # real name now, and the loose spelling normalises onto the emitted one.
+        self.assertEqual(gesture_catalog.normalise_gesture("shush"), "Shush")
+        self.assertEqual(gesture_catalog.normalise_gesture("SHUSH"), "Shush")
+        self.assertTrue(gesture_catalog.is_known_gesture("shush"))
+        self.assertEqual(validate_gesture(" shush "), "Shush")
+
+    def test_a_shush_rule_binds_to_the_mute_action(self):
+        rule = Rule.create("shush", "pipewire", "mute", actor="*")
+        self.assertEqual(rule.gesture, "Shush")
+        self.assertEqual((rule.connector, rule.action), ("pipewire", "mute"))
+        # Muting is a PipeWire action, not an AceRGB one.
+        self.assertEqual(gesture_catalog.CONNECTOR_BINDINGS["volume_mute"],
+                         ("pipewire", "mute"))
+
+    def test_finger_at_the_lips_is_a_shush(self):
+        hand = pointing_hand(AT_LIPS)
+        self.assertTrue(gesture_catalog.is_shush(hand, [FACE_BOX],
+                                                 FRAME_W, FRAME_H))
+
+    def test_the_same_hand_pointed_at_the_ceiling_is_not(self):
+        # Identical pose, fingertip above the head. This is the whole reason
+        # the face box is a term in the geometry.
+        hand = pointing_hand(AT_CEILING)
+        self.assertFalse(gesture_catalog.is_shush(hand, [FACE_BOX],
+                                                  FRAME_W, FRAME_H))
+
+    def test_no_face_means_no_shush(self):
+        hand = pointing_hand(AT_LIPS)
+        for faces in ([], None):
+            self.assertFalse(gesture_catalog.is_shush(hand, faces,
+                                                      FRAME_W, FRAME_H))
+
+    def test_proximity_boundary_on_both_sides(self):
+        # Nearest-miss pairs straddling the 0.5 normalised radius.
+        for tip in (NEAR_EDGE_ABOVE, NEAR_EDGE_SIDE):
+            self.assertTrue(
+                gesture_catalog.is_shush(pointing_hand(tip), [FACE_BOX],
+                                         FRAME_W, FRAME_H), tip)
+        for tip in (PAST_EDGE_ABOVE, PAST_EDGE_SIDE):
+            self.assertFalse(
+                gesture_catalog.is_shush(pointing_hand(tip), [FACE_BOX],
+                                         FRAME_W, FRAME_H), tip)
+
+    def test_proximity_scales_with_the_face_box(self):
+        # The same fingertip, a person standing twice as far away: the face box
+        # halves, so what was at the lips is now well outside the mouth region.
+        tip = (0.500, 0.400)
+        near = Face(400, 300, 200, 260, "Toby", 0.2, True)
+        far = Face(475, 400, 50, 65, "Toby", 0.2, True)
+        self.assertTrue(gesture_catalog.is_shush(pointing_hand(tip), [near],
+                                                 FRAME_W, FRAME_H))
+        self.assertFalse(gesture_catalog.is_shush(pointing_hand(tip), [far],
+                                                  FRAME_W, FRAME_H))
+
+    def test_any_face_in_frame_can_anchor_the_shush(self):
+        other = Face(10, 10, 100, 130, None, 0.9, False)
+        self.assertTrue(gesture_catalog.is_shush(pointing_hand(AT_LIPS),
+                                                 [other, FACE_BOX],
+                                                 FRAME_W, FRAME_H))
+
+    def test_degenerate_face_boxes_are_ignored_not_divided_by(self):
+        empty = Face(500, 480, 0, 0, None, 0.9, False)
+        self.assertFalse(gesture_catalog.is_shush(pointing_hand(AT_LIPS),
+                                                  [empty], FRAME_W, FRAME_H))
+
+    def test_extended_is_not_the_same_as_pointing_up(self):
+        # Fingertip exactly at the lips, but the hand comes from above so the
+        # finger points down. _extended is orientation-agnostic and would
+        # accept this; the shush must not.
+        hand = pointing_hand(AT_LIPS, wrist=(0.5, 0.20))
+        self.assertFalse(gesture_catalog.is_shush(hand, [FACE_BOX],
+                                                  FRAME_W, FRAME_H))
+
+    def test_other_hand_shapes_at_the_lips_are_not_a_shush(self):
+        self.assertFalse(gesture_catalog.is_shush(open_hand(AT_LIPS),
+                                                  [FACE_BOX], FRAME_W, FRAME_H))
+        self.assertFalse(
+            gesture_catalog.is_shush(pointing_hand(AT_LIPS, extended="middle"),
+                                     [FACE_BOX], FRAME_W, FRAME_H))
+        self.assertFalse(gesture_catalog.is_shush([], [FACE_BOX],
+                                                  FRAME_W, FRAME_H))
+        self.assertFalse(gesture_catalog.is_shush(None, [FACE_BOX],
+                                                  FRAME_W, FRAME_H))
+
+    def test_the_real_engine_face_type_drives_the_geometry(self):
+        # The stand-in above mirrors engine.Face; prove the real one binds, so
+        # a field rename in engine.py cannot pass this suite silently.
+        from engine import Face as EngineFace
+
+        face = EngineFace(*FACE_BOX)
+        self.assertTrue(gesture_catalog.is_shush(pointing_hand(AT_LIPS),
+                                                 [face], FRAME_W, FRAME_H))
+
+    def test_shush_takes_strict_precedence_over_pointing_up(self):
+        """The critical case. A shush must emit Shush and must NOT emit
+        Pointing_Up, or every shush also fires `ledctl next-theme`."""
+        from gestures import classify_hands
+
+        Category = namedtuple("Category", "category_name score")
+        model_says_pointing_up = [[Category("Pointing_Up", 0.95)]]
+        hands = [pointing_hand(AT_LIPS)]
+
+        rows = classify_hands(hands, model_says_pointing_up, FRAME_W, FRAME_H,
+                              0.5, faces=[FACE_BOX])
+        names = [row.name for row in rows]
+        self.assertEqual(names, ["Shush"])
+        self.assertNotIn("Pointing_Up", names)
+        self.assertEqual(rows[0].score, 1.0)
+
+    def test_pointing_up_still_reaches_the_theme_binding_away_from_the_face(self):
+        from gestures import classify_hands
+
+        Category = namedtuple("Category", "category_name score")
+        rows = classify_hands([pointing_hand(AT_CEILING)],
+                              [[Category("Pointing_Up", 0.95)]],
+                              FRAME_W, FRAME_H, 0.5, faces=[FACE_BOX])
+        self.assertEqual([row.name for row in rows], ["Pointing_Up"])
+
+        # And with no faces at all — the detector must not start swallowing
+        # Pointing_Up just because face detection went quiet.
+        rows = classify_hands([pointing_hand(AT_LIPS)],
+                              [[Category("Pointing_Up", 0.95)]],
+                              FRAME_W, FRAME_H, 0.5, faces=None)
+        self.assertEqual([row.name for row in rows], ["Pointing_Up"])
+
+    def test_shush_is_detected_even_when_the_model_returned_no_category(self):
+        from gestures import classify_hands
+
+        rows = classify_hands([pointing_hand(AT_LIPS)], [], FRAME_W, FRAME_H,
+                              0.5, faces=[FACE_BOX])
+        self.assertEqual([row.name for row in rows], ["Shush"])
+
+    def test_the_processor_hands_face_boxes_to_the_gesture_detector(self):
+        """Without this wiring the geometry above can never fire in the app."""
+        class ObjectDetector:
+            def detect(self, _frame):
+                return ([Detection(0, 0, 100, 100, "person", 0.9, 1)], {}, "fake")
+
+            def close(self):
+                pass
+
+        face = Face(10, 10, 20, 26, "Toby", 0.2, True)
+        gesture_detector = Mock(detect=Mock(return_value=[]))
+        processor = FaceGestureProcessor(
+            face_detector=Mock(return_value=[face]),
+            gesture_detector=gesture_detector,
+            object_detector=ObjectDetector(),
+        )
+        source = SourceSpec.from_mapping({"type": "webcam"})
+        frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        processor(frame, source, 0, time.monotonic())
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            processor(frame, source, 1, time.monotonic())
+            if gesture_detector.detect.call_args is not None:
+                break
+            time.sleep(0.01)
+        processor.close()
+        passed = gesture_detector.detect.call_args.kwargs["faces"]
+        self.assertEqual([f.name for f in passed], ["Toby"])
 
 
 class CameraDiscoveryTests(unittest.TestCase):
@@ -887,10 +1127,12 @@ class SourceFailureReportingTests(unittest.TestCase):
 
 class RuleVocabularyTests(unittest.TestCase):
     def test_unknown_gesture_is_rejected_at_creation(self):
-        # "shush" is not a MediaPipe gesture; the live rule using it could never
-        # fire and never said so.
+        # A rule naming a gesture nothing emits could never fire and never said
+        # so. "finger_snap" is the standing example: a literal snap is too fast
+        # and too subtle to detect from video (gestures.py module docstring).
+        # "shush" used to sit here — it is a real pose now, see ShushGestureTests.
         with self.assertRaises(ValueError):
-            Rule.create("shush", "pipewire", "mute")
+            Rule.create("finger_snap", "pipewire", "mute")
 
     def test_gesture_case_is_normalised_to_the_emitted_spelling(self):
         rule = Rule.create("open_palm", "mpris", "play_pause")
@@ -924,7 +1166,7 @@ class RuleVocabularyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "rules.json"
             path.write_text(json.dumps({"version": 1, "dry_run": True, "rules": [
-                {"id": "a", "gesture": "shush", "connector": "pipewire",
+                {"id": "a", "gesture": "finger_snap", "connector": "pipewire",
                  "action": "mute", "actor": "toby", "source": "*",
                  "enabled": True, "require_liveness": False,
                  "require_confirmation": False},

@@ -44,10 +44,18 @@ Gesture events are emitted (dry-run) by default; the runner prints
 ### Gesture and action vocabulary
 
 [`gesture_catalog.py`](gesture_catalog.py) is the single vocabulary shared by
-this repo, AcesVision and AceRGB: the seven MediaPipe built-ins plus the
-landmark-derived `Middle_Finger`, and the typed action catalog. Rules validate
-gesture and actor names against it at entry, so a mistyped rule is rejected
-instead of being silently unfireable.
+this repo, AcesVision and AceRGB: the seven MediaPipe built-ins plus the two
+landmark-derived poses `Middle_Finger` and `Shush`, and the typed action
+catalog. Rules validate gesture and actor names against it at entry, so a
+mistyped rule is rejected instead of being silently unfireable.
+
+`Shush` is the real-world shush — index finger up, held to the lips. MediaPipe
+labels that same hand `Pointing_Up`, which is bound to `ledctl next-theme`, so
+the fingertip's distance to the mouth of a detected face is what separates the
+two. It is measured in face-box units (`MOUTH_CENTRE_Y`, `MOUTH_RADIUS`) so it
+scales with how near you stand. That means `Shush` needs face boxes:
+`GestureDetector.detect(frame, faces=...)`. With no face in view the built-in
+`Pointing_Up` stands, and the themes still cycle.
 
 ### Camera selection
 

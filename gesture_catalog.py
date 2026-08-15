@@ -3,7 +3,7 @@
 Single source of truth for:
 
   * which gesture names exist — the seven MediaPipe built-ins plus the custom
-    landmark-derived ``Middle_Finger``;
+    landmark-derived ``Middle_Finger`` and ``Shush``;
   * which typed actions a rule may bind to;
   * how to normalise a hand-typed name onto its canonical spelling.
 
@@ -55,10 +55,12 @@ GESTURES = (
     GestureSpec("Victory", "Victory"),
     GestureSpec("ILoveYou", "I love you"),
     GestureSpec("Middle_Finger", "Middle finger", builtin=False),
+    GestureSpec("Shush", "Shush (finger to lips)", builtin=False),
 )
 
 GESTURE_IDS = tuple(spec.id for spec in GESTURES)
 MIDDLE_FINGER = "Middle_Finger"
+SHUSH = "Shush"
 
 ACTION_CATALOG = (
     ActionSpec("none", "No action", "none"),
@@ -101,6 +103,24 @@ ANY_ACTOR = "*"
 # MediaPipe hand-landmark indices: wrist = 0; (tip, pip) per finger.
 _FINGERS = {"index": (8, 6), "middle": (12, 10), "ring": (16, 14), "pinky": (20, 18)}
 _LANDMARK_COUNT = 21
+_WRIST = 0
+_INDEX_TIP, _INDEX_PIP = _FINGERS["index"]
+_INDEX_MCP = 5           # the knuckle, below the pip on an upright finger
+
+# Where the mouth sits inside a face box, as a fraction of the box height
+# measured down from its top edge. Face detectors (YuNet, dlib) frame roughly
+# hairline-to-chin, which puts the lips at ~0.70-0.75; 0.72 is that midpoint.
+MOUTH_CENTRE_Y = 0.72
+
+# How close the index fingertip must come to that mouth point to count as
+# "at the lips". The distance is normalised by the face box — dx by its width,
+# dy by its height — so it scales with how near the person stands to the
+# camera. 0.5 is therefore an ellipse with semi-axes of half a face width and
+# half a face height: horizontally the fingertip may sit anywhere across the
+# face, vertically it may run from the eye line (0.22h) to just under the chin
+# (1.22h). A hand raised to point at the ceiling puts the fingertip at or above
+# the top of the head, which is dy <= -0.72 — comfortably outside.
+MOUTH_RADIUS = 0.5
 
 
 def _key(name):
@@ -171,6 +191,13 @@ def _extended(landmarks, tip, pip):
     return distance(tip) > distance(pip)
 
 
+def _only_extended(landmarks, finger):
+    """True when exactly ``finger`` is extended and the other three are curled."""
+    extended = {name: _extended(landmarks, tip, pip)
+                for name, (tip, pip) in _FINGERS.items()}
+    return all(state == (name == finger) for name, state in extended.items())
+
+
 def is_middle_finger(landmarks):
     """Middle finger extended and the other three curled — the 'salute'.
 
@@ -179,7 +206,63 @@ def is_middle_finger(landmarks):
     """
     if landmarks is None or len(landmarks) < _LANDMARK_COUNT:
         return False
-    extended = {finger: _extended(landmarks, tip, pip)
-                for finger, (tip, pip) in _FINGERS.items()}
-    return (extended["middle"] and not extended["index"]
-            and not extended["ring"] and not extended["pinky"])
+    return _only_extended(landmarks, "middle")
+
+
+def _index_points_up(landmarks):
+    """The index finger stands vertically: tip above pip above knuckle.
+
+    Image y grows downward, so "above" is a smaller y. This is deliberately
+    stricter than ``_extended`` — extension alone is orientation-agnostic and
+    would accept a finger pointing sideways or down at the chest.
+    """
+    return (landmarks[_INDEX_TIP].y < landmarks[_INDEX_PIP].y
+            < landmarks[_INDEX_MCP].y
+            and landmarks[_INDEX_TIP].y < landmarks[_WRIST].y)
+
+
+def fingertip_near_mouth(landmarks, faces, frame_w, frame_h):
+    """Is the index fingertip inside the mouth ellipse of any detected face?
+
+    ``landmarks`` carry MediaPipe's normalised 0..1 coordinates; ``faces`` are
+    ``engine.Face(x, y, w, h, name, conf, known)`` boxes in full-frame pixels
+    (anything exposing ``.x/.y/.w/.h`` works), so the frame size is what maps
+    one onto the other.
+    """
+    if not faces or not frame_w or not frame_h:
+        return False
+    tip_x = landmarks[_INDEX_TIP].x * float(frame_w)
+    tip_y = landmarks[_INDEX_TIP].y * float(frame_h)
+    for face in faces:
+        width, height = float(face.w), float(face.h)
+        if width <= 0 or height <= 0:
+            continue
+        mouth_x = float(face.x) + width / 2.0
+        mouth_y = float(face.y) + MOUTH_CENTRE_Y * height
+        if math.hypot((tip_x - mouth_x) / width,
+                      (tip_y - mouth_y) / height) <= MOUTH_RADIUS:
+            return True
+    return False
+
+
+def is_shush(landmarks, faces=None, frame_w=0, frame_h=0):
+    """Index finger held vertically against the lips — the real-world shush.
+
+    Three terms, all required:
+
+      1. index extended, middle/ring/pinky curled;
+      2. that index actually pointing *up*, not merely extended;
+      3. its fingertip near the mouth of a detected face.
+
+    Term 3 is the whole point. Terms 1 and 2 alone are exactly what MediaPipe
+    already labels ``Pointing_Up`` — a shush and a point at the ceiling are the
+    same hand. The face box is what tells them apart, so with no face in view
+    this returns False and the built-in ``Pointing_Up`` label stands.
+    """
+    if landmarks is None or len(landmarks) < _LANDMARK_COUNT:
+        return False
+    if not _only_extended(landmarks, "index"):
+        return False
+    if not _index_points_up(landmarks):
+        return False
+    return fingertip_near_mouth(landmarks, faces, frame_w, frame_h)

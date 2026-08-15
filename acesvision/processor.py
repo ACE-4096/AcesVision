@@ -156,7 +156,12 @@ class FaceGestureProcessor:
             if now - last_gesture_at >= self.gesture_interval_s:
                 gesture_started = time.monotonic()
                 try:
-                    gestures = self.gesture_detector.detect(frame)
+                    # Faces come first in this loop on purpose: the Shush pose
+                    # is only separable from Pointing_Up by where the fingertip
+                    # sits relative to the mouth. Faces refresh at face_hz and
+                    # gestures at the faster gesture_hz, so these boxes can be
+                    # up to one face interval old — good enough for proximity.
+                    gestures = self.gesture_detector.detect(frame, faces=faces)
                 except Exception as exc:
                     gestures = []
                     errors.append(f"gestures: {exc}")
