@@ -56,3 +56,6 @@ class GestureDetector:
             out.append(Gesture(g.category_name, float(g.score),
                                x0, y0, x1 - x0, y1 - y0))
         return out
+
+    def close(self):
+        self.rec.close()

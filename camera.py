@@ -21,8 +21,10 @@ import os
 import cv2
 import numpy as np
 
-PREF_W = int(os.environ.get("FACE_ID_W", "1920"))
-PREF_H = int(os.environ.get("FACE_ID_H", "1080"))
+PREF_W = int(os.environ.get("FACE_ID_W", "1280"))
+PREF_H = int(os.environ.get("FACE_ID_H", "720"))
+PREF_FPS = int(os.environ.get("FACE_ID_FPS", "30"))
+MANUAL_EXPOSURE = int(os.environ.get("ACESVISION_EXPOSURE", "166"))
 # Probe colour nodes first, then common indices, then IR nodes as last resort.
 CANDIDATES = [9, 10, 0, 1, 2, 11, 12, 13]
 CHROMA_MIN = 6.0   # mean channel spread above this == a colour image
@@ -33,38 +35,49 @@ def _chroma(frame):
     return float((np.abs(b - g) + np.abs(g - r) + np.abs(b - r)).mean())
 
 
-def _try_open(idx):
-    """Open idx with V4L2+MJPG and return (cap, frame) or (None, None)."""
-    cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+def _try_open(device, manual_exposure=False):
+    """Open an index/path with V4L2+MJPG, returning (cap, frame) or none."""
+    cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
     if not cap.isOpened():
         cap.release()
         return None, None
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, PREF_W)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, PREF_H)
-    for _ in range(6):              # let the stream warm up
+    cap.set(cv2.CAP_PROP_FPS, PREF_FPS)
+    if manual_exposure:
+        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+        cap.set(cv2.CAP_PROP_EXPOSURE, MANUAL_EXPOSURE)
+    else:
+        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 3)
+    frame = None
+    valid_frames = 0
+    for _ in range(8):              # let format and exposure controls settle
         ok, frame = cap.read()
         if ok and frame is not None:
-            return cap, frame
+            valid_frames += 1
+            if valid_frames >= 3:
+                return cap, frame
     cap.release()
     return None, None
 
 
-def open_camera(preferred=None):
+def open_camera(preferred=None, manual_exposure=False):
     """Return an opened cv2.VideoCapture (colour preferred), or raise."""
     env = os.environ.get("FACE_ID_CAM")
-    forced = [int(x) for x in (preferred, env) if x is not None]
+    forced = [x for x in (preferred, int(env) if env is not None else None)
+              if x is not None]
 
     # Forced index: honour it exactly, no colour filtering.
     if forced:
-        for idx in forced:
-            cap, frame = _try_open(idx)
+        for device in forced:
+            cap, frame = _try_open(device, manual_exposure=manual_exposure)
             if cap is not None:
                 h, w = frame.shape[:2]
                 tag = "colour" if _chroma(frame) > CHROMA_MIN else "greyscale"
-                print(f"[camera] forced index {idx} ({w}x{h}, {tag})")
+                print(f"[camera] forced device {device} ({w}x{h}, {tag})")
                 return cap
-        raise RuntimeError(f"Forced camera index {forced} would not open.")
+        raise RuntimeError(f"Forced camera device {forced} would not open.")
 
     # Probe, preferring a colour camera; remember first greyscale as fallback.
     fallback = None
@@ -73,7 +86,7 @@ def open_camera(preferred=None):
         if idx in seen:
             continue
         seen.add(idx)
-        cap, frame = _try_open(idx)
+        cap, frame = _try_open(idx, manual_exposure=manual_exposure)
         if cap is None:
             continue
         h, w = frame.shape[:2]

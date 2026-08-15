@@ -1,6 +1,7 @@
 # LBPH + Haar (your 2016 system) needs only these two:
 opencv-contrib-python>=4.9    # 'contrib' = includes cv2.face (LBPH). NOT plain opencv-python.
 numpy
+PySide6==6.11.1               # AcesVision Qt 6/QML desktop GUI
 
 # OBS virtual-camera bridge (obs_virtualcam.py). Also needs the v4l2loopback
 # kernel module installed via apt + modprobe — see README "OBS integration".
