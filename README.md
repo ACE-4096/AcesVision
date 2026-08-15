@@ -33,9 +33,29 @@ The Phase 1 runner is dry-run for actions and does not enable a service:
 python -m acesvision
 python -m acesvision --source droidcam --url http://PHONE_IP:4747/video
 python -m acesvision --obs
+python -m acesvision --no-events            # suppress gesture events
+python -m acesvision --hold-frames 3 --cooldown-s 0.5
 ```
 
-The temporary browser preview is at `http://127.0.0.1:8765`.
+Gesture events are emitted (dry-run) by default; the runner prints
+`[events] enabled` at startup. The temporary browser preview is at
+`http://127.0.0.1:8765`.
+
+### Gesture and action vocabulary
+
+[`gesture_catalog.py`](gesture_catalog.py) is the single vocabulary shared by
+this repo, AcesVision and AceRGB: the seven MediaPipe built-ins plus the
+landmark-derived `Middle_Finger`, and the typed action catalog. Rules validate
+gesture and actor names against it at entry, so a mistyped rule is rejected
+instead of being silently unfireable.
+
+### Camera selection
+
+`acesvision/discovery.py` is the only device inventory. `camera.py` orders what
+it finds — colour first, IR last, virtual/metadata nodes never — and opens one.
+`FACE_ID_CAM=<index|/dev/path>` still forces a device. A contended device raises
+`CameraBusyError` naming the holding process; an absent one raises
+`CameraNotFoundError`. Diagnose with `fuser -v /dev/videoN`.
 
 Launch the native desktop shell:
 

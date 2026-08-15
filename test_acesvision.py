@@ -26,7 +26,14 @@ from acesvision.outputs import CallbackOutput
 from acesvision.overlay import CLEAN, OverlayProfile, render
 from acesvision.pipeline import VisionPipeline
 from acesvision.perception import Detection, file_sha256
-from acesvision.policy import CONNECTORS, Rule, RuleEngine, RuleStore
+from acesvision.policy import (
+    CONNECTORS,
+    Rule,
+    RuleEngine,
+    RuleStore,
+    validate_actor,
+    validate_gesture,
+)
 from acesvision.processor import FaceGestureProcessor
 from acesvision.sources import open_source
 
@@ -543,6 +550,7 @@ class GuiStyleTests(unittest.TestCase):
 
 Landmark = namedtuple("Landmark", "x y")
 
+
 def hand_landmarks(extended=("middle",), wrist=(0.5, 0.9)):
     """21 landmarks with the named fingers extended away from the wrist.
 
@@ -558,6 +566,7 @@ def hand_landmarks(extended=("middle",), wrist=(0.5, 0.9)):
         points[tip] = Landmark(wrist[0], wrist[1] - tip_distance)
     return points
 
+
 class FakeDevice:
     """Stand-in for discovery.WebcamDevice with only the fields camera.py uses."""
 
@@ -566,6 +575,7 @@ class FakeDevice:
         self.kind = kind
         self.path = path or f"/dev/video{index}"
         self.name = name
+
 
 class GestureCatalogTests(unittest.TestCase):
     def test_vocabulary_carries_the_ported_middle_finger(self):
@@ -639,6 +649,7 @@ class GestureCatalogTests(unittest.TestCase):
                               100, 100, 0.5)
         self.assertEqual(rows, [])
 
+
 class CameraDiscoveryTests(unittest.TestCase):
     """camera.py must own no device list of its own — discovery.py is the SSoT."""
 
@@ -678,6 +689,7 @@ class CameraDiscoveryTests(unittest.TestCase):
         )
         self.assertIsNotNone(cap)
         self.assertEqual(probed, ["/dev/video1"])
+
 
 class CameraStatusTests(unittest.TestCase):
     def test_status_distinguishes_missing_busy_and_available(self):
@@ -724,16 +736,20 @@ class CameraStatusTests(unittest.TestCase):
         self.assertIn("obs", detail)
         self.assertIn("/dev/video1", detail)
 
+
 def _colour_frame():
     frame = np.zeros((8, 8, 3), dtype="uint8")
     frame[:, :, 2] = 200          # strong red channel -> chroma above CHROMA_MIN
     return frame
 
+
 def _grey_frame():
     return np.full((8, 8, 3), 120, dtype="uint8")
 
+
 def _fake_colour_capture():
     return FakeCapture([(True, "frame")])
+
 
 class CameraOpenTests(unittest.TestCase):
     def setUp(self):
@@ -833,6 +849,7 @@ class CameraOpenTests(unittest.TestCase):
             status=lambda device: camera.DEVICE_AVAILABLE)
         self.assertIsNotNone(cap)
 
+
 class SourceFailureReportingTests(unittest.TestCase):
     def test_busy_camera_reason_is_reported_not_swallowed(self):
         source = SourceSpec.from_mapping({"id": "webcam", "type": "webcam"})
@@ -866,6 +883,102 @@ class SourceFailureReportingTests(unittest.TestCase):
             pipeline.stop()
             pipeline.join(1.0)
         self.assertIn("held by obs", pipeline.state().last_error)
+
+
+class RuleVocabularyTests(unittest.TestCase):
+    def test_unknown_gesture_is_rejected_at_creation(self):
+        # "shush" is not a MediaPipe gesture; the live rule using it could never
+        # fire and never said so.
+        with self.assertRaises(ValueError):
+            Rule.create("shush", "pipewire", "mute")
+
+    def test_gesture_case_is_normalised_to_the_emitted_spelling(self):
+        rule = Rule.create("open_palm", "mpris", "play_pause")
+        self.assertEqual(rule.gesture, "Open_Palm")
+        self.assertEqual(validate_gesture(" victory "), "Victory")
+
+    def test_actor_is_validated_against_enrolled_identities(self):
+        self.assertEqual(validate_actor("toby", actors=["Toby"]), "Toby")
+        self.assertEqual(validate_actor("", actors=["Toby"]), "*")
+        self.assertEqual(validate_actor("*", actors=["Toby"]), "*")
+        with self.assertRaises(ValueError) as caught:
+            validate_actor("mallory", actors=["Toby"])
+        self.assertIn("Toby", str(caught.exception))
+
+    def test_normalised_rule_actually_fires(self):
+        # Red-then-green: the raw strings produce no decision, the normalised
+        # rule produces one.
+        event = {"gesture": "Open_Palm", "actor": "Toby", "source": "webcam"}
+        unfireable = Rule(id="x", gesture="open_palm", connector="mpris",
+                          action="play_pause", actor="toby")
+        self.assertEqual(RuleEngine([unfireable]).evaluate(event), [])
+
+        repaired = Rule.create("open_palm", "mpris", "play_pause", actor="toby")
+        decisions = RuleEngine([repaired]).evaluate(event)
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0].outcome, "dry_run")
+
+    def test_store_repairs_legacy_rules_and_quarantines_unfireable_ones(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rules.json"
+            path.write_text(json.dumps({"version": 1, "dry_run": True, "rules": [
+                {"id": "a", "gesture": "shush", "connector": "pipewire",
+                 "action": "mute", "actor": "toby", "source": "*",
+                 "enabled": True, "require_liveness": False,
+                 "require_confirmation": False},
+                {"id": "b", "gesture": "open_palm", "connector": "mpris",
+                 "action": "play_pause", "actor": "toby", "source": "*",
+                 "enabled": True, "require_liveness": False,
+                 "require_confirmation": False},
+            ]}))
+            store = RuleStore(path)
+            rules = store.load(strict=False, actors=["Toby"])
+            self.assertEqual([r.id for r in rules], ["b"])
+            self.assertEqual(rules[0].gesture, "Open_Palm")
+            self.assertEqual(rules[0].actor, "Toby")
+            self.assertEqual([raw["id"] for raw, _ in store.rejected], ["a"])
+            with self.assertRaises(ValueError):
+                store.load(strict=True, actors=["Toby"])
+
+
+class HeadlessRunnerTests(unittest.TestCase):
+    def test_gesture_events_are_enabled_by_default(self):
+        from acesvision.__main__ import build_gesture_output, build_parser
+
+        args = build_parser().parse_args([])
+        output = build_gesture_output(args, callback=lambda event: None)
+        self.assertTrue(output.enabled)   # used to be False, forever
+
+    def test_no_events_flag_and_tuning_are_honoured(self):
+        from acesvision.__main__ import build_gesture_output, build_parser
+
+        args = build_parser().parse_args(["--no-events"])
+        self.assertFalse(build_gesture_output(args).enabled)
+
+        args = build_parser().parse_args(["--hold-frames", "3", "--cooldown-s", "0.5"])
+        output = build_gesture_output(args, callback=lambda event: None)
+        self.assertEqual((output.hold_frames, output.cooldown_s), (3, 0.5))
+
+    def test_enabled_output_emits_without_an_external_toggle(self):
+        events = []
+        output = GestureEventOutput(events.append, hold_frames=1,
+                                    clock=Mock(return_value=1.0), enabled=True)
+        source = SourceSpec.from_mapping({"type": "webcam"})
+        output.publish(SceneFrame(source, 0, 0.0, np.zeros((2, 2, 3)),
+                                  gestures=[Gesture("Victory", 0.9, 0, 0, 5, 5)]))
+        self.assertEqual(len(events), 1)
+
+    def test_default_stays_disabled_for_the_gui_toggle(self):
+        events = []
+        output = GestureEventOutput(events.append, hold_frames=1,
+                                    clock=Mock(return_value=1.0))
+        source = SourceSpec.from_mapping({"type": "webcam"})
+        output.publish(SceneFrame(source, 0, 0.0, np.zeros((2, 2, 3)),
+                                  gestures=[Gesture("Victory", 0.9, 0, 0, 5, 5)]))
+        self.assertEqual(events, [])
+
 
 if __name__ == "__main__":
     unittest.main()

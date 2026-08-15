@@ -1,16 +1,26 @@
-"""Typed gesture rules and deny-by-default action policy."""
+"""Typed gesture rules and deny-by-default action policy.
+
+Rule identifiers are validated against a shared vocabulary at entry. They used
+to be free text matched exactly (gui.py addRule -> RuleEngine._matches), which
+made every mistyped rule a permanent silent no-op: "open_palm" never equals the
+emitted "Open_Palm", "toby" never equals the enrolled "Toby".
+"""
 from __future__ import annotations
 
 import json
 import os
 import tempfile
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+
+from gesture_catalog import ANY_ACTOR, GESTURE_IDS, require_gesture
 
 RISK_CONVENIENCE = "convenience"
 RISK_PERSONAL = "personal"
 RISK_SENSITIVE = "sensitive"
+
+KNOWN_FACES_DIR = Path(__file__).resolve().parents[1] / "known_faces"
 
 CONNECTORS = {
     "acergb": {
@@ -52,10 +62,10 @@ class Rule:
         risk = CONNECTORS[connector][action]
         return cls(
             id=str(uuid.uuid4()),
-            gesture=gesture,
+            gesture=validate_gesture(gesture),
             connector=connector,
             action=action,
-            actor=actor or "*",
+            actor=validate_actor(actor),
             source=source or "*",
             require_liveness=risk == RISK_SENSITIVE,
             require_confirmation=risk == RISK_SENSITIVE,
@@ -81,6 +91,55 @@ def validate_action(connector, action):
         raise ValueError(f"unsupported connector: {connector}")
     if action not in CONNECTORS[connector]:
         raise ValueError(f"unsupported action for {connector}: {action}")
+
+
+def validate_gesture(gesture):
+    """Canonical gesture id from the shared catalog, or ValueError.
+
+    Normalises case and separators, so "open_palm" resolves to the emitted
+    "Open_Palm" instead of becoming an unfireable rule.
+    """
+    return require_gesture(str(gesture).strip())
+
+
+def known_actors(root=None):
+    """Enrolled identities — the directory names under known_faces/."""
+    root = Path(root or KNOWN_FACES_DIR)
+    if not root.is_dir():
+        return []
+    return sorted(entry.name for entry in root.iterdir() if entry.is_dir())
+
+
+def validate_actor(actor, actors=None):
+    """Canonical enrolled name, or '*' for anyone. Raises on an unknown actor.
+
+    Matching is case-insensitive so "toby" resolves to the enrolled "Toby"
+    rather than matching nothing forever.
+    """
+    text = str(actor or "").strip()
+    if not text or text == ANY_ACTOR:
+        return ANY_ACTOR
+    enrolled = list(actors if actors is not None else known_actors())
+    for name in enrolled:
+        if name.lower() == text.lower():
+            return name
+    raise ValueError(
+        f"unknown actor: {actor!r}. Enrolled: "
+        + (", ".join(enrolled) if enrolled else "(nobody)")
+        + f". Use '{ANY_ACTOR}' for anyone."
+    )
+
+
+def normalise_rule(rule, actors=None):
+    """Return the rule with canonical gesture/actor, or raise ValueError.
+
+    Used when loading persisted rules so pre-validation files are repaired
+    rather than silently kept in an unfireable state.
+    """
+    validate_action(rule.connector, rule.action)
+    return replace(rule,
+                   gesture=validate_gesture(rule.gesture),
+                   actor=validate_actor(rule.actor, actors=actors))
 
 
 class RuleEngine:
@@ -124,15 +183,29 @@ class RuleEngine:
 class RuleStore:
     def __init__(self, path=None):
         self.path = Path(path or Path.home() / ".config" / "acesvision" / "rules.json")
+        self.rejected = []
 
-    def load(self):
+    def load(self, strict=True, actors=None):
+        """Load rules, validating every gesture/actor against the catalog.
+
+        strict=True (default) raises on the first invalid rule — the historical
+        behaviour. strict=False repairs what it can (case/separator differences)
+        and quarantines the rest into self.rejected, so one bad rule cannot
+        blank out a whole rule set.
+        """
+        self.rejected = []
         if not self.path.exists():
             return []
         data = json.loads(self.path.read_text())
         rules = []
         for raw in data.get("rules", []):
-            validate_action(raw["connector"], raw["action"])
-            rules.append(Rule(**raw))
+            try:
+                validate_action(raw["connector"], raw["action"])
+                rules.append(normalise_rule(Rule(**raw), actors=actors))
+            except (ValueError, TypeError, KeyError) as exc:
+                if strict:
+                    raise
+                self.rejected.append((raw, str(exc)))
         return rules
 
     def save(self, rules):

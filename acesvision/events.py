@@ -9,7 +9,8 @@ from .contracts import SceneFrame
 
 class GestureEventOutput:
     def __init__(self, callback: Callable[[dict], None], hold_frames: int = 6,
-                 cooldown_s: float = 1.5, clock=time.monotonic):
+                 cooldown_s: float = 1.5, clock=time.monotonic,
+                 enabled: bool = False):
         self.callback = callback
         self.hold_frames = max(1, int(hold_frames))
         self.cooldown_s = float(cooldown_s)
@@ -17,7 +18,10 @@ class GestureEventOutput:
         self._name = ""
         self._held = 0
         self._last_fire = None
-        self.enabled = False
+        # Off by default because the GUI owns a toggle for it. Any headless
+        # caller must opt in explicitly — python -m acesvision emitted nothing
+        # ever because nobody did.
+        self.enabled = bool(enabled)
 
     def set_enabled(self, enabled: bool) -> None:
         self.enabled = bool(enabled)

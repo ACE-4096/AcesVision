@@ -11,13 +11,15 @@ from PySide6.QtCore import Property, QObject, QTimer, Signal, Slot, QUrl
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlApplicationEngine
 
+from gesture_catalog import ANY_ACTOR, GESTURE_IDS
+
 from .contracts import SceneFrame, SourceSpec
 from .events import GestureEventOutput
 from .discovery import discover_webcams, preferred_webcam, scan_droidcam
 from .outputs import LatestFrameOutput, ObsVirtualCameraOutput
 from .overlay import MINIMAL, PROFILES, OverlayProfile
 from .pipeline import VisionPipeline
-from .policy import CONNECTORS, Rule, RuleEngine, RuleStore
+from .policy import CONNECTORS, Rule, RuleEngine, RuleStore, known_actors
 from .preview import PreviewServer
 from .processor import FaceGestureProcessor
 from .perception import file_sha256
@@ -90,7 +92,15 @@ class VisionBackend(QObject):
                 self._model_paths[model["id"]] = path
         self.rule_store = RuleStore()
         try:
-            self._rules = self.rule_store.load() if load_saved_rules else []
+            # Non-strict: repair rules that only differ by case/separator and
+            # quarantine the rest, so one unfireable rule cannot blank the set.
+            self._rules = (self.rule_store.load(strict=False)
+                           if load_saved_rules else [])
+            if self.rule_store.rejected:
+                dropped = ", ".join(
+                    f"{raw.get('gesture', '?')} ({reason})"
+                    for raw, reason in self.rule_store.rejected)
+                self._last_decision = f"Rules skipped as unfireable: {dropped}"
         except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
             self._rules = []
             self._last_decision = f"Saved rules not loaded: {exc}"
@@ -327,6 +337,16 @@ class VisionBackend(QObject):
     def connectorActions(self, connector):
         return list(CONNECTORS.get(connector, {}))
 
+    @Property("QVariantList", constant=True)
+    def gestureNames(self):
+        """The shared catalog vocabulary — rules must pick from this list."""
+        return list(GESTURE_IDS)
+
+    @Property("QVariantList", constant=True)
+    def actorNames(self):
+        """'*' (anyone) plus every enrolled identity under known_faces/."""
+        return [ANY_ACTOR] + known_actors()
+
     @Slot(str)
     def useWebcam(self, index_text):
         try:
@@ -470,15 +490,14 @@ class VisionBackend(QObject):
 
     @Slot(str, str, str, str)
     def addRule(self, gesture, actor, connector, action):
+        # Rule.create validates gesture and actor against the shared catalog and
+        # the enrolled identities; unknown values are rejected here rather than
+        # silently persisted as a rule that can never match.
         try:
             rule = Rule.create(gesture.strip(), connector, action,
-                               actor=actor.strip() or "*")
+                               actor=actor.strip() or ANY_ACTOR)
         except ValueError as exc:
             self._error = str(exc)
-            self.errorChanged.emit()
-            return
-        if not rule.gesture:
-            self._error = "Gesture is required"
             self.errorChanged.emit()
             return
         self._rules.append(rule)

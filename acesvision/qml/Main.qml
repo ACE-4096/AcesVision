@@ -567,14 +567,17 @@ ApplicationWindow {
                             Text { text: "Add dry-run rule"; color: window.textMain; font.bold: true }
                             RowLayout {
                                 Layout.fillWidth: true
-                                TextField {
+                                // Catalog-backed, not free text: a mistyped
+                                // gesture or actor produced a rule that could
+                                // never fire and never said so.
+                                ComboBox {
                                     id: ruleGesture
-                                    placeholderText: "Gesture, for example Victory"
+                                    model: vision.gestureNames
                                     Layout.fillWidth: true
                                 }
-                                TextField {
+                                ComboBox {
                                     id: ruleActor
-                                    placeholderText: "Actor or blank for anyone"
+                                    model: vision.actorNames
                                     Layout.fillWidth: true
                                 }
                             }
@@ -596,14 +599,14 @@ ApplicationWindow {
                                 }
                                 Button {
                                     text: "Add rule"
-                                    enabled: ruleGesture.text.trim().length > 0
+                                    enabled: ruleGesture.currentText.length > 0
                                              && ruleConnector.currentText.length > 0
                                              && ruleAction.currentText.length > 0
                                     onClicked: {
-                                        vision.addRule(ruleGesture.text, ruleActor.text,
+                                        vision.addRule(ruleGesture.currentText,
+                                                       ruleActor.currentText,
                                                        ruleConnector.currentText,
                                                        ruleAction.currentText)
-                                        ruleGesture.text = ""
                                     }
                                 }
                             }

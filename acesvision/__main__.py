@@ -29,7 +29,7 @@ def source_from_args(args):
     })
 
 
-def main():
+def build_parser():
     parser = argparse.ArgumentParser(description="AcesVision local runtime")
     parser.add_argument("--source", choices=["webcam", "droidcam", "network"],
                         default="webcam")
@@ -41,13 +41,38 @@ def main():
     parser.add_argument("--model", default=str(DEFAULT_MODEL))
     parser.add_argument("--obs", action="store_true")
     parser.add_argument("--obs-device", default=os.environ.get("FACE_ID_VCAM"))
-    args = parser.parse_args()
+    parser.add_argument("--no-events", action="store_true",
+                        help="suppress gesture events (they are on by default)")
+    parser.add_argument("--hold-frames", type=int, default=6,
+                        help="frames a gesture must persist before it fires")
+    parser.add_argument("--cooldown-s", type=float, default=1.5,
+                        help="minimum seconds between gesture events")
+    return parser
+
+
+def build_gesture_output(args, callback=None):
+    """Gesture output for the headless runner — enabled unless --no-events.
+
+    This runner is the documented headless entry point (README.md:20-24) and it
+    used to emit nothing, ever: GestureEventOutput defaults to disabled and
+    nothing here turned it on.
+    """
+    return GestureEventOutput(
+        callback or (lambda event:
+                     print("[gesture dry-run] " + json.dumps(event, sort_keys=True))),
+        hold_frames=args.hold_frames,
+        cooldown_s=args.cooldown_s,
+        enabled=not args.no_events,
+    )
+
+
+def main():
+    args = build_parser().parse_args()
 
     source = source_from_args(args)
     latest = LatestFrameOutput(MINIMAL)
-    outputs = [latest, GestureEventOutput(
-        lambda event: print("[gesture dry-run] " + json.dumps(event, sort_keys=True))
-    )]
+    gestures = build_gesture_output(args)
+    outputs = [latest, gestures]
     if args.obs:
         outputs.append(ObsVirtualCameraOutput(BROADCAST, device=args.obs_device))
 
@@ -62,6 +87,8 @@ def main():
     print(f"[source] {source.safe_label()}")
     print(f"[preview] http://127.0.0.1:{args.preview_port}")
     print(f"[obs] {'enabled' if args.obs else 'disabled'}")
+    print(f"[events] {'enabled' if gestures.enabled else 'disabled'} "
+          f"(hold {gestures.hold_frames} frames, cooldown {gestures.cooldown_s:g}s)")
     print("[actions] dry-run only")
     pipeline.start()
     preview.start()
