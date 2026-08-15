@@ -14,6 +14,10 @@ models/*.task
 models/*.pt
 *.pt
 
+# Live-verification output — reports and annotated frames of the founder's
+# face, written by verify_gestures_live.py. NEVER commit these.
+verification/
+
 # Scanner output and test sets — local only (may contain biometric copies)
 photo_matches/
 test_photo_matches/

@@ -57,6 +57,37 @@ scales with how near you stand. That means `Shush` needs face boxes:
 `GestureDetector.detect(frame, faces=...)`. With no face in view the built-in
 `Pointing_Up` stands, and the themes still cycle.
 
+### Live gesture verification
+
+Every gesture claim in this repo is proven against *synthetic* landmarks. No
+gesture has ever been observed coming off a real camera. One command closes
+that gap:
+
+```bash
+.venv/bin/python verify_gestures_live.py
+```
+
+It prompts you through all nine gestures on a timer (~75s), records what the
+real detectors saw for every frame, and writes
+`verification/live-gestures-<date>.md` plus two or three annotated frames per
+gesture under `verification/frames/`. `verification/` is gitignored — those
+frames contain your face and must never be committed.
+
+It is observation only: no rule is loaded, no connector is constructed, nothing
+is dispatched, and `~/.config/acesvision/rules.json` is not read. Enforced by
+`LiveVerificationSafetyTests`, which parses the file and fails if it ever
+imports the rule or connector machinery.
+
+The headline number is the Shush occlusion test. A finger across the lips can
+hide the mouth; if YuNet drops the face box at that instant `is_shush` returns
+False and the frame degrades to `Pointing_Up`, which is bound to `next-theme` —
+a failed shush would cycle your themes. The report counts every such frame and
+fails `Shush` on a single one.
+
+Exit codes: `0` all gestures verified · `1` at least one failed · `2` camera
+held by another process (it names the holder and stops) · `3` no camera ·
+`4` a model is missing.
+
 ### Camera selection
 
 `acesvision/discovery.py` is the only device inventory. `camera.py` orders what

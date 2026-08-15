@@ -6,6 +6,7 @@ import threading
 import time
 import unittest
 from collections import namedtuple
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -13,6 +14,7 @@ import numpy as np
 
 import camera
 import gesture_catalog
+import verify_gestures_live as verify
 from acesvision import connectors
 from acesvision.contracts import SceneFrame, SourceSpec
 from acesvision.events import GestureEventOutput
@@ -1802,6 +1804,365 @@ class HeadlessConnectorTests(unittest.TestCase):
                                         "source": "webcam"})
         self.assertTrue(any("daemon_absent" in line for line in lines))
         self.assertTrue(any(line.startswith("[decision]!!") for line in lines))
+
+
+def observation(detected=(), raw=(), face=False, at_s=0.0):
+    """One synthetic captured frame for the live-verification scorer."""
+    return verify.FrameObservation(
+        detected=tuple(detected), raw_categories=tuple(raw),
+        face_present=bool(face), face_count=1 if face else 0,
+        hands=1 if detected else 0, at_s=at_s,
+    )
+
+
+class LiveVerificationScoringTests(unittest.TestCase):
+    """Scoring for verify_gestures_live, driven entirely by synthetic frames.
+
+    The harness itself can only be run in front of a real webcam, so the part
+    that decides PASS/FAIL is deliberately pure and is proven here instead.
+    """
+
+    def test_a_clean_hold_passes_with_the_measured_rate(self):
+        score = verify.score_attempt(
+            "Thumb_Up", [observation(["Thumb_Up"], ["Thumb_Up"], face=True)] * 10)
+        self.assertTrue(score.passed)
+        self.assertEqual((score.frames, score.hits), (10, 10))
+        self.assertEqual(score.detection_rate, 1.0)
+        self.assertEqual(score.face_rate, 1.0)
+        self.assertEqual(score.misclassified, ())
+        self.assertEqual(score.verdict, "PASS")
+
+    def test_no_frames_scores_an_honest_zero_and_fails(self):
+        score = verify.score_attempt("Victory", [])
+        self.assertFalse(score.passed)
+        self.assertEqual((score.frames, score.hits), (0, 0))
+        self.assertEqual((score.detection_rate, score.face_rate), (0.0, 0.0))
+        self.assertIn("no frames", score.reason)
+
+    def test_a_hold_below_the_bar_fails_and_names_the_rate(self):
+        frames = ([observation(["Open_Palm"])] * 5 + [observation()] * 5)
+        score = verify.score_attempt("Open_Palm", frames, min_rate=0.6)
+        self.assertFalse(score.passed)
+        self.assertEqual(score.detection_rate, 0.5)
+        self.assertIn("50%", score.reason)
+        self.assertIn("60%", score.reason)
+        # The same frames pass against a lower bar — the bar is what decides.
+        self.assertTrue(verify.score_attempt("Open_Palm", frames,
+                                             min_rate=0.5).passed)
+
+    def test_face_rate_counts_only_frames_that_kept_a_box(self):
+        frames = [observation(["Victory"], face=True)] * 3 + \
+                 [observation(["Victory"], face=False)] * 1
+        score = verify.score_attempt("Victory", frames)
+        self.assertEqual(score.face_rate, 0.75)
+        self.assertEqual(score.detection_rate, 1.0)
+
+    def test_misclassifications_are_ranked_and_counted_once_per_frame(self):
+        frames = [
+            observation(["Closed_Fist", "Thumb_Up", "Thumb_Up"]),   # two hands
+            observation(["Thumb_Up"]),
+            observation(["Victory"]),
+        ]
+        score = verify.score_attempt("Closed_Fist", frames)
+        self.assertEqual(score.misclassified, (("Thumb_Up", 2), ("Victory", 1)))
+        self.assertEqual(score.hits, 1)
+
+    def test_raw_mediapipe_labels_are_recorded_alongside_the_verdict(self):
+        frames = [observation(["Shush"], ["Pointing_Up"], face=True)] * 4
+        score = verify.score_attempt("Shush", frames)
+        self.assertEqual(score.raw_labels, (("Pointing_Up", 4),))
+        # The model said Pointing_Up on every frame, but the custom pose won,
+        # so nothing leaked and nothing would have fired next-theme.
+        self.assertEqual(score.leak_frames, 0)
+        self.assertTrue(score.passed)
+
+    def test_a_single_leaked_pointing_up_fails_the_shush(self):
+        # The defect this whole harness exists to measure: an occluded mouth
+        # drops the face box, is_shush returns False, and the frame degrades to
+        # Pointing_Up -- which automations.json binds to `next-theme`.
+        frames = [observation(["Shush"], ["Pointing_Up"], face=True)] * 19 + \
+                 [observation(["Pointing_Up"], ["Pointing_Up"], face=False)]
+        score = verify.score_attempt("Shush", frames)
+        self.assertEqual(score.leak_frames, 1)
+        self.assertEqual(score.detection_rate, 0.95)   # 95% is not good enough
+        self.assertFalse(score.passed)
+        self.assertIn("next-theme", score.reason)
+
+    def test_leaks_are_recorded_for_other_gestures_but_do_not_fail_them(self):
+        frames = [observation(["Victory"])] * 9 + [observation(["Pointing_Up"])]
+        score = verify.score_attempt("Victory", frames)
+        self.assertEqual(score.leak_frames, 1)
+        self.assertTrue(score.passed)
+
+    def test_pointing_up_is_never_its_own_leak(self):
+        score = verify.score_attempt(
+            "Pointing_Up", [observation(["Pointing_Up"])] * 4)
+        self.assertEqual(score.leak_frames, 0)
+        self.assertTrue(score.passed)
+
+    def test_overall_verdict_needs_every_gesture(self):
+        good = verify.score_attempt("Victory", [observation(["Victory"])] * 4)
+        bad = verify.score_attempt("Shush", [])
+        self.assertEqual(verify.overall_verdict([good])[0], True)
+        passed, summary = verify.overall_verdict([good, bad])
+        self.assertFalse(passed)
+        self.assertIn("Shush", summary)
+        self.assertIn("1/2", summary)
+        self.assertEqual(verify.overall_verdict([])[0], False)
+
+    def test_every_catalog_gesture_has_a_prompt(self):
+        # Drift guard: a gesture added to the catalog with no instruction would
+        # be prompted as a blank line the founder cannot act on.
+        for spec in gesture_catalog.GESTURES:
+            self.assertIn(spec.id, verify.INSTRUCTIONS)
+        self.assertEqual(len(verify.INSTRUCTIONS), len(gesture_catalog.GESTURES))
+
+    def test_gesture_subset_selection_keeps_catalog_order(self):
+        chosen = verify.selected_gestures("shush,thumb up")
+        self.assertEqual([spec.id for spec in chosen], ["Thumb_Up", "Shush"])
+        self.assertEqual(len(verify.selected_gestures("")),
+                         len(gesture_catalog.GESTURES))
+        with self.assertRaises(ValueError):
+            verify.selected_gestures("wave")
+
+
+class LiveVerificationReportTests(unittest.TestCase):
+    def _scores(self):
+        return [
+            verify.score_attempt("Thumb_Up",
+                                 [observation(["Thumb_Up"], ["Thumb_Up"])] * 8),
+            verify.score_attempt(
+                "Shush",
+                [observation(["Shush"], ["Pointing_Up"], face=True)] * 6 +
+                [observation(["Pointing_Up"], ["Pointing_Up"])] * 4),
+        ]
+
+    def test_report_carries_the_table_the_verdicts_and_the_leak_count(self):
+        meta = verify.RunMeta(started_at=datetime(2026, 8, 15, 14, 30),
+                              camera_label="Integrated Camera",
+                              camera_path="/dev/video1", resolution="1280x720",
+                              face_engine="yunet")
+        text = verify.render_report(self._scores(), meta)
+        self.assertIn("# Live gesture verification — 2026-08-15 14:30:00", text)
+        self.assertIn("**Verdict: FAIL", text)
+        self.assertIn("/dev/video1", text)
+        self.assertIn("| `Thumb_Up` |", text)
+        self.assertIn("**PASS**", text)
+        self.assertIn("**FAIL**", text)
+        self.assertIn("Shush occlusion test", text)
+        self.assertIn("`Pointing_Up` leaked: 4 frame(s)", text)
+        self.assertIn("Face box survived: **60%** (6 frames)", text)
+        self.assertIn("no rule loaded, no connector armed", text)
+
+    def test_report_says_so_when_the_shush_was_not_measured(self):
+        text = verify.render_report(
+            [verify.score_attempt("Victory", [observation(["Victory"])])],
+            verify.RunMeta())
+        self.assertIn("Shush occlusion test", text)
+        self.assertIn("Not measured", text)
+        self.assertIn("**Verdict: PASS", text)
+
+    def test_report_is_written_and_never_overwrites_an_earlier_run(self):
+        when = datetime(2026, 8, 15, 14, 30, 5)
+        with tempfile.TemporaryDirectory() as directory:
+            first = verify.write_report("one", directory, when)
+            self.assertEqual(first.name, "live-gestures-2026-08-15.md")
+            self.assertEqual(first.read_text(), "one")
+            second = verify.write_report("two", directory, when)
+            self.assertEqual(second.name, "live-gestures-2026-08-15-143005.md")
+            self.assertEqual(first.read_text(), "one")   # still intact
+            self.assertEqual(second.read_text(), "two")
+
+
+class FakeRecognizer:
+    """Stand-in for the MediaPipe GestureRecognizer."""
+
+    Result = namedtuple("Result", "hand_landmarks gestures")
+    Category = namedtuple("Category", "category_name score")
+
+    def __init__(self, landmarks, label="Pointing_Up", score=0.9):
+        self.landmarks = landmarks
+        self.label = label
+        self.score = score
+        self.calls = 0
+
+    def recognize(self, image):
+        self.calls += 1
+        return self.Result([self.landmarks],
+                           [[self.Category(self.label, self.score)]])
+
+    def close(self):
+        pass
+
+
+class FakeGestureDetector:
+    """Only what capture_attempt uses: recognize() and min_score."""
+
+    def __init__(self, landmarks, label="Pointing_Up"):
+        self.rec = FakeRecognizer(landmarks, label)
+        self.min_score = 0.5
+
+    def recognize(self, frame):
+        return self.rec.recognize(None), FRAME_W, FRAME_H
+
+
+class LiveVerificationCaptureTests(unittest.TestCase):
+    """The recording loop, exercised with synthetic frames and no camera."""
+
+    def _run(self, face_sequence, reads=4):
+        frames = [(True, np.zeros((4, 4, 3), np.uint8)) for _ in range(reads)]
+        cap = FakeCapture(frames)
+        detector = FakeGestureDetector(pointing_hand(AT_LIPS))
+        faces = list(face_sequence)
+
+        def face_detector(frame):
+            return faces.pop(0) if faces else []
+
+        # hold_s is long; the run ends on the read-failure guard instead, which
+        # makes the frame count deterministic rather than wall-clock dependent.
+        return verify.capture_attempt(cap, "Shush", detector, face_detector,
+                                      hold_s=60.0, out=lambda *a: None)
+
+    def test_the_same_hand_reads_as_shush_or_as_a_leak_by_the_face_box_alone(self):
+        observations, failures = self._run([[FACE_BOX], [FACE_BOX], [], []])
+        self.assertEqual(len(observations), 4)
+        self.assertEqual([item.detected for item in observations],
+                         [("Shush",), ("Shush",), ("Pointing_Up",),
+                          ("Pointing_Up",)])
+        # MediaPipe called every one of them Pointing_Up.
+        self.assertEqual([item.raw_categories for item in observations],
+                         [("Pointing_Up",)] * 4)
+        self.assertEqual([item.face_present for item in observations],
+                         [True, True, False, False])
+        self.assertEqual(failures, 30)   # the guard that ends a dead capture
+
+        score = verify.score_attempt("Shush", observations)
+        self.assertEqual((score.hits, score.leak_frames), (2, 2))
+        self.assertEqual((score.detection_rate, score.face_rate), (0.5, 0.5))
+        self.assertFalse(score.passed)
+
+    def test_a_failing_face_detector_never_aborts_the_run(self):
+        def exploding(frame):
+            raise RuntimeError("yunet fell over")
+
+        cap = FakeCapture([(True, np.zeros((4, 4, 3), np.uint8))])
+        detector = FakeGestureDetector(pointing_hand(AT_LIPS))
+        observations, _ = verify.capture_attempt(
+            cap, "Shush", detector, exploding, hold_s=60.0, out=lambda *a: None)
+        self.assertEqual(len(observations), 1)
+        self.assertFalse(observations[0].face_present)
+        self.assertEqual(observations[0].detected, ("Pointing_Up",))
+
+    def test_frame_saver_keeps_two_samples_plus_the_first_defect(self):
+        saver = verify.FrameSaver("/nonexistent", per_gesture=3, hold_s=10.0)
+        clean = observation(["Shush"])
+        leak = observation(["Pointing_Up"])
+        self.assertIsNone(saver.wanted("Shush", clean, 0.5))    # too early
+        self.assertEqual(saver.wanted("Shush", leak, 0.5), "defect")
+        saver._record("Shush", "defect")
+        self.assertIsNone(saver.wanted("Shush", leak, 0.6))     # only the first
+        self.assertIsNone(saver.wanted("Shush", clean, 1.0))
+        self.assertEqual(saver.wanted("Shush", clean, 3.0), "early")
+        saver._record("Shush", "early")
+        self.assertEqual(saver.wanted("Shush", clean, 8.0), "late")
+        saver._record("Shush", "late")
+        self.assertIsNone(saver.wanted("Shush", clean, 9.0))    # capped at 3
+        # A second gesture gets its own budget.
+        self.assertEqual(saver.wanted("Victory", leak, 3.0), "defect")
+
+    def test_saved_frames_are_annotated_jpegs_on_disk(self):
+        with tempfile.TemporaryDirectory() as directory:
+            saver = verify.FrameSaver(directory)
+            frame = np.zeros((200, 200, 3), np.uint8)
+            path = saver.save("Shush", "defect", frame,
+                              [Face(20, 20, 60, 80, "Toby", 0.2, True)],
+                              [Gesture("Pointing_Up", 0.9, 10, 10, 40, 40)], 9)
+            self.assertEqual(path.name, "09-Shush-defect.jpg")
+            self.assertTrue(path.exists() and path.stat().st_size > 0)
+            # The overlay drew on a copy; the captured frame is untouched.
+            self.assertEqual(int(frame.max()), 0)
+
+    def test_a_contended_camera_reports_the_holder_and_exits_without_spinning(self):
+        lines = []
+        with patch.object(verify, "choose_camera",
+                          return_value=("/dev/video1", "Cam", "/dev/video1")), \
+                patch.object(camera, "open_camera",
+                             side_effect=camera.CameraBusyError("in use")), \
+                patch.object(verify, "describe_holders",
+                             return_value="obs (pid 4242)"):
+            code = verify.main([], out=lines.append)
+        self.assertEqual(code, verify.EXIT_BUSY)
+        self.assertTrue(any("obs (pid 4242)" in line for line in lines))
+        self.assertTrue(any("Nothing was measured" in line for line in lines))
+
+
+class LiveVerificationSafetyTests(unittest.TestCase):
+    """The harness must not be able to move a light, by construction."""
+
+    SOURCE = Path(__file__).with_name("verify_gestures_live.py")
+
+    def test_it_imports_no_rule_or_connector_machinery(self):
+        import ast
+
+        tree = ast.parse(self.SOURCE.read_text())
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                module = node.module or ""
+                imported.add(module)
+                imported.update(f"{module}.{alias.name}" for alias in node.names)
+        # Lazy, in-function imports are visible to ast too, so this covers the
+        # whole file rather than just the header.
+        for banned in ("acesvision.policy", "acesvision.connectors",
+                       "acesvision.__main__", "policy", "connectors", "dbus"):
+            self.assertNotIn(banned, imported)
+
+    def test_it_names_no_executor_and_no_rules_file(self):
+        import ast
+
+        tree = ast.parse(self.SOURCE.read_text())
+        used = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+        used |= {node.attr for node in ast.walk(tree)
+                 if isinstance(node, ast.Attribute)}
+        for banned in ("RuleEngine", "RuleStore", "default_registry",
+                       "AceRgbConnector", "evaluate", "execute", "subprocess",
+                       "Popen"):
+            self.assertNotIn(banned, used)
+        literals = [node.value for node in ast.walk(tree)
+                    if isinstance(node, ast.Constant) and isinstance(node.value, str)]
+        # The module docstring is allowed to explain what the file must not do.
+        literals.remove(ast.get_docstring(tree, clean=False))
+        self.assertFalse([text for text in literals if "rules.json" in text])
+
+    def test_the_report_directory_is_gitignored(self):
+        # The annotated frames contain the founder's face. They must never be
+        # committable, so this is asserted rather than assumed.
+        ignore = Path(__file__).with_name(".gitignore").read_text().splitlines()
+        self.assertIn("verification/", [line.strip() for line in ignore])
+
+
+class GestureRecognizeSeamTests(unittest.TestCase):
+    def test_detect_is_recognize_plus_classify(self):
+        # verify_gestures_live needs the model's own label as well as the
+        # classified one; recognize() exists so it does not run inference twice.
+        from gestures import GestureDetector
+
+        detector = GestureDetector.__new__(GestureDetector)
+        detector.rec = FakeRecognizer(pointing_hand(AT_LIPS))
+        detector.min_score = 0.5
+        frame = np.zeros((FRAME_H, FRAME_W, 3), np.uint8)
+
+        result, width, height = detector.recognize(frame)
+        self.assertEqual((width, height), (FRAME_W, FRAME_H))
+        self.assertEqual(len(result.hand_landmarks), 1)
+
+        self.assertEqual([row.name for row in detector.detect(frame)],
+                         ["Pointing_Up"])
+        self.assertEqual([row.name for row in
+                          detector.detect(frame, faces=[FACE_BOX])], ["Shush"])
+        self.assertEqual(detector.rec.calls, 3)   # one pass per detect call
 
 
 if __name__ == "__main__":

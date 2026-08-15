@@ -48,12 +48,23 @@ class GestureDetector:
         self.rec = vision.GestureRecognizer.create_from_options(opts)
         self.min_score = min_score
 
-    def detect(self, frame_bgr, faces=None):
+    def recognize(self, frame_bgr):
+        """One MediaPipe pass -> (raw result, frame width, frame height).
+
+        Public because the model's own labels are evidence in their own right:
+        a tool that wants to see what MediaPipe said *before* the custom poses
+        overrode it (verify_gestures_live.py does) would otherwise have to run
+        inference twice, or reach into .rec. detect() is this plus classify.
+        """
         h, w = frame_bgr.shape[:2]
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         with _GLOCK:
             res = self.rec.recognize(img)
+        return res, w, h
+
+    def detect(self, frame_bgr, faces=None):
+        res, w, h = self.recognize(frame_bgr)
         return classify_hands(res.hand_landmarks, res.gestures, w, h,
                               self.min_score, faces=faces)
 
