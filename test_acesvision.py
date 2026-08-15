@@ -6,6 +6,7 @@ from unittest.mock import Mock
 
 import numpy as np
 
+import gesture_catalog
 from acesvision.contracts import SceneFrame, SourceSpec
 from acesvision.events import GestureEventOutput
 from acesvision.discovery import (
@@ -20,7 +21,7 @@ from acesvision.outputs import CallbackOutput
 from acesvision.overlay import CLEAN, OverlayProfile, render
 from acesvision.pipeline import VisionPipeline
 from acesvision.perception import Detection, file_sha256
-from acesvision.policy import Rule, RuleEngine, RuleStore
+from acesvision.policy import CONNECTORS, Rule, RuleEngine, RuleStore
 from acesvision.processor import FaceGestureProcessor
 from acesvision.sources import open_source
 
@@ -534,6 +535,95 @@ class GuiStyleTests(unittest.TestCase):
         self.assertTrue(backend._auto_exposure)
         self.assertTrue(backend.pipeline._camera_controls["auto_exposure"])
 
+
+Landmark = namedtuple("Landmark", "x y")
+
+def hand_landmarks(extended=("middle",), wrist=(0.5, 0.9)):
+    """21 landmarks with the named fingers extended away from the wrist.
+
+    Distances are measured from the wrist, so this mirrors the orientation-
+    agnostic test in gesture_catalog._extended.
+    """
+    points = [Landmark(*wrist)] * 21
+    points = list(points)
+    for finger, (tip, pip) in gesture_catalog._FINGERS.items():
+        pip_distance = 0.10
+        tip_distance = 0.20 if finger in extended else 0.05
+        points[pip] = Landmark(wrist[0], wrist[1] - pip_distance)
+        points[tip] = Landmark(wrist[0], wrist[1] - tip_distance)
+    return points
+
+class GestureCatalogTests(unittest.TestCase):
+    def test_vocabulary_carries_the_ported_middle_finger(self):
+        self.assertIn("Middle_Finger", gesture_catalog.GESTURE_IDS)
+        spec = gesture_catalog.gesture_by_id("Middle_Finger")
+        self.assertFalse(spec.builtin)   # landmark-derived, not a model label
+        # The seven MediaPipe built-ins are all present and marked as built-in.
+        builtins = [s.id for s in gesture_catalog.GESTURES if s.builtin]
+        self.assertEqual(len(builtins), 7)
+
+    def test_loose_names_normalise_onto_the_emitted_spelling(self):
+        # The exact live-rules bug: "open_palm" never matched "Open_Palm".
+        self.assertEqual(gesture_catalog.normalise_gesture("open_palm"), "Open_Palm")
+        self.assertEqual(gesture_catalog.normalise_gesture("middle finger"),
+                         "Middle_Finger")
+        self.assertEqual(gesture_catalog.normalise_gesture("ILOVEYOU"), "ILoveYou")
+
+    def test_unknown_gesture_is_named_and_rejected(self):
+        self.assertIsNone(gesture_catalog.normalise_gesture("shush"))
+        self.assertFalse(gesture_catalog.is_known_gesture("shush"))
+        with self.assertRaises(ValueError) as caught:
+            gesture_catalog.require_gesture("shush")
+        self.assertIn("shush", str(caught.exception))
+        self.assertIn("Open_Palm", str(caught.exception))   # lists the vocabulary
+
+    def test_action_catalog_matches_acergb(self):
+        self.assertEqual(len(gesture_catalog.ACTION_CATALOG), 16)
+        for action_id in ("lights_next_theme", "device_gradient", "media_playpause",
+                          "volume_mute", "custom"):
+            self.assertEqual(gesture_catalog.require_action(action_id), action_id)
+        with self.assertRaises(ValueError):
+            gesture_catalog.require_action("launch_missiles")
+
+    def test_connector_bindings_all_resolve_in_the_policy_table(self):
+        # Guards the two vocabularies against drifting apart again.
+        for action_id, (connector, action) in \
+                gesture_catalog.CONNECTOR_BINDINGS.items():
+            self.assertIn(action_id, gesture_catalog.ACTION_IDS)
+            self.assertIn(connector, CONNECTORS, action_id)
+            self.assertIn(action, CONNECTORS[connector], action_id)
+
+    def test_middle_finger_pose_needs_one_finger_up_and_three_curled(self):
+        self.assertTrue(gesture_catalog.is_middle_finger(hand_landmarks(["middle"])))
+        self.assertFalse(gesture_catalog.is_middle_finger(
+            hand_landmarks(["index", "middle", "ring", "pinky"])))   # open palm
+        self.assertFalse(gesture_catalog.is_middle_finger(hand_landmarks(["index"])))
+        self.assertFalse(gesture_catalog.is_middle_finger([]))
+        self.assertFalse(gesture_catalog.is_middle_finger(None))
+
+    def test_classify_hands_prefers_the_custom_pose_over_the_model_label(self):
+        from gestures import classify_hands
+
+        Category = namedtuple("Category", "category_name score")
+        landmarks = [hand_landmarks(["middle"])]
+        # The model calls it Pointing_Up; the landmark pose must win.
+        rows = classify_hands(landmarks, [[Category("Pointing_Up", 0.9)]],
+                              100, 100, 0.5)
+        self.assertEqual([row.name for row in rows], ["Middle_Finger"])
+        self.assertEqual(rows[0].score, 1.0)
+
+        # Still detected when the model returned no category for that hand.
+        rows = classify_hands(landmarks, [], 100, 100, 0.5)
+        self.assertEqual([row.name for row in rows], ["Middle_Finger"])
+
+        # Built-in labels still pass through, and low scores are still dropped.
+        open_palm = [hand_landmarks(["index", "middle", "ring", "pinky"])]
+        rows = classify_hands(open_palm, [[Category("Open_Palm", 0.9)]],
+                              100, 100, 0.5)
+        self.assertEqual([row.name for row in rows], ["Open_Palm"])
+        rows = classify_hands(open_palm, [[Category("Open_Palm", 0.1)]],
+                              100, 100, 0.5)
+        self.assertEqual(rows, [])
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,6 +3,12 @@
 Recognises 7 built-in gestures out of the box (no training):
     Closed_Fist  Open_Palm  Pointing_Up  Thumb_Up  Thumb_Down  Victory  ILoveYou
 
+plus one custom pose derived from the hand landmarks rather than the model:
+    Middle_Finger    (ported from AceRGB acergb_gesture.py:47-57)
+
+The full vocabulary lives in gesture_catalog.GESTURES — that module is the
+single source of truth both this repo and AceRGB validate names against.
+
 GestureDetector.detect(frame_bgr) -> list of Gesture(name, score, box).
 Each detector instance is single-thread; give each camera worker its own.
 
@@ -17,6 +23,8 @@ import cv2
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
+
+from gesture_catalog import MIDDLE_FINGER, is_middle_finger
 
 MODEL = Path(__file__).parent / "models" / "gesture_recognizer.task"
 Gesture = namedtuple("Gesture", "name score x y w h")
@@ -42,20 +50,39 @@ class GestureDetector:
         img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         with _GLOCK:
             res = self.rec.recognize(img)
-        out = []
-        for cats, lms in zip(res.gestures, res.hand_landmarks):
-            if not cats:
-                continue
-            g = cats[0]
-            if g.category_name in ("None", "") or g.score < self.min_score:
-                continue
-            xs = [lm.x for lm in lms]
-            ys = [lm.y for lm in lms]
-            x0, y0 = int(min(xs) * w), int(min(ys) * h)
-            x1, y1 = int(max(xs) * w), int(max(ys) * h)
-            out.append(Gesture(g.category_name, float(g.score),
-                               x0, y0, x1 - x0, y1 - y0))
-        return out
+        return classify_hands(res.hand_landmarks, res.gestures, w, h,
+                              self.min_score)
 
     def close(self):
         self.rec.close()
+
+
+def classify_hands(hand_landmarks, gesture_categories, w, h, min_score):
+    """Map one recognizer result onto Gesture rows. Pure — no MediaPipe calls.
+
+    The custom Middle_Finger pose wins over the model's built-in label for that
+    hand, matching AceRGB's _classify (acergb_gesture.py:60-80). Landmarks lead
+    the iteration so the custom pose is still detected on a hand the model
+    returned no category for.
+    """
+    out = []
+    for index, lms in enumerate(hand_landmarks or []):
+        xs = [lm.x for lm in lms]
+        ys = [lm.y for lm in lms]
+        x0, y0 = int(min(xs) * w), int(min(ys) * h)
+        x1, y1 = int(max(xs) * w), int(max(ys) * h)
+        box = (x0, y0, x1 - x0, y1 - y0)
+
+        if is_middle_finger(lms):
+            out.append(Gesture(MIDDLE_FINGER, 1.0, *box))
+            continue
+
+        cats = (gesture_categories[index]
+                if gesture_categories and index < len(gesture_categories) else [])
+        if not cats:
+            continue
+        g = cats[0]
+        if g.category_name in ("None", "") or g.score < min_score:
+            continue
+        out.append(Gesture(g.category_name, float(g.score), *box))
+    return out
