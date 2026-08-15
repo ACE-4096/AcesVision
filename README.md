@@ -10,6 +10,58 @@ and your child (or "Unknown"). Two interchangeable engines:
 
 Both read the same enrolled photos and both already work in this venv.
 
+## AcesVision (in development)
+
+AcesVision is the approved unified local vision application. One switchable
+webcam or DroidCam input feeds the GUI preview, OBS virtual camera, and typed
+gesture events without competing camera handles. See
+[`docs/VISION_CONTROL_SPEC.md`](docs/VISION_CONTROL_SPEC.md).
+
+The Phase 1 runner is dry-run for actions and does not enable a service:
+
+```bash
+python -m acesvision
+python -m acesvision --source droidcam --url http://PHONE_IP:4747/video
+python -m acesvision --obs
+```
+
+The temporary browser preview is at `http://127.0.0.1:8765`.
+
+Launch the native desktop shell:
+
+```bash
+python -m acesvision.gui
+```
+
+The native shell currently includes live runtime status, webcam and DroidCam
+switching, named physical-camera selectors, an on-demand local DroidCam scan,
+live preview-side exposure/brightness/contrast/gamma controls, black/privacy-frame warnings,
+GUI and OBS overlay profiles, custom box styles, gesture-event controls, and a
+persistent typed dry-run rule editor. Security authorization remains locked
+until the face verification and liveness phases pass their tests.
+
+The perception spine now runs YOLO object detection and ByteTrack tracking in
+the local `cv-worker` ROCm environment without blocking capture. YOLO26n is the
+default; YOLO11n and YOLOv8n are selectable verified fallbacks. Face recognition
+runs on tracked person crops and MediaPipe supplies Release 1 gestures. The GUI
+shows capture FPS, inference FPS, latency, and the active model. See
+[`docs/ACESVISION_VALIDATION.md`](docs/ACESVISION_VALIDATION.md) for measured
+results and remaining security gates.
+
+The first YOLO/ROCm cold start takes roughly 9 seconds on this host. After
+warm-up, the validated live RGB pipeline runs at approximately 30 FPS. This is
+Ultralytics YOLO on AMD ROCm, not an NVIDIA or TensorRT runtime.
+
+The current Sunplus monitor webcam is locked to automatic exposure in the GUI.
+Its driver advertises manual exposure and accepts values, but the sensor returns
+black frames in that mode. Manual exposure remains an internal capability for a
+future camera that passes calibration; it is not exposed for this device.
+
+The camera selector shows the Linux camera number, hardware name, capture type,
+and `/dev/videoN` path. AcesVision starts with the first real colour camera;
+IR and virtual devices remain available for explicit selection. The DroidCam
+scan is manual and checks only the local private `/24` network on port 4747.
+
 ## Setup (done already, for reference)
 
 ```bash
@@ -49,7 +101,10 @@ Green box = recognised (with confidence), red = Unknown. **Q** to quit.
 
 | Var | Applies to | Default | Meaning |
 |-----|-----------|---------|---------|
-| `FACE_ID_CAM` | both | auto-probe | Force camera index (this box uses ~9-12, not 0) |
+| `FACE_ID_CAM` | both | auto-probe | Force camera index (this box uses changing V4L indexes) |
+| `FACE_ID_W` / `FACE_ID_H` | camera | `1280x720` | Capture resolution; AcesVision defaults to the webcam's 30 FPS 720p MJPEG mode. |
+| `FACE_ID_FPS` | camera | `30` | Requested physical-camera frame rate. |
+| `ACESVISION_EXPOSURE` | AcesVision webcam | `166` | Starting value when manual exposure is selected; automatic exposure is the visible-image default. |
 | `FACE_ID_LBPH_THRESH` | LBPH | `70` | Max match distance. **Lower = stricter**, 0 = identical. (Your 2016 `10` almost never matched.) |
 | `FACE_ID_TOLERANCE` | dlib | `0.6` | Match strictness, **lower = stricter**. Try `0.5`. |
 | `FACE_ID_MODEL` | dlib | `hog` | `hog` (CPU) or `cnn` (needs GPU, more robust) |
