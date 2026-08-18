@@ -1,6 +1,8 @@
 import errno
 import json
 import os
+import struct
+import sys
 import tempfile
 import threading
 import time
@@ -17,7 +19,6 @@ import gesture_catalog
 import verify_gestures_live as verify
 from acesvision import connectors
 from acesvision.contracts import SceneFrame, SourceSpec
-from acesvision.events import GestureEventOutput
 from acesvision.discovery import (
     WebcamDevice,
     _stable_v4l_path,
@@ -29,7 +30,22 @@ from acesvision.discovery import (
 from acesvision.outputs import CallbackOutput
 from acesvision.overlay import CLEAN, OverlayProfile, render
 from acesvision.pipeline import VisionPipeline
-from acesvision.perception import Detection, file_sha256
+from acesvision import perception
+from acesvision.events import (
+    GestureEventOutput,
+    attribute_actor,
+    select_gesture,
+)
+from acesvision.perception import (
+    Detection,
+    default_device,
+    default_worker_python,
+    WorkerDeviceError,
+    YoloSubprocessDetector,
+    file_sha256,
+    rocm_env_overrides,
+)
+from acesvision.yolo_worker import resolve_device
 from acesvision.policy import (
     CONNECTORS,
     Rule,
@@ -217,7 +233,10 @@ class GestureEventTests(unittest.TestCase):
         self.assertFalse(events[0]["security_authorized"])
         self.assertEqual(events[0]["liveness_state"], "not_evaluated")
 
-    def test_ambiguous_actor_is_unknown(self):
+    def test_several_known_faces_attribute_to_the_gesturing_hand(self):
+        """Two known faces used to give actor=None, which silently killed every
+        actor-scoped rule. The nearest enrolled face now takes the gesture, and
+        the event says the attribution was made under ambiguity."""
         events = []
         output = GestureEventOutput(events.append, hold_frames=1,
                                     clock=Mock(return_value=10.0))
@@ -228,7 +247,9 @@ class GestureEventTests(unittest.TestCase):
         gesture = Gesture("Open_Palm", 0.9, 0, 0, 5, 5)
         output.publish(SceneFrame(source, 0, 0.0, np.zeros((2, 2, 3)),
                                   faces=faces, gestures=[gesture]))
-        self.assertIsNone(events[0]["actor"])
+        self.assertEqual(events[0]["actor"], "A")
+        self.assertEqual(events[0]["actor_attribution"], "nearest")
+        self.assertEqual(events[0]["actor_candidates"], ["A", "B"])
 
 
 class AsyncProcessorTests(unittest.TestCase):
@@ -2163,6 +2184,321 @@ class GestureRecognizeSeamTests(unittest.TestCase):
         self.assertEqual([row.name for row in
                           detector.detect(frame, faces=[FACE_BOX])], ["Shush"])
         self.assertEqual(detector.rec.calls, 3)   # one pass per detect call
+
+
+# ---------------------------------------------------------------------------
+# Worker protocol — the silent one-frame-stale desync, and the device gate.
+# ---------------------------------------------------------------------------
+
+
+class PipeWorker:
+    """A pipe-backed stand-in for the YOLO worker subprocess.
+
+    Real os.pipe() file descriptors, because the adapter blocks in
+    select.select() on the worker's stdout — a Mock cannot exercise that path.
+    """
+
+    def __init__(self):
+        to_worker_r, to_worker_w = os.pipe()
+        from_worker_r, from_worker_w = os.pipe()
+        # Unbuffered, matching Popen(bufsize=0): a buffered reader would hide
+        # an arrived reply from select() and the test would pass for the wrong
+        # reason (or fail for one).
+        self.stdin = os.fdopen(to_worker_w, "wb", 0)         # parent writes
+        self.stdout = os.fdopen(from_worker_r, "rb", 0)      # parent reads
+        self._requests = os.fdopen(to_worker_r, "rb", 0)     # worker reads
+        self._replies = os.fdopen(from_worker_w, "wb", 0)    # worker writes
+        self.stderr = None
+        self.returncode = None
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        self.returncode = 0
+        return 0
+
+    def terminate(self):
+        self.returncode = -15
+
+    def kill(self):
+        self.returncode = -9
+
+    def reply(self, payload):
+        encoded = json.dumps(payload).encode()
+        self._replies.write(struct.pack(">I", len(encoded)) + encoded)
+        self._replies.flush()
+
+    def read_request(self):
+        """(sequence, payload) for one framed request the adapter sent."""
+        header = self._read_exact(8)
+        sequence, size = struct.unpack(">II", header)
+        return sequence, self._read_exact(size)
+
+    def _read_exact(self, size):
+        chunks = []
+        while size:
+            chunk = self._requests.read(size)
+            if not chunk:
+                raise EOFError
+            chunks.append(chunk)
+            size -= len(chunk)
+        return b"".join(chunks)
+
+    def close(self):
+        for handle in (self.stdin, self.stdout, self._requests, self._replies):
+            try:
+                handle.close()
+            except OSError:
+                pass
+
+
+class WorkerProtocolTests(unittest.TestCase):
+    """The reply for frame N must never be returned as the answer to frame N+1."""
+
+    def setUp(self):
+        self.worker = PipeWorker()
+        self.addCleanup(self.worker.close)
+        self.frame = np.zeros((8, 8, 3), dtype=np.uint8)
+
+    def _detector(self, **kwargs):
+        detector = YoloSubprocessDetector(**kwargs)
+        detector._process = self.worker          # skip Popen and the handshake
+        return detector
+
+    @staticmethod
+    def _objects(label):
+        return [{"x": 0, "y": 0, "w": 4, "h": 4, "label": label,
+                 "score": 0.9, "track_id": 1}]
+
+    def test_timeout_does_not_desync_the_pipe_for_ever(self):
+        """Reproducer for the silent stale-frame bug.
+
+        Frame 1 times out. Its reply then lands in the pipe anyway, because the
+        worker is still alive and still working. Frame 2 must get frame 2's
+        answer — not frame 1's, and not one frame behind for the rest of the
+        process's life.
+        """
+        detector = self._detector(timeout_s=0.05)
+
+        with self.assertRaises(TimeoutError):
+            detector.detect(self.frame)
+        first_sequence, _ = self.worker.read_request()
+
+        # The abandoned reply arrives late, followed by the live one.
+        self.worker.reply({"seq": first_sequence, "objects": self._objects("couch")})
+        self.worker.reply({"seq": first_sequence + 1,
+                           "objects": self._objects("person")})
+
+        detector.timeout_s = 2.0
+        objects, _, _ = detector.detect(self.frame)
+        self.assertEqual([item.label for item in objects], ["person"])
+        self.assertEqual(detector.stale_replies_discarded, 1)
+
+    def test_requests_carry_an_increasing_frame_tag(self):
+        detector = self._detector(timeout_s=2.0)
+        for expected in (1, 2, 3):
+            self.worker.reply({"seq": expected, "objects": []})
+            detector.detect(self.frame)
+            sequence, payload = self.worker.read_request()
+            self.assertEqual(sequence, expected)
+            self.assertTrue(payload.startswith(b"\xff\xd8"))   # JPEG SOI
+
+    def test_untagged_reply_is_a_loud_protocol_error(self):
+        detector = self._detector(timeout_s=2.0)
+        self.worker.reply({"objects": self._objects("person")})
+        with self.assertRaises(RuntimeError) as caught:
+            detector.detect(self.frame)
+        self.assertIn("frame tag", str(caught.exception))
+
+    def test_timeout_names_the_frame_it_abandoned(self):
+        detector = self._detector(timeout_s=0.05)
+        with self.assertRaises(TimeoutError) as caught:
+            detector.detect(self.frame)
+        self.assertIn("frame 1", str(caught.exception))
+
+    def test_handshake_rejects_a_device_that_does_not_exist(self):
+        detector = self._detector()
+        self.worker.reply({"seq": 0, "ready": False,
+                           "error": "device '9' does not exist"})
+        with self.assertRaises(WorkerDeviceError) as caught:
+            detector._handshake()
+        self.assertIn("device '9'", str(caught.exception))
+
+    def test_handshake_records_the_resolved_device(self):
+        detector = self._detector()
+        self.worker.reply({"seq": 0, "ready": True, "device": "cpu",
+                           "model": "ultralytics:yolo26n"})
+        detector._handshake()
+        self.assertEqual(detector.resolved_device, "cpu")
+        self.assertEqual(detector.model_id, "ultralytics:yolo26n")
+
+
+class WorkerDeviceResolutionTests(unittest.TestCase):
+    """device='9' used to succeed silently and return normal detections."""
+
+    def test_auto_prefers_a_gpu_and_falls_back_to_cpu(self):
+        self.assertEqual(resolve_device("auto", available=1), "0")
+        self.assertEqual(resolve_device("auto", available=0), "cpu")
+        self.assertEqual(resolve_device(None, available=0), "cpu")
+
+    def test_explicit_cpu_is_always_valid(self):
+        self.assertEqual(resolve_device("cpu", available=0), "cpu")
+
+    def test_index_beyond_the_device_count_is_refused(self):
+        with self.assertRaises(ValueError) as caught:
+            resolve_device("9", available=1)
+        self.assertIn("valid indices 0..0", str(caught.exception))
+
+    def test_gpu_index_on_a_host_with_no_gpu_is_refused(self):
+        with self.assertRaises(ValueError) as caught:
+            resolve_device("0", available=0)
+        self.assertIn("ACESVISION_YOLO_DEVICE=cpu", str(caught.exception))
+
+    def test_qualified_and_bare_indices_both_resolve(self):
+        self.assertEqual(resolve_device("cuda:1", available=2), "1")
+        self.assertEqual(resolve_device("1", available=2), "1")
+
+    def test_nonsense_device_is_refused_rather_than_guessed(self):
+        with self.assertRaises(ValueError):
+            resolve_device("gpu-please", available=2)
+
+
+class WorkerEnvironmentTests(unittest.TestCase):
+    def test_default_worker_python_is_this_interpreter_not_another_repo(self):
+        self.assertEqual(str(default_worker_python({})), sys.executable)
+        source = Path(perception.__file__).read_text()
+        self.assertNotIn("cv-worker", source)
+
+    def test_worker_python_is_overridable_by_environment(self):
+        override = {"ACESVISION_YOLO_PYTHON": "/opt/py/bin/python"}
+        self.assertEqual(str(default_worker_python(override)), "/opt/py/bin/python")
+
+    def test_device_default_comes_from_environment(self):
+        self.assertEqual(default_device({}), "auto")
+        self.assertEqual(default_device({"ACESVISION_YOLO_DEVICE": "cpu"}), "cpu")
+
+    def test_detector_reads_the_environment_when_it_is_built_not_when_imported(self):
+        """Importing acesvision early used to freeze the configuration."""
+        with patch.dict(os.environ, {"ACESVISION_YOLO_DEVICE": "cpu"}):
+            self.assertEqual(YoloSubprocessDetector().device, "cpu")
+        self.assertEqual(YoloSubprocessDetector().device, "auto")
+
+    def test_rocm_override_is_set_only_on_an_amd_host(self):
+        self.assertEqual(rocm_env_overrides({}, "0", present=True),
+                         {"HSA_OVERRIDE_GFX_VERSION": "10.3.0"})
+        self.assertEqual(rocm_env_overrides({}, "0", present=False), {})
+
+    def test_rocm_override_is_skipped_for_cpu_inference(self):
+        self.assertEqual(rocm_env_overrides({}, "cpu", present=True), {})
+
+    def test_inherited_override_always_wins(self):
+        env = {"HSA_OVERRIDE_GFX_VERSION": "11.0.0"}
+        self.assertEqual(rocm_env_overrides(env, "0", present=True), {})
+        blank = {"HSA_OVERRIDE_GFX_VERSION": ""}
+        self.assertEqual(rocm_env_overrides(blank, "0", present=True), {})
+
+    def test_headless_runner_passes_a_device_through(self):
+        from acesvision.__main__ import build_parser
+
+        self.assertEqual(build_parser().parse_args([]).device, default_device())
+        self.assertEqual(build_parser().parse_args(["--device", "cpu"]).device, "cpu")
+
+
+# ---------------------------------------------------------------------------
+# Gesture attribution — the two silent no-op gates.
+# ---------------------------------------------------------------------------
+
+
+class GestureSelectionTests(unittest.TestCase):
+    """GestureDetector defaults to num_hands=2, so 'exactly one' meant never."""
+
+    def test_two_hands_in_frame_still_produce_an_event(self):
+        events = []
+        output = GestureEventOutput(events.append, hold_frames=1,
+                                    clock=Mock(return_value=1.0), enabled=True)
+        source = SourceSpec.from_mapping({"type": "webcam"})
+        output.publish(SceneFrame(source, 0, 0.0, np.zeros((2, 2, 3)),
+                                  gestures=[Gesture("Open_Palm", 0.7, 0, 0, 5, 5),
+                                            Gesture("Victory", 0.95, 40, 0, 5, 5)]))
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["gesture"], "Victory")
+        self.assertEqual(events[0]["hands_in_frame"], 2)
+
+    def test_most_confident_gesture_wins(self):
+        picked = select_gesture([Gesture("Open_Palm", 0.61, 0, 0, 5, 5),
+                                 Gesture("Thumb_Up", 0.99, 0, 0, 5, 5),
+                                 Gesture("Victory", 0.72, 0, 0, 5, 5)])
+        self.assertEqual(picked.name, "Thumb_Up")
+
+    def test_custom_landmark_poses_keep_their_precedence(self):
+        # Middle_Finger and Shush are scored 1.0 by gesture_catalog on purpose.
+        picked = select_gesture([Gesture("Pointing_Up", 0.98, 0, 0, 5, 5),
+                                 Gesture(gesture_catalog.SHUSH, 1.0, 0, 0, 5, 5)])
+        self.assertEqual(picked.name, gesture_catalog.SHUSH)
+
+    def test_no_gestures_selects_nothing(self):
+        self.assertIsNone(select_gesture([]))
+        self.assertIsNone(select_gesture(None))
+
+
+class ActorAttributionTests(unittest.TestCase):
+    """Two known faces used to mean actor=None and every actor rule going dead."""
+
+    def setUp(self):
+        self.source = SourceSpec.from_mapping({"type": "webcam"})
+
+    def _publish(self, faces, gestures):
+        events = []
+        output = GestureEventOutput(events.append, hold_frames=1,
+                                    clock=Mock(return_value=1.0), enabled=True)
+        output.publish(SceneFrame(self.source, 0, 0.0, np.zeros((2, 2, 3)),
+                                  faces=faces, gestures=gestures))
+        return events
+
+    def test_single_known_face_is_attributed_as_unique(self):
+        events = self._publish([Face(0, 0, 5, 5, "Toby", 0.2, True)],
+                               [Gesture("Victory", 0.9, 0, 0, 5, 5)])
+        self.assertEqual(events[0]["actor"], "Toby")
+        self.assertEqual(events[0]["actor_attribution"], "unique")
+
+    def test_two_known_faces_attribute_to_the_nearest_hand(self):
+        faces = [Face(0, 0, 10, 10, "A", 0.2, True),
+                 Face(200, 0, 10, 10, "B", 0.2, True)]
+        near_b = self._publish(faces, [Gesture("Open_Palm", 0.9, 195, 0, 10, 10)])
+        self.assertEqual(near_b[0]["actor"], "B")
+        self.assertEqual(near_b[0]["actor_attribution"], "nearest")
+        self.assertEqual(near_b[0]["actor_candidates"], ["A", "B"])
+
+        near_a = self._publish(faces, [Gesture("Open_Palm", 0.9, 0, 0, 10, 10)])
+        self.assertEqual(near_a[0]["actor"], "A")
+
+    def test_unknown_faces_are_never_actors(self):
+        events = self._publish([Face(0, 0, 5, 5, None, 0.9, False)],
+                               [Gesture("Victory", 0.9, 0, 0, 5, 5)])
+        self.assertIsNone(events[0]["actor"])
+        self.assertEqual(events[0]["actor_attribution"], "none")
+        self.assertEqual(events[0]["identity_state"], "unknown")
+
+    def test_ambiguity_without_geometry_is_named_not_silent(self):
+        Blind = namedtuple("Blind", "name known")
+        actor, attribution, candidates = attribute_actor(
+            [Blind("A", True), Blind("B", True)],
+            Gesture("Victory", 0.9, 0, 0, 5, 5))
+        self.assertIsNone(actor)
+        self.assertEqual(attribution, "ambiguous")
+        self.assertEqual(candidates, ["A", "B"])
+
+    def test_actor_scoped_rules_match_again_with_two_people_present(self):
+        """The reason this mattered: the rule silently stopped firing."""
+        rule = Rule.create("Victory", "mpris", "next", actor="Toby",
+                           dry_run=True)
+        engine = RuleEngine([rule])
+        events = self._publish(
+            [Face(0, 0, 10, 10, "Toby", 0.2, True),
+             Face(300, 0, 10, 10, "Toby", 0.2, True)],
+            [Gesture("Victory", 0.9, 0, 0, 10, 10)])
+        self.assertEqual(len(engine.evaluate(events[0])), 1)
 
 
 if __name__ == "__main__":

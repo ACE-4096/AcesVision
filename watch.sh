@@ -5,20 +5,31 @@
 #   ./watch.sh --source 0             # local webcam index 0
 #   WATCH_ALERT=desktop ./watch.sh    # desktop pop-ups only
 #
-# Runs the YOLO watcher under the torch-capable cv-worker venv and lets it shell
-# out to the face-id venv for face recognition. Pass-through args go to the script.
+# Runs the YOLO watcher in this repo's own venv — torch, ultralytics and dlib all
+# live there. Pass-through args go to the script.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CV_PY="${CV_WORKER_PYTHON:-$HOME/Documents/git_private/cv-worker/.venv/bin/python}"
+PY="${FACE_ID_PYTHON:-$REPO/.venv/bin/python}"
 
-if [[ ! -x "$CV_PY" ]]; then
-  echo "torch-capable python not found at: $CV_PY" >&2
-  echo "set CV_WORKER_PYTHON=/path/to/python (needs torch + ultralytics)" >&2
+if [[ ! -x "$PY" ]]; then
+  echo "python not found at: $PY" >&2
+  echo "set FACE_ID_PYTHON=/path/to/python (needs torch + ultralytics + dlib)" >&2
   exit 1
 fi
 
-export HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE_GFX_VERSION:-10.3.0}"  # AMD ROCm
-export FACE_ID_PYTHON="${FACE_ID_PYTHON:-$REPO/.venv/bin/python}"      # dlib recogniser
+if ! "$PY" -c 'import torch, ultralytics' 2>/dev/null; then
+  echo "$PY cannot import torch + ultralytics." >&2
+  echo "see README 'Runtime: one venv' for the ROCm install commands" >&2
+  exit 1
+fi
 
-exec "$CV_PY" "$REPO/watch_person.py" "$@"
+# gfx1030 is what an RX 6600 needs ROCm to pretend to be. Only set it when this
+# host actually has the AMD stack loaded, and never over an explicit value.
+if [[ -z "${HSA_OVERRIDE_GFX_VERSION:-}" ]] \
+   && { [[ -d /sys/module/amdgpu ]] || [[ -d /opt/rocm ]]; }; then
+  export HSA_OVERRIDE_GFX_VERSION=10.3.0
+fi
+export FACE_ID_PYTHON="$PY"
+
+exec "$PY" "$REPO/watch_person.py" "$@"

@@ -20,7 +20,7 @@ from .overlay import BROADCAST, MINIMAL
 from .pipeline import VisionPipeline
 from .preview import PreviewServer
 from .processor import FaceGestureProcessor
-from .perception import DEFAULT_MODEL, YoloSubprocessDetector
+from .perception import default_device, default_model, YoloSubprocessDetector
 
 
 def source_from_args(args):
@@ -46,7 +46,11 @@ def build_parser():
     parser.add_argument("--preview-port", type=int, default=8765)
     parser.add_argument("--detect-every", type=int,
                         default=int(os.environ.get("FACE_ID_DETECT_EVERY", "1")))
-    parser.add_argument("--model", default=str(DEFAULT_MODEL))
+    parser.add_argument("--model", default=str(default_model()))
+    parser.add_argument("--device", default=default_device(),
+                        help="YOLO device: 'auto', 'cpu', or an index like '0' "
+                             "(default from ACESVISION_YOLO_DEVICE). A device "
+                             "that does not exist is refused at startup.")
     parser.add_argument("--obs", action="store_true")
     parser.add_argument("--obs-device", default=os.environ.get("FACE_ID_VCAM"))
     parser.add_argument("--no-events", action="store_true",
@@ -113,13 +117,15 @@ def main():
     pipeline = VisionPipeline(
         source, FaceGestureProcessor(
             detect_every=args.detect_every,
-            object_detector=YoloSubprocessDetector(model=args.model),
+            object_detector=YoloSubprocessDetector(model=args.model,
+                                                   device=args.device),
         ), outputs
     )
     preview = PreviewServer(latest, pipeline, port=args.preview_port)
 
     print(f"[source] {source.safe_label()}")
     print(f"[preview] http://127.0.0.1:{args.preview_port}")
+    print(f"[yolo] model {args.model} on device {args.device!r}")
     print(f"[obs] {'enabled' if args.obs else 'disabled'}")
     print(f"[events] {'enabled' if gestures.enabled else 'disabled'} "
           f"(hold {gestures.hold_frames} frames, cooldown {gestures.cooldown_s:g}s)")

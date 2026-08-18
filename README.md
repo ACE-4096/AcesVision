@@ -110,16 +110,23 @@ persistent typed dry-run rule editor. Security authorization remains locked
 until the face verification and liveness phases pass their tests.
 
 The perception spine now runs YOLO object detection and ByteTrack tracking in
-the local `cv-worker` ROCm environment without blocking capture. YOLO26n is the
+its own subprocess (`acesvision.yolo_worker`) without blocking capture. YOLO26n is the
 default; YOLO11n and YOLOv8n are selectable verified fallbacks. Face recognition
 runs on tracked person crops and MediaPipe supplies Release 1 gestures. The GUI
 shows capture FPS, inference FPS, latency, and the active model. See
 [`docs/ACESVISION_VALIDATION.md`](docs/ACESVISION_VALIDATION.md) for measured
 results and remaining security gates.
 
-The first YOLO/ROCm cold start takes roughly 9 seconds on this host. After
-warm-up, the validated live RGB pipeline runs at approximately 30 FPS. This is
-Ultralytics YOLO on AMD ROCm, not an NVIDIA or TensorRT runtime.
+The first YOLO/ROCm cold start takes roughly 9-10 seconds on this host. After
+warm-up the live RGB pipeline runs at **14.9 FPS**, and that ceiling is the
+camera, not the pipeline: the USB2.0 FHD UVC webcam advertises 30 FPS through
+`v4l2-ctl` but delivers 14.93 FPS on a raw `cv2` MJPG read with no inference
+attached at all, at every resolution. Raw capture, plain capture, and the full
+pipeline all measure 14.93-14.96 FPS. Warm GPU inference itself takes about
+11 ms per frame, so there is roughly 55 ms of unused headroom per frame. (The
+earlier "approximately 30 FPS" claim here was the driver's advertised rate,
+not a measured one.) This is Ultralytics YOLO on AMD ROCm, not an NVIDIA or
+TensorRT runtime.
 
 The current Sunplus monitor webcam is locked to automatic exposure in the GUI.
 Its driver advertises manual exposure and accepts values, but the sensor returns
@@ -294,15 +301,36 @@ with which camera saw them. One thread per camera, each auto-reconnecting.
 WATCH_ALERT=desktop ./watch.sh               # pop-ups only (no Telegram)
 ```
 
-### ⚠️ Runtime: it needs a torch-capable venv (two-venv split)
+### Runtime: one venv
 
-`face-id/.venv` has working dlib/face_recognition but its **torch is broken**, so
-YOLO can't run there. `watch.sh` therefore runs the watcher under the
-**`cv-worker/.venv`** (working torch + ultralytics, AMD ROCm GPU) and shells out
-to `face-id/.venv` for the recognition step (`recognize_snapshot.py`). The
-launcher wires both automatically; override with `CV_WORKER_PYTHON` /
-`FACE_ID_PYTHON` if either venv moves. (The old ROCm venv on the external drive
-is gone — `cv-worker/.venv` is the live torch env.)
+`face-id/.venv` runs everything — dlib/face_recognition, Ultralytics, and torch
+on the AMD ROCm GPU. There is no second environment and no dependency on any
+other repository.
+
+    torch==2.9.1+rocm6.3         # AMD RX 6600, HSA_OVERRIDE_GFX_VERSION=10.3.0
+    torchvision==0.24.1+rocm6.3
+    ultralytics==8.4.60
+    opencv-contrib-python==4.13.0.92
+
+Install torch and torchvision from the ROCm index, never from PyPI — the PyPI
+build of `torchvision` drags a CUDA `torch` in behind it and silently replaces
+the ROCm one:
+
+```bash
+.venv/bin/pip install torch==2.9.1+rocm6.3 torchvision==0.24.1+rocm6.3 \
+  --index-url https://download.pytorch.org/whl/rocm6.3
+.venv/bin/pip install --no-deps ultralytics==8.4.60
+```
+
+`ultralytics` is installed with `--no-deps` deliberately: its metadata requires
+plain `opencv-python`, which would shadow `opencv-contrib-python` and take
+`cv2.face` (the LBPH engine) out with it. `pip check` therefore reports
+"ultralytics requires opencv-python, which is not installed" — that one line is
+expected and is the correct state.
+
+Both `watch.sh` and the YOLO worker default to this venv's interpreter. Set
+`ACESVISION_YOLO_PYTHON` (worker) or `FACE_ID_PYTHON` (recogniser) only if you
+deliberately want to split the environments again.
 
 ### Cameras (`watch_cameras.json`)
 

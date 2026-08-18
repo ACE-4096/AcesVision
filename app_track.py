@@ -2,16 +2,20 @@
 
 Ticket cdd38f26.
 
-Launch:
-    HSA_OVERRIDE_GFX_VERSION=10.3.0 /media/ace4096/3533a241-7f05-4541-99b3-e1b78ed866f8/venvs/face-id-rocm/bin/python app_track.py
+REQUIRES AN EXTRA DEPENDENCY. Gradio is not in requirements.txt and is not
+installed by default; everything else this module needs is already in .venv:
+
+    .venv/bin/pip install gradio
+    .venv/bin/python app_track.py
 
 URL: http://127.0.0.1:7860
 
 No data leaves the machine. All inference is local (ROCm GPU for YOLO,
 CPU for dlib encoding). Biometric data never written to Gradio tmp.
 
-NOTE: uses the ROCm venv on the secondary drive, NOT the face-id .venv.
-      See README or run with the exact Python path above.
+The launch command here used to name a ROCm venv on an external drive. That
+drive is gone and that venv no longer exists; this repo's own .venv carries
+torch, torchvision and ultralytics now.
 """
 from __future__ import annotations
 
@@ -21,8 +25,10 @@ import sys
 import tempfile
 from pathlib import Path
 
-# --- ROCm GFX override: must be first ---
-os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", "10.3.0")
+# --- ROCm GFX override: must be set before torch is imported anywhere ---
+# Only meaningful on an AMD host; setting it elsewhere just misleads a crash log.
+if os.path.isdir("/sys/module/amdgpu") or os.path.isdir("/opt/rocm"):
+    os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", "10.3.0")
 
 # Ensure repo root is on sys.path so engine.py / track_video.py import cleanly
 _REPO = Path(__file__).parent
