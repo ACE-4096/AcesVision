@@ -568,13 +568,20 @@ class GuiStyleTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             VisionBackend._hex_to_bgr("purple")
 
-    def test_monitor_webcam_manual_exposure_is_guarded(self):
+    def test_manual_exposure_is_allowed_until_a_camera_proves_otherwise(self):
+        """Manual exposure used to be hardcoded off for every user, forever.
+
+        One monitor webcam returning black frames is not a reason to grey the
+        control out on hardware that handles it fine.
+        """
         from acesvision.gui import VisionBackend
 
         backend = VisionBackend(initialize_models=False, load_saved_rules=False)
+        self.assertTrue(backend.manualExposureSupported)
+        self.assertEqual(backend.exposureNotice, "")
         backend.setCameraTuning(False, 251, 0, 0, 100)
-        self.assertTrue(backend._auto_exposure)
-        self.assertTrue(backend.pipeline._camera_controls["auto_exposure"])
+        self.assertFalse(backend._auto_exposure)
+        self.assertFalse(backend.pipeline._camera_controls["auto_exposure"])
 
 
 Landmark = namedtuple("Landmark", "x y")
@@ -2499,6 +2506,620 @@ class ActorAttributionTests(unittest.TestCase):
              Face(300, 0, 10, 10, "Toby", 0.2, True)],
             [Gesture("Victory", 0.9, 0, 0, 10, 10)])
         self.assertEqual(len(engine.evaluate(events[0])), 1)
+
+# ---------------------------------------------------------------------------
+# GUI shell defects — error visibility, preview freshness, runtime capability
+# detection, and the QML layout itself.
+# ---------------------------------------------------------------------------
+
+
+class FakeClock:
+    """Monotonic clock the tests advance by hand."""
+
+    def __init__(self, start=0.0):
+        self.now = float(start)
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += float(seconds)
+        return self.now
+
+
+def gui_backend(**kwargs):
+    from acesvision.gui import VisionBackend
+
+    kwargs.setdefault("initialize_models", False)
+    kwargs.setdefault("load_saved_rules", False)
+    return VisionBackend(**kwargs)
+
+
+def pipeline_state(backend, **kwargs):
+    """Push a synthetic PipelineState, the way a running capture loop would."""
+    backend.pipeline._set_state(**kwargs)
+
+
+class GuiErrorChannelTests(unittest.TestCase):
+    """An error the operator never sees is the same as no error at all."""
+
+    def test_an_action_error_survives_the_refresh_tick(self):
+        # The 100 ms tick used to copy pipeline.last_error ("") straight over
+        # whatever a slot had just set, so every message died inside one frame.
+        backend = gui_backend()
+        backend.useDroidCam("   ")
+        self.assertIn("DroidCam URL", backend.lastError)
+        for _ in range(10):
+            backend._refresh()
+        self.assertIn("DroidCam URL", backend.lastError)
+
+    def test_a_connector_failure_stays_on_screen(self):
+        executor = RecordingExecutor(connectors.ExecutionResult(
+            "acergb", "next_theme", False, "daemon is not on the bus",
+            error_kind="daemon_absent"))
+        backend = gui_backend(executor=executor)
+        backend._rules = [Rule.create("Victory", "acergb", "next_theme",
+                                      dry_run=False)]
+        backend.rule_engine.rules = list(backend._rules)
+        backend._receive_gesture({"gesture": "Victory", "actor": "Toby",
+                                  "source": "webcam"})
+        for _ in range(20):
+            backend._refresh()
+        self.assertIn("daemon_absent", backend.lastError)
+        self.assertTrue(backend.errorDismissable)
+
+    def test_only_the_operator_clears_an_action_error(self):
+        backend = gui_backend()
+        backend.useDroidCam("")
+        backend.dismissError()
+        self.assertEqual(backend.lastError, "")
+        self.assertFalse(backend.errorDismissable)
+
+    def test_a_newer_action_error_supersedes_the_older_one(self):
+        backend = gui_backend()
+        backend.useDroidCam("")
+        backend.useWebcam("not-a-number")
+        self.assertIn("Webcam index", backend.lastError)
+
+    def test_a_pipeline_error_shows_when_nothing_else_is_pending(self):
+        backend = gui_backend()
+        pipeline_state(backend, error="Webcam is unavailable or in use")
+        backend._refresh()
+        self.assertIn("unavailable", backend.lastError)
+        self.assertFalse(backend.errorDismissable)   # live state, not dismissable
+
+    def test_an_action_error_outranks_a_pipeline_error(self):
+        backend = gui_backend()
+        pipeline_state(backend, error="Webcam is unavailable or in use")
+        backend._refresh()
+        backend.useDroidCam("")
+        self.assertIn("DroidCam URL", backend.lastError)
+        backend.dismissError()
+        backend._refresh()
+        self.assertIn("unavailable", backend.lastError)
+
+    def test_the_error_signal_fires_only_when_the_visible_text_changes(self):
+        backend = gui_backend()
+        seen = []
+        backend.errorChanged.connect(lambda: seen.append(backend.lastError))
+        backend.useDroidCam("")
+        pipeline_state(backend, error="something the operator cannot see yet")
+        backend._refresh()
+        backend._refresh()
+        self.assertEqual(len(seen), 1)
+
+
+class GuiPreviewFreshnessTests(unittest.TestCase):
+    """A frozen last frame renders exactly like live video. Say which it is."""
+
+    def test_a_stalled_capture_is_reported_as_stale(self):
+        clock = FakeClock()
+        backend = gui_backend(clock=clock)
+        pipeline_state(backend, status="live", sequence=1)
+        backend._refresh()
+        self.assertFalse(backend.previewStale)
+        clock.advance(0.5)
+        backend._refresh()
+        self.assertFalse(backend.previewStale)
+        clock.advance(5.0)
+        backend._refresh()
+        self.assertTrue(backend.previewStale)
+
+    def test_a_fresh_frame_clears_staleness(self):
+        clock = FakeClock()
+        backend = gui_backend(clock=clock)
+        pipeline_state(backend, status="live", sequence=1)
+        backend._refresh()
+        clock.advance(5.0)
+        backend._refresh()
+        self.assertTrue(backend.previewStale)
+        pipeline_state(backend, status="live", sequence=2)
+        backend._refresh()
+        self.assertFalse(backend.previewStale)
+
+    def test_a_runtime_that_never_produced_a_frame_is_not_stale(self):
+        clock = FakeClock()
+        backend = gui_backend(clock=clock)
+        pipeline_state(backend, status="reconnecting")
+        clock.advance(60.0)
+        backend._refresh()
+        self.assertFalse(backend.previewStale)
+
+    def test_a_stopped_runtime_is_not_reported_as_a_stale_feed(self):
+        clock = FakeClock()
+        backend = gui_backend(clock=clock)
+        pipeline_state(backend, status="live", sequence=1)
+        backend._refresh()
+        clock.advance(30.0)
+        pipeline_state(backend, status="stopped")
+        backend._refresh()
+        self.assertFalse(backend.previewStale)
+
+    def test_the_preview_url_only_moves_when_a_frame_does(self):
+        backend = gui_backend()
+        first = backend.previewSource
+        backend._refresh()
+        self.assertEqual(backend.previewSource, first)
+        pipeline_state(backend, status="live", sequence=1)
+        backend._refresh()
+        self.assertNotEqual(backend.previewSource, first)
+
+
+class GuiExposureCapabilityTests(unittest.TestCase):
+    """OSS blocker: one webcam's quirk must not disable a control for everyone."""
+
+    BLACK = {"image_mean": 1.5, "image_std": 0.4,
+             "camera_controls": {"auto_exposure": False}}
+
+    def drive_black_frame(self, backend):
+        backend.setCameraTuning(False, 251, 0, 0, 100)
+        pipeline_state(backend, status="live", sequence=1, metrics=dict(self.BLACK))
+        backend._refresh()
+
+    def test_a_black_frame_in_manual_mode_withdraws_manual_exposure(self):
+        backend = gui_backend()
+        self.assertTrue(backend.manualExposureSupported)
+        self.drive_black_frame(backend)
+        self.assertFalse(backend.manualExposureSupported)
+        self.assertIn("black frame", backend.exposureNotice)
+
+    def test_automatic_exposure_is_restored_for_the_offending_camera(self):
+        backend = gui_backend()
+        self.drive_black_frame(backend)
+        self.assertTrue(backend.autoExposure)
+        self.assertTrue(backend.pipeline._camera_controls["auto_exposure"])
+        self.assertIn("black frame", backend.lastError)
+
+    def test_a_dark_but_not_flat_frame_keeps_manual_exposure(self):
+        backend = gui_backend()
+        backend.setCameraTuning(False, 251, 0, 0, 100)
+        pipeline_state(backend, status="live", sequence=1,
+                       metrics={"image_mean": 20.0, "image_std": 18.0,
+                                "camera_controls": {"auto_exposure": False}})
+        backend._refresh()
+        self.assertTrue(backend.manualExposureSupported)
+
+    def test_a_black_frame_in_automatic_mode_is_not_the_cameras_fault(self):
+        backend = gui_backend()
+        pipeline_state(backend, status="live", sequence=1,
+                       metrics={"image_mean": 1.0, "image_std": 0.1,
+                                "camera_controls": {"auto_exposure": True}})
+        backend._refresh()
+        self.assertTrue(backend.manualExposureSupported)
+
+    def test_the_block_is_per_device_not_global(self):
+        backend = gui_backend()
+        self.drive_black_frame(backend)
+        self.assertFalse(backend.manualExposureSupported)
+        backend.pipeline.switch_source(SourceSpec.from_mapping({
+            "id": "webcam", "name": "Some Other Camera", "type": "webcam",
+            "index": 7,
+        }))
+        backend._refresh()
+        self.assertTrue(backend.manualExposureSupported)
+        self.assertEqual(backend.exposureNotice, "")
+
+    def test_the_guard_still_forces_auto_while_a_camera_is_blocked(self):
+        backend = gui_backend()
+        self.drive_black_frame(backend)
+        backend.setCameraTuning(False, 251, 0, 0, 100)
+        self.assertTrue(backend._auto_exposure)
+        self.assertTrue(backend.pipeline._camera_controls["auto_exposure"])
+
+
+class GuiOverlayStudioTests(unittest.TestCase):
+    def setUp(self):
+        from acesvision import overlay
+
+        self.addCleanup(overlay.PROFILES.pop, "custom", None)
+
+    def test_applying_a_custom_style_gives_it_a_selectable_card(self):
+        # It used to set overlayProfile to "custom" while the QML card model
+        # only knew clean/minimal/broadcast/security, so nothing read "Active".
+        backend = gui_backend()
+        self.assertFalse(backend.customOverlayReady)
+        backend.applyOverlayStyle(True, True, True, 3, 0.8, "#112233",
+                                  "#00ff00", "#ff0000", "#0000ff")
+        self.assertTrue(backend.customOverlayReady)
+        self.assertEqual(backend.overlayProfile, "custom")
+
+    def test_the_custom_card_can_be_reselected_after_switching_away(self):
+        backend = gui_backend()
+        backend.applyOverlayStyle(True, True, True, 3, 0.8, "#112233",
+                                  "#00ff00", "#ff0000", "#0000ff")
+        backend.setOverlayProfile("broadcast")
+        self.assertEqual(backend.overlayProfile, "broadcast")
+        backend.setOverlayProfile("custom")
+        self.assertEqual(backend.overlayProfile, "custom")
+
+    def test_a_rejected_custom_style_neither_registers_nor_activates(self):
+        backend = gui_backend()
+        backend.applyOverlayStyle(True, True, True, 3, 0.8, "not-a-colour",
+                                  "#00ff00", "#ff0000", "#0000ff")
+        self.assertFalse(backend.customOverlayReady)
+        self.assertEqual(backend.overlayProfile, "minimal")
+        self.assertIn("hex", backend.lastError)
+
+    def test_the_profile_list_signals_when_the_custom_card_appears(self):
+        backend = gui_backend()
+        fired = []
+        backend.overlayProfilesChanged.connect(lambda: fired.append(True))
+        backend.applyOverlayStyle(True, True, True, 3, 0.8, "#112233",
+                                  "#00ff00", "#ff0000", "#0000ff")
+        backend.applyOverlayStyle(False, True, True, 4, 0.9, "#112233",
+                                  "#00ff00", "#ff0000", "#0000ff")
+        self.assertEqual(len(fired), 1)   # the card appears once, not per apply
+
+
+class GuiNotifyingPropertyTests(unittest.TestCase):
+    """`constant=True` on anything that can change is a stale-UI bug."""
+
+    LIVE_PROPERTIES = ("actorNames", "executableConnectors", "modelOptions",
+                       "manualExposureSupported", "connectorNames",
+                       "gestureNames", "computeDevice")
+
+    def test_none_of_the_live_properties_are_declared_constant(self):
+        backend = gui_backend()
+        meta = backend.metaObject()
+        without_notify = []
+        for name in self.LIVE_PROPERTIES:
+            index = meta.indexOfProperty(name)
+            self.assertNotEqual(index, -1, name)
+            if not meta.property(index).hasNotifySignal():
+                without_notify.append(name)
+        self.assertEqual(without_notify, [])
+
+    def test_a_newly_enrolled_person_appears_without_a_restart(self):
+        backend = gui_backend()
+        fired = []
+        backend.actorsChanged.connect(lambda: fired.append(True))
+        with patch("acesvision.gui.known_actors", return_value=["Toby", "Ada"]):
+            backend.refreshActors()
+        self.assertIn("Ada", backend.actorNames)
+        self.assertIn(gesture_catalog.ANY_ACTOR, backend.actorNames)
+        self.assertEqual(len(fired), 1)
+
+    def test_re_scanning_the_same_people_does_not_churn_the_ui(self):
+        backend = gui_backend()
+        fired = []
+        backend.actorsChanged.connect(lambda: fired.append(True))
+        backend.refreshActors()
+        backend.refreshActors()
+        self.assertEqual(fired, [])
+
+    def test_a_connector_daemon_registered_later_reaches_the_sidebar(self):
+        class GrowingExecutor(RecordingExecutor):
+            wired = ["acergb"]
+
+            def names(self):
+                return list(self.wired)
+
+        executor = GrowingExecutor()
+        backend = gui_backend(executor=executor)
+        self.assertEqual(backend.executableConnectors, ["acergb"])
+        fired = []
+        backend.connectorsChanged.connect(lambda: fired.append(True))
+        executor.wired = ["acergb", "pipewire"]
+        backend.refreshConnectors()
+        self.assertEqual(backend.executableConnectors, ["acergb", "pipewire"])
+        self.assertEqual(len(fired), 1)
+
+    def test_the_slow_tick_picks_up_new_people_and_connectors(self):
+        from acesvision import gui as gui_module
+
+        backend = gui_backend()
+        with patch("acesvision.gui.known_actors", return_value=["Ada"]):
+            for _ in range(gui_module.SLOW_REFRESH_TICKS):
+                backend._refresh()
+        self.assertIn("Ada", backend.actorNames)
+
+    def test_rescanning_models_reports_what_is_on_disk(self):
+        backend = gui_backend()
+        fired = []
+        backend.modelsChanged.connect(lambda: fired.append(True))
+        backend.refreshModels()
+        self.assertEqual(fired, [])          # nothing changed on disk
+        backend._model_options = []
+        backend.refreshModels()
+        self.assertEqual(len(fired), 1)
+
+
+class ComputeDeviceTests(unittest.TestCase):
+    """OSS blocker: the UI named the author's GPU."""
+
+    def device(self, torch_module):
+        from acesvision.gui import describe_compute_device
+
+        return describe_compute_device(torch_module)
+
+    def test_no_torch_means_no_hardware_claim(self):
+        from acesvision.gui import describe_compute_device
+
+        with patch.dict("sys.modules", {"torch": None}):
+            self.assertEqual(describe_compute_device(), "this machine")
+
+    def test_a_rocm_build_reports_rocm_and_the_real_card(self):
+        torch = Mock()
+        torch.cuda.is_available.return_value = True
+        torch.cuda.get_device_name.return_value = "AMD Radeon RX 7900 XTX"
+        torch.version.hip = "6.2.0"
+        self.assertEqual(self.device(torch),
+                         "AMD Radeon RX 7900 XTX via ROCm")
+
+    def test_a_cuda_build_reports_cuda(self):
+        torch = Mock()
+        torch.cuda.is_available.return_value = True
+        torch.cuda.get_device_name.return_value = "NVIDIA GeForce RTX 4070"
+        torch.version.hip = None
+        self.assertEqual(self.device(torch), "NVIDIA GeForce RTX 4070 via CUDA")
+
+    def test_a_cpu_only_build_says_cpu(self):
+        torch = Mock()
+        torch.cuda.is_available.return_value = False
+        self.assertEqual(self.device(torch), "the CPU on this machine")
+
+    def test_a_broken_torch_never_breaks_the_ui(self):
+        torch = Mock()
+        torch.cuda.is_available.side_effect = RuntimeError("no driver")
+        self.assertEqual(self.device(torch), "this machine")
+
+
+class QmlSourceTests(unittest.TestCase):
+    """Cheap deterministic guards over the shipped QML text."""
+
+    @classmethod
+    def setUpClass(cls):
+        from acesvision.gui import QML_PATH
+
+        cls.qml = QML_PATH.read_text()
+
+    @staticmethod
+    def page_root_properties(page):
+        """The page ColumnLayout's own property lines, comments stripped.
+
+        Stops at the first nested element so only the layout's own settings are
+        inspected, not its children's.
+        """
+        body = page.split("ColumnLayout {", 1)[1]
+        lines = []
+        for line in body.split("\n"):
+            text = line.split("//", 1)[0].strip()
+            if not text:
+                continue
+            if text.endswith("{"):
+                break
+            lines.append(text)
+        return lines
+
+    def test_no_page_relies_on_an_anchor_margin_it_never_set(self):
+        # Every page root was `ColumnLayout { width: parent.width;
+        # anchors.margins: 20 }` with no anchor at all, so the gutter was inert
+        # and titles and cards ran into the window edge.
+        pages = [block.split("ScrollView {")[0]
+                 for block in self.qml.split("ScrollView {")[1:]]
+        self.assertEqual(len(pages), 6)
+        for index, page in enumerate(pages):
+            properties = self.page_root_properties(page)
+            anchored = [line for line in properties if line.startswith("anchors.")]
+            self.assertEqual(anchored, [],
+                             f"page {index} sets anchor properties with no anchor")
+            self.assertIn("padding: window.pageMargin",
+                          [line.split("//")[0].strip()
+                           for line in page.split("\n")],
+                          f"page {index} has no gutter")
+
+    def test_no_specific_gpu_is_named_in_user_facing_copy(self):
+        for banned in ("RX 6600", "ROCm on the", "RTX"):
+            self.assertNotIn(banned, self.qml)
+        self.assertIn("vision.computeDevice", self.qml)
+
+    def test_no_internal_roadmap_vocabulary_ships_in_the_ui(self):
+        for banned in ("migration slice", "migration baseline",
+                       "compositor slice", "advanced compositor"):
+            self.assertNotIn(banned, self.qml)
+
+    def test_the_error_banner_can_be_dismissed(self):
+        self.assertIn("vision.dismissError()", self.qml)
+        self.assertIn("vision.errorDismissable", self.qml)
+
+    def test_the_preview_has_an_error_and_a_staleness_branch(self):
+        self.assertIn("Image.Error", self.qml)
+        self.assertIn("vision.previewStale", self.qml)
+
+    def test_the_overlay_grid_can_render_a_custom_card(self):
+        self.assertIn("vision.customOverlayReady", self.qml)
+
+
+def _require_qt():
+    try:
+        import PySide6.QtQuick                       # noqa: F401
+    except Exception as exc:                         # noqa: BLE001
+        raise unittest.SkipTest(f"PySide6 is not installed: {exc}")
+
+
+def _run_qml_probe(script):
+    """Load Main.qml on the offscreen platform in a clean subprocess."""
+    import subprocess
+
+    environment = dict(os.environ, QT_QPA_PLATFORM="offscreen")
+    environment.pop("DISPLAY", None)
+    environment.pop("WAYLAND_DISPLAY", None)
+    return subprocess.run([sys.executable, "-c", script],
+                          cwd=str(Path(__file__).parent), env=environment,
+                          capture_output=True, text=True, timeout=120)
+
+
+QML_GEOMETRY_PROBE = '''
+import json, os, sys
+from PySide6.QtCore import QUrl, QTimer, QEventLoop, qInstallMessageHandler
+from PySide6.QtGui import QGuiApplication
+from PySide6.QtQml import QQmlApplicationEngine
+from PySide6.QtQuick import QQuickItem
+from acesvision.gui import VisionBackend, QML_PATH
+
+messages = []
+qInstallMessageHandler(lambda kind, ctx, text: messages.append(text))
+app = QGuiApplication(sys.argv[:1])
+backend = VisionBackend(initialize_models=False, load_saved_rules=False)
+engine = QQmlApplicationEngine()
+engine.rootContext().setContextProperty("vision", backend)
+engine.load(QUrl.fromLocalFile(str(QML_PATH)))
+window = engine.rootObjects()[0]
+
+def settle(ms=150):
+    loop = QEventLoop()
+    QTimer.singleShot(ms, loop.quit)
+    loop.exec()
+
+def find_type(item, prefix):
+    for child in item.childItems():
+        if child.metaObject().className().startswith(prefix):
+            return child
+        found = find_type(child, prefix)
+        if found is not None:
+            return found
+    return None
+
+# Located positionally, not by objectName, so the same probe can measure a tree
+# that predates the objectName markers.
+stack = find_type(window.property("contentItem"), "QQuickStackLayout")
+
+def collect():
+    settle(250)
+    report = {"sizes": {}}
+    for width, height in [(980, 640), (1280, 800), (1920, 1080)]:
+        window.setWidth(width)
+        window.setHeight(height)
+        settle()
+        pages = []
+        for index, view in enumerate(stack.childItems()):
+            window.setProperty("currentPage", index)
+            settle()
+            flickable = view.childItems()[0]
+            pages.append({
+                "gutterX": flickable.x(),
+                "gutterY": flickable.y(),
+                "viewportW": flickable.width(),
+                "viewportH": flickable.height(),
+                "contentW": flickable.property("contentWidth"),
+                "contentH": flickable.property("contentHeight"),
+            })
+        tuning = window.findChild(QQuickItem, "liveTuning")
+        report["sizes"]["%dx%d" % (width, height)] = {
+            "pages": pages,
+            "tuningHeight": tuning.height() if tuning else None,
+            "tuningImplicit": tuning.property("implicitHeight") if tuning else None,
+        }
+    report["messages"] = messages
+    sys.stdout.write("PROBE" + json.dumps(report) + "\\n")
+    sys.stdout.flush()
+
+def run():
+    try:
+        collect()
+    except BaseException:
+        import traceback
+        traceback.print_exc()
+        os._exit(3)
+    os._exit(0)
+
+# Never let a broken probe hang the suite; a stuck probe is a failure.
+QTimer.singleShot(60000, lambda: os._exit(4))
+QTimer.singleShot(50, run)
+app.exec()
+'''
+
+
+class QmlLayoutTests(unittest.TestCase):
+    """Measure the real QML scene graph rather than trusting the source."""
+
+    report = None
+
+    @classmethod
+    def setUpClass(cls):
+        # Skip ONLY when Qt itself is missing. A probe that starts and then
+        # fails to report is a defect in the UI, not an unavailable toolchain,
+        # and must not be allowed to pass as a skip.
+        _require_qt()
+        completed = _run_qml_probe(QML_GEOMETRY_PROBE)
+        marker = "PROBE"
+        if completed.returncode != 0 or marker not in completed.stdout:
+            raise AssertionError(
+                "the QML probe did not report:\n" + (completed.stderr or "")[-2000:])
+        cls.report = json.loads(completed.stdout.split(marker, 1)[1])
+
+    def test_every_page_has_a_real_gutter_on_every_size(self):
+        for size, data in self.report["sizes"].items():
+            self.assertEqual(len(data["pages"]), 6, size)
+            for index, page in enumerate(data["pages"]):
+                self.assertGreaterEqual(page["gutterX"], 20, f"{size} page{index}")
+                self.assertGreaterEqual(page["gutterY"], 20, f"{size} page{index}")
+                self.assertLessEqual(
+                    page["contentW"], page["viewportW"] + 0.5,
+                    f"{size} page{index} content is wider than the viewport")
+
+    def test_the_live_page_does_not_grow_taller_as_the_window_grows_wider(self):
+        # Measured before the fix: 600 / 756 / 1089. The 1089 overflowed the
+        # viewport and scrolled the OBS and gesture-event bar off screen.
+        heights = {size: data["pages"][0]["contentH"]
+                   for size, data in self.report["sizes"].items()}
+        for size, data in self.report["sizes"].items():
+            if size == "980x640":
+                continue     # the minimum window cannot hold the tuning panel
+            self.assertLessEqual(
+                data["pages"][0]["contentH"], data["pages"][0]["viewportH"],
+                f"live page scrolls at {size}: {heights}")
+
+    def test_the_image_tuning_panel_is_never_squeezed(self):
+        for size, data in self.report["sizes"].items():
+            self.assertIsNotNone(data["tuningHeight"],
+                                 f"no liveTuning panel found at {size}")
+            self.assertGreaterEqual(data["tuningHeight"],
+                                    data["tuningImplicit"] - 0.5, size)
+
+    def test_loading_and_resizing_the_ui_logs_no_qml_warnings(self):
+        self.assertEqual(self.report["messages"], [])
+
+
+class QmlTeardownTests(unittest.TestCase):
+    """A clean exit must not print a page of null-property warnings."""
+
+    def test_the_smoke_run_exits_without_warnings(self):
+        import subprocess
+
+        _require_qt()
+        environment = dict(os.environ, QT_QPA_PLATFORM="offscreen")
+        environment.pop("DISPLAY", None)
+        environment.pop("WAYLAND_DISPLAY", None)
+        completed = subprocess.run(
+            [sys.executable, "-m", "acesvision.gui", "--smoke-test",
+             "--preview-port", "8791"],
+            cwd=str(Path(__file__).parent), env=environment,
+            capture_output=True, text=True, timeout=180)
+        self.assertEqual(completed.returncode, 0, completed.stderr[-2000:])
+        self.assertNotIn("of null", completed.stderr)
+        self.assertNotIn("TypeError", completed.stderr)
+        self.assertEqual(completed.stderr.strip(), "")
 
 
 if __name__ == "__main__":

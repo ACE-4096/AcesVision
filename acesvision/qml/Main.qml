@@ -27,6 +27,7 @@ ApplicationWindow {
     property color good: "#4fd18b"
     property color warning: "#f5b942"
     property int currentPage: 0
+    readonly property int pageMargin: 20
 
     component Card: Rectangle {
         color: window.panel
@@ -131,11 +132,17 @@ ApplicationWindow {
 
             // Live
             ScrollView {
+                id: livePage
+                objectName: "page0"
+                // Page gutter lives on the ScrollView, not on the ColumnLayout.
+                // A ColumnLayout sized by `width: parent.width` has no anchors,
+                // so anchors.margins on it was inert and every page ran its
+                // titles and cards straight into the window edge.
+                padding: window.pageMargin
                 contentWidth: availableWidth
                 ColumnLayout {
                     width: parent.width
                     spacing: 14
-                    anchors.margins: 20
 
                     RowLayout {
                         Layout.fillWidth: true
@@ -177,8 +184,26 @@ ApplicationWindow {
                     }
 
                     RowLayout {
+                        id: liveStage
+                        objectName: "liveStage"
+                        readonly property int tuningWidth: 320
+                        // Video is 16:9, so key the stage to the width the VIDEO
+                        // gets, and never let it grow past the viewport. Keying it
+                        // to the row width alone made the page TALLER as the window
+                        // got WIDER — at 1920x1080 the whole page scrolled and the
+                        // OBS/gesture bar went off screen.
+                        readonly property real videoWidth:
+                            Math.max(240, width - tuningWidth - spacing)
+                        // Everything else on this page measures ~205 px.
+                        readonly property real viewportBudget:
+                            livePage.availableHeight - 210
+                        // Never shorter than the tuning panel needs; clipping the
+                        // controls is worse than scrolling the page.
+                        readonly property real minimumHeight:
+                            Math.max(390, liveTuning.implicitHeight + 28)
                         Layout.fillWidth: true
-                        Layout.preferredHeight: Math.max(390, width * 0.52)
+                        Layout.preferredHeight: Math.max(
+                            minimumHeight, Math.min(videoWidth * 9 / 16, viewportBudget))
                         spacing: 12
 
                         Card {
@@ -187,19 +212,57 @@ ApplicationWindow {
                             color: "#050608"
                             clip: true
                             Image {
+                                id: previewImage
+                                objectName: "previewImage"
+                                // Bumped only to force a refetch after a failure.
+                                property int retryTick: 0
+                                readonly property bool failed: status === Image.Error
                                 anchors.fill: parent
                                 anchors.margins: 1
-                                source: vision.status === "starting" ? "" : vision.previewSource
+                                // Nothing to fetch before the first frame exists —
+                                // asking earlier just logged a 503 per attempt.
+                                source: vision.sequence > 0
+                                        ? vision.previewSource + "&retry=" + retryTick
+                                        : ""
                                 cache: false
                                 asynchronous: true
                                 fillMode: Image.PreserveAspectFit
+                                onStatusChanged: if (status === Image.Error) previewRetry.restart()
+                            }
+                            // The preview server answers 503 until the first frame
+                            // exists. Retry quietly instead of leaving a dead tile.
+                            Timer {
+                                id: previewRetry
+                                interval: 1000
+                                onTriggered: previewImage.retryTick++
+                            }
+                            // A stalled feed keeps the last good frame on screen and
+                            // reads as live video. Scrim it and say what happened.
+                            Rectangle {
+                                anchors.fill: parent
+                                anchors.margins: 1
+                                visible: previewImage.failed || vision.previewStale
+                                color: "#b0050608"
                             }
                             Text {
                                 anchors.centerIn: parent
-                                visible: vision.status !== "live"
-                                text: vision.status === "reconnecting" ? "Waiting for camera" : "Starting vision runtime"
-                                color: window.textMuted
+                                width: parent.width - 40
+                                horizontalAlignment: Text.AlignHCenter
+                                wrapMode: Text.Wrap
+                                visible: previewImage.failed || vision.previewStale
+                                         || vision.status !== "live"
+                                color: previewImage.failed || vision.previewStale
+                                       ? window.warning : window.textMuted
                                 font.pixelSize: 18
+                                text: previewImage.failed
+                                      ? "Preview feed unavailable — retrying"
+                                      : vision.status === "reconnecting"
+                                        ? "Waiting for camera"
+                                        : vision.previewStale
+                                          ? "Frame is stale — this is not live video"
+                                          : vision.status === "live"
+                                            ? ""
+                                            : "Starting vision runtime"
                             }
                         }
 
@@ -208,6 +271,7 @@ ApplicationWindow {
                             Layout.fillHeight: true
                             ColumnLayout {
                                 id: liveTuning
+                                objectName: "liveTuning"
                                 anchors.fill: parent
                                 anchors.margins: 14
                                 spacing: 7
@@ -223,7 +287,7 @@ ApplicationWindow {
 
                                 Text { text: "Image tuning"; color: window.textMain; font.bold: true; font.pixelSize: 16 }
                                 Text {
-                                    text: "Changes apply live. Auto is brighter but this webcam may run slower."
+                                    text: "Changes apply live. Automatic exposure is usually brighter; manual gives a steadier frame rate."
                                     color: window.textMuted
                                     wrapMode: Text.Wrap
                                     Layout.fillWidth: true
@@ -232,14 +296,22 @@ ApplicationWindow {
                                     id: autoExposure
                                     text: vision.manualExposureSupported
                                           ? "Automatic exposure"
-                                          : "Automatic exposure (required)"
+                                          : "Automatic exposure (required for this camera)"
                                     checked: true
                                     enabled: vision.manualExposureSupported
                                     onToggled: liveTuning.applyTuning()
                                 }
+                                // The backend can force auto back on when it catches
+                                // a camera going black in manual mode, so mirror it.
+                                Connections {
+                                    target: vision
+                                    function onCameraTuningChanged() {
+                                        autoExposure.checked = vision.autoExposure
+                                    }
+                                }
                                 Text {
-                                    visible: !vision.manualExposureSupported
-                                    text: "This monitor webcam returns black frames in manual exposure mode."
+                                    visible: vision.exposureNotice.length > 0
+                                    text: vision.exposureNotice
                                     color: window.warning
                                     wrapMode: Text.Wrap
                                     Layout.fillWidth: true
@@ -335,22 +407,44 @@ ApplicationWindow {
                         }
                     }
 
-                    Text {
-                        visible: vision.lastError.length > 0
-                        text: vision.lastError
-                        color: "#ff7474"
-                        wrapMode: Text.Wrap
+                    // Persists until another failure supersedes it or the operator
+                    // dismisses it. It used to be erased by the next 100 ms
+                    // refresh tick, so a failed action flashed for under a frame.
+                    Card {
                         Layout.fillWidth: true
+                        visible: vision.lastError.length > 0
+                        color: "#2a1417"
+                        border.color: "#7a3138"
+                        implicitHeight: errorRow.implicitHeight + 24
+                        RowLayout {
+                            id: errorRow
+                            objectName: "errorRow"
+                            anchors.fill: parent
+                            anchors.margins: 12
+                            spacing: 12
+                            Text {
+                                text: vision.lastError
+                                color: "#ff9a9a"
+                                wrapMode: Text.Wrap
+                                Layout.fillWidth: true
+                            }
+                            Button {
+                                text: "Dismiss"
+                                visible: vision.errorDismissable
+                                onClicked: vision.dismissError()
+                            }
+                        }
                     }
                 }
             }
 
             // Sources
             ScrollView {
+                objectName: "page1"
+                padding: window.pageMargin
                 contentWidth: availableWidth
                 ColumnLayout {
                     width: parent.width
-                    anchors.margins: 20
                     spacing: 14
                     Text { text: "Sources"; color: window.textMain; font.pixelSize: 26; font.bold: true }
                     Text {
@@ -444,10 +538,11 @@ ApplicationWindow {
 
             // Overlay Studio
             ScrollView {
+                objectName: "page2"
+                padding: window.pageMargin
                 contentWidth: availableWidth
                 ColumnLayout {
                     width: parent.width
-                    anchors.margins: 20
                     spacing: 14
                     Text { text: "Overlay Studio"; color: window.textMain; font.pixelSize: 26; font.bold: true }
                     Text { text: "Profiles render independently from the shared raw frame."; color: window.textMuted }
@@ -457,27 +552,49 @@ ApplicationWindow {
                         columnSpacing: 12
                         rowSpacing: 12
                         Repeater {
-                            model: [
-                                { id: "clean", title: "Clean", body: "Raw video without annotations" },
-                                { id: "minimal", title: "Minimal", body: "Subtle boxes and compact labels" },
-                                { id: "broadcast", title: "Broadcast", body: "High-contrast OBS styling" },
-                                { id: "security", title: "Security", body: "Scores and security state" }
-                            ]
+                            // The custom profile gets a card as soon as one has
+                            // been applied. Without it, "Apply custom" selected a
+                            // profile no card knew about and all four read "Select".
+                            model: {
+                                var profiles = [
+                                    { id: "clean", title: "Clean", body: "Raw video without annotations" },
+                                    { id: "minimal", title: "Minimal", body: "Subtle boxes and compact labels" },
+                                    { id: "broadcast", title: "Broadcast", body: "High-contrast OBS styling" },
+                                    { id: "security", title: "Security", body: "Scores and security state" }
+                                ]
+                                if (vision.customOverlayReady)
+                                    profiles.push({ id: "custom", title: "Custom",
+                                                    body: "The box style you applied below" })
+                                return profiles
+                            }
                             delegate: Card {
+                                id: overlayCard
                                 required property var modelData
+                                // The model list is rebuilt when the custom profile
+                                // appears, and a delegate briefly sees an undefined
+                                // modelData while that happens. Read it once, safely.
+                                readonly property string profileId: modelData ? modelData.id : ""
+                                readonly property string profileTitle: modelData ? modelData.title : ""
+                                readonly property string profileBody: modelData ? modelData.body : ""
+                                readonly property bool active:
+                                    profileId !== "" && vision.overlayProfile === profileId
                                 Layout.fillWidth: true
                                 implicitHeight: 110
-                                border.color: vision.overlayProfile === modelData.id ? window.accent : window.border
-                                MouseArea { anchors.fill: parent; onClicked: vision.setOverlayProfile(modelData.id) }
+                                border.color: overlayCard.active ? window.accent : window.border
+                                MouseArea {
+                                    anchors.fill: parent
+                                    onClicked: if (overlayCard.profileId !== "")
+                                                   vision.setOverlayProfile(overlayCard.profileId)
+                                }
                                 Column {
                                     anchors.fill: parent
                                     anchors.margins: 14
                                     spacing: 7
-                                    Text { text: modelData.title; color: window.textMain; font.bold: true; font.pixelSize: 16 }
-                                    Text { text: modelData.body; color: window.textMuted }
+                                    Text { text: overlayCard.profileTitle; color: window.textMain; font.bold: true; font.pixelSize: 16 }
+                                    Text { text: overlayCard.profileBody; color: window.textMuted }
                                     Text {
-                                        text: vision.overlayProfile === modelData.id ? "Active" : "Select"
-                                        color: vision.overlayProfile === modelData.id ? window.accent : window.textMuted
+                                        text: overlayCard.active ? "Active" : "Select"
+                                        color: overlayCard.active ? window.accent : window.textMuted
                                     }
                                 }
                             }
@@ -528,7 +645,7 @@ ApplicationWindow {
                         }
                     }
                     Text {
-                        text: "Landmarks, trails, zones, privacy effects, and profile import/export remain in the advanced compositor slice."
+                        text: "Landmarks, trails, zones, privacy effects, and saving or loading profiles are not available yet."
                         color: window.textMuted
                         wrapMode: Text.Wrap
                         Layout.fillWidth: true
@@ -538,10 +655,11 @@ ApplicationWindow {
 
             // Gestures and Rules
             ScrollView {
+                objectName: "page3"
+                padding: window.pageMargin
                 contentWidth: availableWidth
                 ColumnLayout {
                     width: parent.width
-                    anchors.margins: 20
                     spacing: 14
                     Text { text: "Gestures and Rules"; color: window.textMain; font.pixelSize: 26; font.bold: true }
                     Card {
@@ -621,7 +739,7 @@ ApplicationWindow {
 
                     Text {
                         visible: vision.rules.length === 0
-                        text: "No rules configured. Existing automations will import disabled in the migration slice."
+                        text: "No rules configured. Add one above — every new rule starts in dry-run until you arm it."
                         color: window.textMuted
                     }
 
@@ -664,10 +782,11 @@ ApplicationWindow {
 
             // People
             ScrollView {
+                objectName: "page4"
+                padding: window.pageMargin
                 contentWidth: availableWidth
                 ColumnLayout {
                     width: parent.width
-                    anchors.margins: 20
                     spacing: 14
                     Text { text: "People"; color: window.textMain; font.pixelSize: 26; font.bold: true }
                     Card {
@@ -680,9 +799,35 @@ ApplicationWindow {
                             Text { text: "Secure enrolment is not active yet"; color: window.warning; font.bold: true }
                             Text {
                                 width: parent.width
-                                text: "The current dlib gallery is a migration baseline. AcesVision will not present it as verified authentication."
+                                text: "Enrolled faces are used for labelling only. AcesVision will not present them as verified authentication."
                                 color: window.textMuted
                                 wrapMode: Text.Wrap
+                            }
+                        }
+                    }
+                    Card {
+                        Layout.fillWidth: true
+                        implicitHeight: enrolledColumn.implicitHeight + 28
+                        ColumnLayout {
+                            id: enrolledColumn
+                            anchors.fill: parent
+                            anchors.margins: 14
+                            spacing: 8
+                            RowLayout {
+                                Layout.fillWidth: true
+                                Text { text: "Enrolled identities"; color: window.textMain; font.bold: true }
+                                Item { Layout.fillWidth: true }
+                                Button { text: "Rescan"; onClicked: vision.refreshActors() }
+                            }
+                            Text {
+                                // Re-read while the app runs, so somebody enrolled
+                                // now can be picked as a rule actor without a restart.
+                                text: vision.actorNames.length > 1
+                                      ? vision.actorNames.filter(function (name) { return name !== "*" }).join(", ")
+                                      : "Nobody is enrolled yet. Rules can still target anyone with the * actor."
+                                color: window.textMuted
+                                wrapMode: Text.Wrap
+                                Layout.fillWidth: true
                             }
                         }
                     }
@@ -691,10 +836,11 @@ ApplicationWindow {
 
             // Models and Security
             ScrollView {
+                objectName: "page5"
+                padding: window.pageMargin
                 contentWidth: availableWidth
                 ColumnLayout {
                     width: parent.width
-                    anchors.margins: 20
                     spacing: 14
                     Text { text: "Models and Security"; color: window.textMain; font.pixelSize: 26; font.bold: true }
                     Card {
@@ -707,7 +853,7 @@ ApplicationWindow {
                             spacing: 8
                             Text { text: "Object detection and tracking"; color: window.textMain; font.bold: true; font.pixelSize: 17 }
                             Text {
-                                text: "Models run locally through ROCm on the RX 6600. Switching keeps capture and outputs alive while the new model warms up."
+                                text: "Models run locally on " + vision.computeDevice + ". Switching keeps capture and outputs alive while the new model warms up."
                                 color: window.textMuted
                                 wrapMode: Text.Wrap
                                 Layout.fillWidth: true
@@ -721,6 +867,7 @@ ApplicationWindow {
                                     valueRole: "id"
                                     Layout.fillWidth: true
                                 }
+                                Button { text: "Rescan"; onClicked: vision.refreshModels() }
                                 Button {
                                     text: "Use model"
                                     enabled: objectModelPicker.count > 0
