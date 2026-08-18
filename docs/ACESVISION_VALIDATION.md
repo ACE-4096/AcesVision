@@ -7,8 +7,10 @@ Runtime: PyTorch 2.9.1 with ROCm 6.3, Ultralytics 8.4.60
 ## Validated architecture
 
 - AcesVision capture and Qt outputs run in the `face-id` environment.
-- Ultralytics runs in the local `cv-worker` ROCm environment through a framed
-  binary subprocess protocol.
+- Ultralytics runs in a subprocess of this repo (`acesvision.yolo_worker`)
+  through a framed, frame-tagged binary protocol, in the same `face-id`
+  environment. Keeping it out of process keeps torch off the Qt import path;
+  it is not a second environment.
 - Capture publishes every available frame using latest-frame output slots.
 - Inference consumes only the newest pending frame and cannot block capture.
 - YOLO performs COCO object detection and ByteTrack tracking in one pass.

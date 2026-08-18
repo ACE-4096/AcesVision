@@ -12,8 +12,14 @@ Pipeline:
 
 Ticket 6bcb1adc.
 
+Runs in this repo's own .venv — torch, torchvision and ultralytics are
+installed there:
+
+    .venv/bin/python track_video.py <video.mp4> --annotated <out.mp4>
+
 IMPORTANT: set HSA_OVERRIDE_GFX_VERSION before any torch import so ROCm
-           correctly maps RX 6600 GFX architecture.
+           correctly maps RX 6600 GFX architecture. This module does it below,
+           and only on a host that actually has the AMD stack loaded.
 """
 from __future__ import annotations
 
@@ -25,7 +31,9 @@ from pathlib import Path
 from typing import Optional
 
 # --- ROCm GFX override: must happen before torch / ultralytics import ---
-os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", "10.3.0")
+# Only meaningful on an AMD host; setting it elsewhere just misleads a crash log.
+if os.path.isdir("/sys/module/amdgpu") or os.path.isdir("/opt/rocm"):
+    os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", "10.3.0")
 
 import cv2
 import numpy as np
