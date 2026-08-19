@@ -88,8 +88,16 @@ def attribute_actor(faces, gesture):
 class GestureEventOutput:
     def __init__(self, callback: Callable[[dict], None], hold_frames: int = 6,
                  cooldown_s: float = 1.5, clock=time.monotonic,
-                 enabled: bool = False):
+                 enabled: bool = False, emitter=None):
         self.callback = callback
+        # Two sinks, deliberately. `callback` is the in-process one that feeds
+        # the rule engine, and its dict is unchanged. `emitter` is the wire —
+        # it receives the same event plus the scene, projects it onto the
+        # published schema, and is free to publish strictly less (see
+        # emitter.GestureEmitter). Flattening the scene into the callback dict
+        # to serve both would have made the local contract answer to the remote
+        # one. Optional: without it this class behaves exactly as it did.
+        self.emitter = emitter
         self.hold_frames = max(1, int(hold_frames))
         self.cooldown_s = float(cooldown_s)
         self.clock = clock
@@ -124,7 +132,7 @@ class GestureEventOutput:
             return
 
         actor, attribution, candidates = attribute_actor(scene.faces, gesture)
-        self.callback({
+        event = {
             "event": "gesture",
             "gesture": name,
             "confidence": float(getattr(gesture, "score", 0.0)),
@@ -138,7 +146,18 @@ class GestureEventOutput:
             "source": scene.source.id,
             "captured_at_monotonic": scene.captured_at,
             "security_authorized": False,
-        })
+        }
+        self.callback(event)
+        if self.emitter is not None:
+            # This runs on the pipeline's _OutputWorker thread, never the
+            # capture thread, and the emitter's publish is non-blocking — so a
+            # subscriber that has stopped reading cannot cost a frame. A
+            # subscriber that raises must not cost the local rules either: the
+            # callback above has already run.
+            try:
+                self.emitter.publish_gesture(event, scene)
+            except Exception as exc:
+                log.warning("gesture event not published: %s", exc)
         self._last_fire = now
 
     def close(self) -> None:

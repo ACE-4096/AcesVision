@@ -5,7 +5,8 @@ Single source of truth for:
   * which gesture names exist — the seven MediaPipe built-ins plus the custom
     landmark-derived ``Middle_Finger`` and ``Shush``;
   * which typed actions a rule may bind to;
-  * how to normalise a hand-typed name onto its canonical spelling.
+  * how to normalise a hand-typed name onto its canonical spelling;
+  * the landmark geometry that recognises the two custom poses.
 
 Ported from AceRGB's ``gesture/acergb_gesture.py`` (``GESTURES`` :132-133,
 ``ACTION_CATALOG`` :135-151 and the ``Middle_Finger`` landmark pose :43-57) so
@@ -13,25 +14,34 @@ the two projects share one vocabulary instead of two that silently disagree.
 Free-text gesture names are how both live rules in ``rules.json`` ended up
 permanently unfireable ("open_palm" never equals the emitted "Open_Palm").
 
-Pure data and pure functions: no cv2, no mediapipe, no I/O. Safe to import from
-anywhere, including modules AcesVision imports lazily.
+The gesture half of that vocabulary is no longer written here. It is data in
+``gestures.json``, loaded and validated by ``acesvision.catalog``, and
+re-exported below so every existing caller keeps the same names. Doing it that
+way gives the vocabulary a version and a content hash, which is what lets an
+out-of-process subscriber check that it agrees with the emitter instead of
+assuming it. The action catalog stays code: nothing outside this repo binds to
+it yet, and it is the next thing to move if that changes.
+
+Pure data and pure functions: no cv2, no mediapipe, no network or device I/O.
+The one file read — ``gestures.json``, once, at import — happens inside
+``acesvision.catalog``. Still safe to import from anywhere.
 """
 from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass
 
-
-@dataclass(frozen=True)
-class GestureSpec:
-    """One entry in the recognisable-gesture vocabulary."""
-
-    id: str
-    label: str
-    builtin: bool = True   # True == the MediaPipe model emits this label itself
-
-    def as_dict(self):
-        return asdict(self)
+from acesvision.catalog import (
+    CATALOG_SHA256,
+    CATALOG_VERSION,
+    GESTURE_IDS,
+    GESTURES,
+    GestureSpec,
+    gesture_by_id,
+    is_known_gesture,
+    normalise_gesture,
+    require_gesture,
+)
 
 
 @dataclass(frozen=True)
@@ -46,19 +56,10 @@ class ActionSpec:
         return asdict(self)
 
 
-GESTURES = (
-    GestureSpec("Closed_Fist", "Closed fist"),
-    GestureSpec("Open_Palm", "Open palm"),
-    GestureSpec("Pointing_Up", "Pointing up"),
-    GestureSpec("Thumb_Up", "Thumb up"),
-    GestureSpec("Thumb_Down", "Thumb down"),
-    GestureSpec("Victory", "Victory"),
-    GestureSpec("ILoveYou", "I love you"),
-    GestureSpec("Middle_Finger", "Middle finger", builtin=False),
-    GestureSpec("Shush", "Shush (finger to lips)", builtin=False),
-)
-
-GESTURE_IDS = tuple(spec.id for spec in GESTURES)
+# GESTURES and GESTURE_IDS are imported above from acesvision.catalog, which
+# reads them from gestures.json. The two custom poses are named here because the
+# geometry further down is what actually recognises them, and that code needs to
+# refer to them by something other than a bare string literal.
 MIDDLE_FINGER = "Middle_Finger"
 SHUSH = "Shush"
 
@@ -123,39 +124,11 @@ MOUTH_CENTRE_Y = 0.72
 MOUTH_RADIUS = 0.5
 
 
-def _key(name):
-    """Fold a hand-typed name onto a comparison key: case and separators ignored."""
-    return "".join(character for character in str(name).lower()
-                   if character.isalnum())
-
-
-_GESTURES_BY_KEY = {_key(spec.id): spec for spec in GESTURES}
+# gesture_by_id / normalise_gesture / is_known_gesture / require_gesture are
+# imported above. They are methods of the loaded acesvision.catalog.GestureCatalog
+# rather than functions written twice — a second copy of the folding rule is
+# exactly how two spellings of one gesture start to disagree.
 _ACTIONS_BY_ID = {spec.id: spec for spec in ACTION_CATALOG}
-
-
-def gesture_by_id(gesture_id):
-    return _GESTURES_BY_KEY.get(_key(gesture_id))
-
-
-def normalise_gesture(name):
-    """Return the canonical gesture id for a loosely typed name, or None."""
-    spec = _GESTURES_BY_KEY.get(_key(name))
-    return spec.id if spec else None
-
-
-def is_known_gesture(name):
-    return normalise_gesture(name) is not None
-
-
-def require_gesture(name):
-    """Canonical gesture id, or ValueError naming the whole vocabulary."""
-    canonical = normalise_gesture(name)
-    if canonical is None:
-        raise ValueError(
-            f"unknown gesture: {name!r}. Known gestures: "
-            + ", ".join(GESTURE_IDS)
-        )
-    return canonical
 
 
 def action_by_id(action_id):
@@ -174,8 +147,15 @@ def require_action(action_id):
 
 
 def catalog_json():
-    """Serialisable vocabulary for UI clients (QML combo boxes, applet, CLI)."""
+    """Serialisable vocabulary for UI clients (QML combo boxes, applet, CLI).
+
+    Carries the gesture catalog's version and content hash so a client that
+    caches this payload can tell whether it is still current. ``GET /api/catalog``
+    serves the gesture half of it to out-of-process subscribers.
+    """
     return {
+        "catalog_version": CATALOG_VERSION,
+        "catalog_sha256": CATALOG_SHA256,
         "gestures": [spec.as_dict() for spec in GESTURES],
         "actions": [spec.as_dict() for spec in ACTION_CATALOG],
     }

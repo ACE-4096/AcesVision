@@ -1,12 +1,18 @@
 import errno
+import hashlib
+import hmac
+import http.client
+import inspect
 import json
 import os
+import stat
 import struct
 import sys
 import tempfile
 import threading
 import time
 import unittest
+import uuid
 from collections import namedtuple
 from datetime import datetime
 from pathlib import Path
@@ -18,7 +24,42 @@ import camera
 import gesture_catalog
 import verify_gestures_live as verify
 from acesvision import connectors
+from acesvision.catalog import (
+    CATALOG,
+    CatalogError,
+    GestureCatalog,
+    canonical_json,
+    catalog_sha256,
+    load_catalog,
+)
 from acesvision.contracts import SceneFrame, SourceSpec
+from acesvision import server as server_module
+from acesvision.emitter import (
+    SCHEMA_GESTURE,
+    SCHEMA_HELLO,
+    EmitterIdentity,
+    EventBus,
+    GestureEmitter,
+    PublishFilter,
+    Subscription,
+    TooManySubscribers,
+    harden_directory,
+    identity_state,
+    write_secret_file,
+)
+from acesvision.server import (
+    BindRefused,
+    VisionServer,
+    host_header_ok,
+    is_loopback,
+    keepalive_frame,
+    load_or_create_token,
+    parse_since,
+    presented_token,
+    resolve_bind,
+    sse_frame,
+    token_matches,
+)
 from acesvision.discovery import (
     WebcamDevice,
     _stable_v4l_path,
@@ -29,7 +70,7 @@ from acesvision.discovery import (
 )
 from acesvision.outputs import CallbackOutput
 from acesvision.overlay import CLEAN, OverlayProfile, render
-from acesvision.pipeline import VisionPipeline
+from acesvision.pipeline import PipelineState, VisionPipeline
 from acesvision import perception
 from acesvision.events import (
     GestureEventOutput,
@@ -3120,6 +3161,1501 @@ class QmlTeardownTests(unittest.TestCase):
         self.assertNotIn("of null", completed.stderr)
         self.assertNotIn("TypeError", completed.stderr)
         self.assertEqual(completed.stderr.strip(), "")
+
+
+# ---------------------------------------------------------------------------
+# The gesture catalog as data — gestures.json, its version, and its content hash.
+# ---------------------------------------------------------------------------
+
+
+#: Every catalog version this repo has ever published, and the sha256 of its
+#: canonical serialisation. This is the canary: editing gestures.json changes the
+#: hash, and the only way to make this table agree again is to bump
+#: catalog_version and add a row. An edit that forgets the bump fails here,
+#: which is the whole point — a subscriber pinned to version 1 must never be
+#: handed a different version-1 vocabulary.
+CATALOG_HASHES = {
+    1: "e1243aea83118534ba92ae915bafb74101fbc446fab4d055737a731841709a13",
+}
+
+
+class GestureCatalogFileTests(unittest.TestCase):
+    def test_the_shipped_catalog_matches_its_pinned_hash(self):
+        self.assertIn(
+            CATALOG.version, CATALOG_HASHES,
+            "gestures.json declares catalog_version "
+            f"{CATALOG.version}, which has no pinned hash. Add it to "
+            "CATALOG_HASHES.")
+        self.assertEqual(
+            CATALOG.sha256, CATALOG_HASHES[CATALOG.version],
+            "gestures.json changed but catalog_version is still "
+            f"{CATALOG.version}. Bump the version and pin the new hash.")
+
+    def test_the_catalog_holds_exactly_the_nine_known_gestures(self):
+        self.assertEqual(
+            CATALOG.ids,
+            ("Closed_Fist", "Open_Palm", "Pointing_Up", "Thumb_Up",
+             "Thumb_Down", "Victory", "ILoveYou", "Middle_Finger", "Shush"))
+        builtins = [spec.id for spec in CATALOG.gestures if spec.builtin]
+        self.assertEqual(len(builtins), 7)            # the MediaPipe labels
+        self.assertEqual([spec.id for spec in CATALOG.gestures if not spec.builtin],
+                         ["Middle_Finger", "Shush"])  # the landmark poses
+
+    def test_the_hash_describes_content_not_formatting(self):
+        """Reformatting the file must not move the hash; a real edit must."""
+        document = CATALOG.as_document()
+        reordered = {
+            "gestures": [dict(reversed(list(entry.items())))
+                         for entry in document["gestures"]],
+            "catalog_version": document["catalog_version"],
+        }
+        self.assertEqual(catalog_sha256(reordered), CATALOG.sha256)
+
+        added = CATALOG.as_document()
+        added["gestures"].append({"id": "Wave", "label": "Wave", "builtin": True})
+        self.assertNotEqual(catalog_sha256(added), CATALOG.sha256)
+
+    def test_a_subscriber_can_recompute_the_hash_from_the_served_payload(self):
+        """The wire contract: strip 'sha256', canonicalise, hash, compare."""
+        payload = CATALOG.as_payload()
+        served_hash = payload.pop("sha256")
+        recomputed = hashlib.sha256(
+            canonical_json(payload).encode("utf-8")).hexdigest()
+        self.assertEqual(recomputed, served_hash)
+        self.assertEqual(recomputed, CATALOG.sha256)
+
+    def test_the_file_on_disk_is_what_the_module_loaded(self):
+        root = Path(__file__).resolve().parent
+        on_disk = json.loads((root / "gestures.json").read_text())
+        self.assertEqual(on_disk, CATALOG.as_document())
+
+
+class GestureCatalogValidationTests(unittest.TestCase):
+    """A vocabulary two processes could read differently is refused outright."""
+
+    def good(self, **overrides):
+        document = {
+            "catalog_version": 1,
+            "gestures": [{"id": "Open_Palm", "label": "Open palm",
+                          "builtin": True}],
+        }
+        document.update(overrides)
+        return document
+
+    def assert_rejected(self, document, fragment):
+        with self.assertRaises(CatalogError) as caught:
+            GestureCatalog(document, origin="probe.json")
+        self.assertIn(fragment, str(caught.exception))
+
+    def test_a_valid_catalog_loads(self):
+        catalog = GestureCatalog(self.good(), origin="probe.json")
+        self.assertEqual(catalog.ids, ("Open_Palm",))
+        self.assertEqual(catalog.version, 1)
+
+    def test_version_must_be_a_positive_integer(self):
+        for bad in (0, -1, "1", 1.0, None, True):
+            self.assert_rejected(self.good(catalog_version=bad),
+                                 "'catalog_version' must be an integer >= 1")
+
+    def test_gestures_must_be_a_non_empty_array(self):
+        self.assert_rejected(self.good(gestures=[]), "non-empty array")
+        self.assert_rejected(self.good(gestures={}), "non-empty array")
+
+    def test_every_field_is_required_and_typed(self):
+        self.assert_rejected(self.good(gestures=[{"id": "A", "label": "A"}]),
+                             "is missing builtin")
+        self.assert_rejected(
+            self.good(gestures=[{"id": "", "label": "A", "builtin": True}]),
+            "non-string or empty 'id'")
+        self.assert_rejected(
+            self.good(gestures=[{"id": "A", "label": "A", "builtin": "yes"}]),
+            "non-boolean 'builtin'")
+        self.assert_rejected(self.good(gestures=["Open_Palm"]),
+                             "must be an object")
+
+    def test_ids_that_fold_together_are_a_collision(self):
+        """'open_palm' and 'Open_Palm' are one gesture wearing two hats: names
+        are matched ignoring case and separators, so normalisation would pick
+        between them arbitrarily."""
+        self.assert_rejected(
+            self.good(gestures=[
+                {"id": "Open_Palm", "label": "Open palm", "builtin": True},
+                {"id": "open palm", "label": "Open palm again", "builtin": True},
+            ]),
+            "collides with 'Open_Palm'")
+
+    def test_a_missing_or_unparsable_file_names_itself(self):
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "nope.json"
+            with self.assertRaises(CatalogError) as caught:
+                load_catalog(missing)
+            self.assertIn("nope.json", str(caught.exception))
+
+            broken = Path(directory) / "broken.json"
+            broken.write_text("{not json")
+            with self.assertRaises(CatalogError) as caught:
+                load_catalog(broken)
+            self.assertIn("not valid JSON", str(caught.exception))
+
+    def test_catalog_error_is_a_value_error(self):
+        # Callers already catch ValueError around vocabulary loading.
+        self.assertTrue(issubclass(CatalogError, ValueError))
+
+
+class GestureCatalogReexportTests(unittest.TestCase):
+    """gesture_catalog kept its whole public surface when the data moved out."""
+
+    def test_the_vocabulary_functions_are_the_catalog_object(self):
+        # Bound methods of the one loaded catalog, not a second copy of the
+        # name-folding rule. (Bound methods compare equal, never identical.)
+        self.assertEqual(gesture_catalog.normalise_gesture, CATALOG.normalise)
+        self.assertEqual(gesture_catalog.require_gesture, CATALOG.require)
+        self.assertIs(gesture_catalog.GESTURES, CATALOG.gestures)
+        self.assertIs(gesture_catalog.GESTURE_IDS, CATALOG.ids)
+
+    def test_catalog_json_now_carries_the_version_and_hash(self):
+        payload = gesture_catalog.catalog_json()
+        self.assertEqual(payload["catalog_version"], CATALOG.version)
+        self.assertEqual(payload["catalog_sha256"], CATALOG.sha256)
+        self.assertEqual([entry["id"] for entry in payload["gestures"]],
+                         list(CATALOG.ids))
+        self.assertEqual(len(payload["actions"]), 16)
+
+    def test_the_landmark_geometry_stayed_behind(self):
+        # Real perception code, not vocabulary — it must not have moved.
+        for name in ("is_middle_finger", "is_shush", "fingertip_near_mouth",
+                     "MOUTH_CENTRE_Y", "MOUTH_RADIUS"):
+            self.assertTrue(hasattr(gesture_catalog, name), name)
+        self.assertTrue(gesture_catalog.is_middle_finger(hand_landmarks(["middle"])))
+
+    def test_importing_the_vocabulary_does_not_import_opencv(self):
+        """gesture_catalog promises no cv2. Loading the vocabulary through the
+        acesvision package must not quietly break that promise — which it would
+        if acesvision/__init__ imported the capture pipeline eagerly."""
+        import subprocess
+
+        probe = ("import sys, gesture_catalog, acesvision.catalog;"
+                 "print(sorted(m for m in ('cv2', 'mediapipe', 'PySide6')"
+                 " if m in sys.modules))")
+        completed = subprocess.run([sys.executable, "-c", probe],
+                                   cwd=str(Path(__file__).parent),
+                                   capture_output=True, text=True, timeout=120)
+        self.assertEqual(completed.returncode, 0, completed.stderr[-2000:])
+        self.assertEqual(completed.stdout.strip(), "[]")
+
+    def test_the_lazy_package_export_still_resolves(self):
+        import acesvision
+
+        from acesvision.pipeline import VisionPipeline as direct
+
+        self.assertIs(acesvision.VisionPipeline, direct)
+        with self.assertRaises(AttributeError):
+            acesvision.NoSuchThing
+
+
+# ---------------------------------------------------------------------------
+# The event emitter — bus, wire schema, and the HTTP surface subscribers use.
+# ---------------------------------------------------------------------------
+
+
+TEST_TOKEN = "test-token-Yg7Qx0pM3nV8sLzR2bT5wC1aH4eJ6kD9"
+
+#: An RTSP source with credentials in the URL. Every source assertion below uses
+#: it, because "the URL never reaches the wire" is only worth asserting against a
+#: URL that would hurt if it did.
+CREDENTIALED_RTSP = {
+    "id": "desk", "name": "Desk cam", "type": "rtsp",
+    "url": "rtsp://admin:hunter2@192.168.68.40:554/Preferred?channel=1",
+}
+
+
+def gesture_event(gesture="Open_Palm", attribution="unique", actor="Toby",
+                  confidence=0.91, held_frames=6, captured_at=12.5,
+                  candidates=("Toby", "Ana")):
+    """The dict GestureEventOutput hands to its callback and to the emitter."""
+    return {
+        "event": "gesture",
+        "gesture": gesture,
+        "confidence": confidence,
+        "held_frames": held_frames,
+        "actor": actor,
+        "actor_attribution": attribution,
+        "actor_candidates": list(candidates),
+        "hands_in_frame": 1,
+        "identity_state": "identified" if actor else "unknown",
+        "liveness_state": "not_evaluated",
+        "source": "desk",
+        "captured_at_monotonic": captured_at,
+        "security_authorized": False,
+    }
+
+
+def emitter_for(publish_filter=None, publishing=True, source=None):
+    source = source or SourceSpec.from_mapping(CREDENTIALED_RTSP)
+    bus = EventBus()
+    emitter = GestureEmitter(
+        bus, identity=EmitterIdentity("acesvision", "instance-1", "9.9.9", "test-host"),
+        publish_filter=publish_filter or PublishFilter(), publishing=publishing,
+        clock=lambda: 1700000000.5)
+    return bus, emitter, source
+
+
+def scene_for(source, sequence=117, captured_at=12.5):
+    return SceneFrame(source, sequence, captured_at, None)
+
+
+class FakeLatestOutput:
+    def __init__(self, jpeg=b"\xff\xd8jpeg"):
+        self.jpeg = jpeg
+
+    def snapshot(self):
+        return None, self.jpeg
+
+
+class FakePipeline:
+    def __init__(self, source):
+        self._state = PipelineState("live", source, 7, "", {"capture_fps": 30.0})
+
+    def state(self):
+        return self._state
+
+
+def parse_sse(raw):
+    """``(event, id, data)`` from one raw SSE frame."""
+    event_id = event = None
+    data = []
+    for line in raw.split("\n"):
+        field, _, value = line.partition(": ")
+        if field == "id":
+            event_id = int(value)
+        elif field == "event":
+            event = value
+        elif field == "data":
+            data.append(value)
+    return event, event_id, (json.loads("\n".join(data)) if data else None)
+
+
+class SSEStream:
+    """An SSE reader that pulls a fixed number of bytes at a time.
+
+    The chunk size is a test parameter on purpose. A frame boundary and a read
+    boundary have nothing to do with each other on a real socket, and a stream
+    that only survives when they coincide is not a stream.
+    """
+
+    def __init__(self, response, chunk=64):
+        self.response = response
+        self.chunk = chunk
+        self.buffer = b""
+
+    def raw_frame(self):
+        while b"\n\n" not in self.buffer:
+            piece = self.response.read1(self.chunk)
+            if not piece:
+                raise EOFError("stream closed while waiting for a frame")
+            self.buffer += piece
+        frame, _, self.buffer = self.buffer.partition(b"\n\n")
+        return frame.decode("utf-8")
+
+    def frame(self):
+        """The next frame that is not a comment."""
+        while True:
+            raw = self.raw_frame()
+            if not raw.startswith(":"):
+                return parse_sse(raw)
+
+
+class StreamHandle:
+    """Closes an SSE stream properly.
+
+    ``HTTPConnection.close()`` alone is not enough. The server answers a stream
+    with ``Connection: close``, so ``http.client`` detaches the connection the
+    moment the headers are read — ``self.sock`` is already ``None`` and
+    ``close()`` is a no-op by the time a test calls it. The socket's file
+    descriptor is held open by the *response* object, whose ``makefile`` handle
+    keeps it alive. Closing only the connection leaves the server writing into a
+    socket nobody will ever read, and its subscriber slot occupied.
+    """
+
+    def __init__(self, connection, response):
+        self.connection = connection
+        self.response = response
+
+    def close(self):
+        try:
+            self.response.close()
+        finally:
+            self.connection.close()
+
+
+class EmitterHarness:
+    """A running VisionServer over a real socket, with a fake camera behind it."""
+
+    def __init__(self, token=TEST_TOKEN, publish_filter=None, publishing=True,
+                 keepalive_s=15.0, poll_s=0.02, ring_size=256, queue_size=64,
+                 max_subscribers=8, host="127.0.0.1"):
+        self.source = SourceSpec.from_mapping(CREDENTIALED_RTSP)
+        self.bus = EventBus(ring_size=ring_size, queue_size=queue_size,
+                            max_subscribers=max_subscribers)
+        self.emitter = GestureEmitter(
+            self.bus,
+            identity=EmitterIdentity("acesvision", "instance-1", "9.9.9", "test-host"),
+            publish_filter=publish_filter or PublishFilter(),
+            publishing=publishing, clock=lambda: 1700000000.5)
+        self.server = VisionServer(
+            FakeLatestOutput(), FakePipeline(self.source), host=host, port=0,
+            bus=self.bus, emitter=self.emitter, token=token,
+            keepalive_s=keepalive_s, poll_s=poll_s)
+        self.server.start()
+        self.connections = []
+
+    @property
+    def port(self):
+        return self.server.bound_port
+
+    def stop(self):
+        for connection in self.connections:
+            try:
+                connection.close()
+            except OSError:
+                pass
+        self.server.stop()
+
+    def publish(self, **kwargs):
+        sequence = kwargs.pop("sequence", 117)
+        return self.emitter.publish_gesture(gesture_event(**kwargs),
+                                            scene_for(self.source, sequence))
+
+    def request(self, path, token=TEST_TOKEN, headers=None, stream=False):
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=15)
+        self.connections.append(connection)
+        sent = dict(headers or {})
+        if token is not None and "Authorization" not in sent:
+            sent["Authorization"] = f"Bearer {token}"
+        connection.request("GET", path, headers=sent)
+        response = connection.getresponse()
+        if stream:
+            return connection, response
+        body = response.read()
+        connection.close()
+        self.connections.remove(connection)
+        return response.status, body
+
+    def json(self, path, **kwargs):
+        status, body = self.request(path, **kwargs)
+        return status, (json.loads(body) if body else None)
+
+    def stream(self, path="/api/events", chunk=64, **kwargs):
+        connection, response = self.request(path, stream=True, **kwargs)
+        return (StreamHandle(connection, response), response,
+                SSEStream(response, chunk=chunk))
+
+
+class EmitterHarnessCase(unittest.TestCase):
+    harness_kwargs: dict = {}
+
+    def setUp(self):
+        self.harness = EmitterHarness(**self.harness_kwargs)
+        self.addCleanup(self.harness.stop)
+
+
+# --- the wire schema -------------------------------------------------------
+
+
+class GestureEventSchemaTests(unittest.TestCase):
+    REQUIRED = (
+        "schema", "type", "seq", "emitted_at", "emitter", "catalog", "gesture",
+        "confidence", "held_frames", "actor", "identity_state", "liveness_state",
+        "security_authorized", "source", "frame_sequence",
+        "captured_at_monotonic", "dropped",
+    )
+
+    def setUp(self):
+        self.bus, self.emitter, self.source = emitter_for()
+
+    def publish(self, **kwargs):
+        sequence = kwargs.pop("sequence", 117)
+        return self.emitter.publish_gesture(gesture_event(**kwargs),
+                                            scene_for(self.source, sequence))
+
+    def test_every_declared_field_is_present_and_nothing_else_is(self):
+        event = self.publish()
+        self.assertEqual(sorted(event), sorted(self.REQUIRED))
+
+    def test_the_payload_round_trips_through_json_unchanged(self):
+        """It has to survive the wire, so nothing in it may be unserialisable."""
+        event = self.publish()
+        self.assertEqual(json.loads(json.dumps(event, sort_keys=True)), event)
+
+    def test_the_values_are_the_ones_that_were_observed(self):
+        event = self.publish(gesture="Victory", confidence=0.77, held_frames=4,
+                             captured_at=42.25, sequence=901)
+        self.assertEqual(event["schema"], SCHEMA_GESTURE)
+        self.assertEqual(event["type"], "gesture")
+        self.assertEqual(event["gesture"], "Victory")
+        self.assertAlmostEqual(event["confidence"], 0.77)
+        self.assertEqual(event["held_frames"], 4)
+        self.assertEqual(event["frame_sequence"], 901)
+        self.assertEqual(event["captured_at_monotonic"], 42.25)
+        self.assertEqual(event["emitted_at"], 1700000000.5)
+        self.assertEqual(event["dropped"], 0)
+
+    def test_it_names_the_emitter_instance_and_the_catalog_it_used(self):
+        event = self.publish()
+        self.assertEqual(event["emitter"], {
+            "id": "acesvision", "instance": "instance-1",
+            "version": "9.9.9", "host": "test-host"})
+        self.assertEqual(event["catalog"],
+                         {"version": CATALOG.version, "sha256": CATALOG.sha256})
+
+    def test_a_process_gets_one_instance_id_and_a_new_one_per_start(self):
+        first = EmitterIdentity.for_process()
+        second = EmitterIdentity.for_process()
+        self.assertNotEqual(first.instance, second.instance)
+        uuid.UUID(first.instance)             # a real UUID4, not a counter
+        self.assertEqual(uuid.UUID(first.instance).version, 4)
+
+    def test_sequence_numbers_start_at_one_and_never_repeat(self):
+        self.assertEqual(self.bus.seq, 0)     # 0 means "nothing published yet"
+        sequences = [self.publish()["seq"] for _ in range(5)]
+        self.assertEqual(sequences, [1, 2, 3, 4, 5])
+
+    def test_the_source_url_and_its_credentials_never_reach_the_wire(self):
+        event = self.publish()
+        self.assertEqual(event["source"], {
+            "id": "desk", "kind": "network", "trusted_device": False,
+            "label": "Desk cam (network: rtsp://192.168.68.40:554/Preferred)"})
+        serialised = json.dumps(event)
+        for secret in ("admin", "hunter2", "admin:hunter2@", "channel=1"):
+            self.assertNotIn(secret, serialised, secret)
+
+    def test_the_source_label_can_be_withheld_entirely(self):
+        _, emitter, source = emitter_for(
+            PublishFilter(publish_source_label=False))
+        event = emitter.publish_gesture(gesture_event(), scene_for(source))
+        self.assertIsNone(event["source"]["label"])
+        # id and kind still route, and neither carries a hostname.
+        self.assertEqual(event["source"]["id"], "desk")
+        self.assertEqual(event["source"]["kind"], "network")
+
+    def test_liveness_and_authorization_are_honestly_negative(self):
+        event = self.publish()
+        self.assertEqual(event["liveness_state"], "not_evaluated")
+        self.assertIs(event["security_authorized"], False)
+
+
+class IdentityStateTests(unittest.TestCase):
+    """Four states. The old collapse made two of them indistinguishable."""
+
+    def setUp(self):
+        self.source = SourceSpec.from_mapping({"type": "webcam"})
+
+    def wire_event(self, faces, gestures, publish_filter=None):
+        """Drive the real detector so the projection is tested on real input."""
+        bus = EventBus()
+        emitter = GestureEmitter(bus, publish_filter=publish_filter or PublishFilter(),
+                                 identity=EmitterIdentity.for_process(host="test"))
+        local = []
+        output = GestureEventOutput(local.append, hold_frames=1, enabled=True,
+                                    clock=Mock(return_value=1.0), emitter=emitter)
+        output.publish(SceneFrame(self.source, 5, 0.0, np.zeros((2, 2, 3)),
+                                  faces=faces, gestures=gestures))
+        published = bus.replay_since(0)
+        return local[0], (published[0] if published else None)
+
+    def test_one_enrolled_face_is_identified_and_named(self):
+        local, wire = self.wire_event([Face(0, 0, 5, 5, "Toby", 0.2, True)],
+                                      [Gesture("Victory", 0.9, 0, 0, 5, 5)])
+        self.assertEqual(local["actor_attribution"], "unique")
+        self.assertEqual(wire["identity_state"], "identified")
+        self.assertEqual(wire["actor"], "Toby")
+
+    def test_no_enrolled_face_is_unknown(self):
+        _, wire = self.wire_event([Face(0, 0, 5, 5, None, 0.9, False)],
+                                  [Gesture("Victory", 0.9, 0, 0, 5, 5)])
+        self.assertEqual(wire["identity_state"], "unknown")
+        self.assertIsNone(wire["actor"])
+
+    def test_two_enrolled_faces_are_ambiguous_and_neither_is_named(self):
+        """The case with no test before this one.
+
+        Locally the nearest face still wins, marked as a guess, so actor-scoped
+        rules keep working. On the wire that guess is published as `ambiguous`
+        with no actor: a proximity guess is not an identification, and naming
+        both candidates to say it might be either publishes both of them.
+        """
+        faces = [Face(0, 0, 10, 10, "A", 0.2, True),
+                 Face(200, 0, 10, 10, "B", 0.2, True)]
+        local, wire = self.wire_event(faces,
+                                      [Gesture("Open_Palm", 0.9, 195, 0, 10, 10)])
+        self.assertEqual((local["actor"], local["actor_attribution"]),
+                         ("B", "nearest"))
+        self.assertEqual(local["actor_candidates"], ["A", "B"])
+
+        self.assertEqual(wire["identity_state"], "ambiguous")
+        self.assertIsNone(wire["actor"])
+        serialised = json.dumps(wire)
+        self.assertNotIn("A", json.dumps(wire.get("actor")))
+        for name in ("\"A\"", "\"B\"", "candidates"):
+            self.assertNotIn(name, serialised, name)
+
+    def test_two_enrolled_faces_with_no_geometry_are_ambiguous_too(self):
+        Blind = namedtuple("Blind", "name known")
+        _, wire = self.wire_event([Blind("A", True), Blind("B", True)],
+                                  [Gesture("Victory", 0.9, 0, 0, 5, 5)])
+        self.assertEqual(wire["identity_state"], "ambiguous")
+        self.assertIsNone(wire["actor"])
+
+    def test_the_operator_can_switch_identity_off_entirely(self):
+        _, wire = self.wire_event([Face(0, 0, 5, 5, "Toby", 0.2, True)],
+                                  [Gesture("Victory", 0.9, 0, 0, 5, 5)],
+                                  publish_filter=PublishFilter(publish_identity=False))
+        self.assertEqual(wire["identity_state"], "disabled")
+        self.assertIsNone(wire["actor"])
+        self.assertNotIn("Toby", json.dumps(wire))
+
+    def test_disabled_says_nothing_about_the_scene(self):
+        # All four scene cases collapse to `disabled`, which is the point: it
+        # reports the operator's choice, not what the camera saw.
+        for attribution in ("unique", "nearest", "ambiguous", "none"):
+            self.assertEqual(identity_state(attribution, False), "disabled")
+        self.assertEqual(
+            [identity_state(a, True)
+             for a in ("unique", "nearest", "ambiguous", "none", "anything")],
+            ["identified", "ambiguous", "ambiguous", "unknown", "unknown"])
+
+
+# --- the bus ---------------------------------------------------------------
+
+
+class EventBusTests(unittest.TestCase):
+    def setUp(self):
+        self.bus = EventBus(ring_size=8, queue_size=4, max_subscribers=3)
+
+    def payload(self, name="x"):
+        return {"type": "gesture", "gesture": name}
+
+    def test_publish_stamps_a_monotonic_sequence(self):
+        self.assertEqual([self.bus.publish(self.payload())["seq"]
+                          for _ in range(3)], [1, 2, 3])
+        self.assertEqual(self.bus.seq, 3)
+
+    def test_the_ring_replays_only_what_comes_after_since(self):
+        for index in range(5):
+            self.bus.publish(self.payload(f"g{index}"))
+        self.assertEqual([event["seq"] for event in self.bus.replay_since(2)],
+                         [3, 4, 5])
+        self.assertEqual(self.bus.replay_since(5), [])
+        self.assertEqual([event["seq"] for event in self.bus.replay_since(0)],
+                         [1, 2, 3, 4, 5])
+
+    def test_the_ring_is_bounded_and_says_what_it_still_holds(self):
+        for index in range(20):                    # ring_size is 8
+            self.bus.publish(self.payload(f"g{index}"))
+        self.assertEqual(self.bus.oldest_seq(), 13)
+        self.assertEqual([event["seq"] for event in self.bus.replay_since(0)],
+                         [13, 14, 15, 16, 17, 18, 19, 20])
+
+    def test_an_empty_ring_reports_no_oldest(self):
+        self.assertEqual(self.bus.oldest_seq(), 0)
+
+    def test_a_slow_subscriber_loses_its_oldest_events_and_is_told(self):
+        subscription, _, _ = self.bus.subscribe()
+        for index in range(7):                     # queue_size is 4
+            self.bus.publish(self.payload(f"g{index}"))
+        self.assertEqual(subscription.dropped, 3)
+
+        received = [subscription.get(timeout=0.1) for _ in range(4)]
+        # Newest-wins: the four that survived are the last four, not the first.
+        self.assertEqual([event["seq"] for event in received], [4, 5, 6, 7])
+        # And every one of them carries the gap count, so it is in-band.
+        self.assertEqual([event["dropped"] for event in received], [3, 3, 3, 3])
+        self.assertIsNone(subscription.get(timeout=0.05))
+
+    def test_dropping_never_blocks_and_never_loses_the_newest(self):
+        subscription, _, _ = self.bus.subscribe()
+        for index in range(1000):
+            self.bus.publish(self.payload(f"g{index}"))
+        self.assertEqual(subscription.dropped, 996)
+        newest = None
+        while True:
+            event = subscription.get(timeout=0.05)
+            if event is None:
+                break
+            newest = event
+        self.assertEqual(newest["seq"], 1000)
+
+    def test_dropped_is_per_subscriber_not_per_bus(self):
+        slow, _, _ = self.bus.subscribe()
+        quick, _, _ = self.bus.subscribe()
+        for index in range(6):
+            self.bus.publish(self.payload(f"g{index}"))
+            quick.get(timeout=0.1)                 # keeps up
+        self.assertEqual(quick.dropped, 0)
+        self.assertEqual(slow.dropped, 2)
+        self.assertEqual(slow.get(timeout=0.1)["dropped"], 2)
+
+    def test_the_ring_is_unaffected_by_a_subscriber_falling_behind(self):
+        self.bus.subscribe()
+        for index in range(7):
+            self.bus.publish(self.payload(f"g{index}"))
+        self.assertEqual([event["dropped"] for event in self.bus.replay_since(0)],
+                         [0] * 7)
+
+    def test_subscribing_is_capped(self):
+        for _ in range(3):
+            self.bus.subscribe()
+        with self.assertRaises(TooManySubscribers):
+            self.bus.subscribe()
+
+    def test_unsubscribing_frees_a_slot_and_wakes_the_reader(self):
+        subscription, _, _ = self.bus.subscribe()
+        self.bus.subscribe()
+        self.bus.subscribe()
+        self.bus.unsubscribe(subscription)
+        self.assertTrue(subscription.closed)
+        self.assertIsNone(subscription.get(timeout=1.0))
+        self.bus.subscribe()                       # the slot came back
+        self.assertEqual(self.bus.subscriber_count, 3)
+
+    def test_an_unsubscribed_reader_receives_nothing_further(self):
+        subscription, _, _ = self.bus.subscribe()
+        self.bus.unsubscribe(subscription)
+        self.bus.publish(self.payload())
+        self.assertIsNone(subscription.get(timeout=0.05))
+
+    def test_replay_and_live_traffic_do_not_overlap_or_gap(self):
+        """The seam a replay protocol usually leaks.
+
+        Subscribing and taking the replay slice happen under one lock. Register
+        first and anything published in between is delivered twice; read first
+        and it is lost. Subscribing in the middle of a hard publish loop is what
+        would expose either, so this runs the race repeatedly and demands that
+        replay + live is exactly 1..TOTAL, once each, every time.
+
+        The ring and the queue are both larger than TOTAL, so a drop here would
+        be a real loss rather than the documented back-pressure.
+        """
+        TOTAL = 400
+        for attempt in range(25):
+            bus = EventBus(ring_size=1024, queue_size=1024, max_subscribers=2)
+            running = threading.Event()
+
+            def publisher():
+                running.set()
+                for _ in range(TOTAL):
+                    bus.publish(self.payload())
+                    # Paced only so that `subscribe` below reliably lands while
+                    # the loop is still running. Nothing about the seam itself
+                    # is synchronised — the lock is what has to hold.
+                    time.sleep(0.001)
+
+            thread = threading.Thread(target=publisher, daemon=True)
+            thread.start()
+            running.wait(5)
+            time.sleep(0.05)
+            subscription, replay, _ = bus.subscribe(since=0)
+            thread.join(timeout=10)
+            self.assertFalse(thread.is_alive())
+
+            live = []
+            while True:
+                event = subscription.get(timeout=0.05)
+                if event is None:
+                    break
+                live.append(event)
+
+            self.assertEqual(subscription.dropped, 0, f"attempt {attempt}")
+            sequences = [event["seq"] for event in replay] + \
+                        [event["seq"] for event in live]
+            self.assertEqual(sequences, list(range(1, TOTAL + 1)),
+                             f"attempt {attempt}: duplicated or lost at the seam")
+            # The race has to have actually straddled the seam at least once.
+            if replay and live:
+                break
+        else:
+            self.fail("subscribe never landed mid-publish; the seam went untested")
+
+    def test_closing_the_bus_releases_every_subscriber(self):
+        first, _, _ = self.bus.subscribe()
+        second, _, _ = self.bus.subscribe()
+        self.bus.close()
+        self.assertIsNone(first.get(timeout=1.0))
+        self.assertIsNone(second.get(timeout=1.0))
+        self.assertEqual(self.bus.subscriber_count, 0)
+
+    def test_a_full_queue_still_accepts_the_close_sentinel(self):
+        subscription, _, _ = self.bus.subscribe()
+        for _ in range(10):
+            self.bus.publish(self.payload())
+        subscription.close()
+        for _ in range(5):                          # drains, then hits the sentinel
+            if subscription.get(timeout=0.5) is None:
+                return
+        self.fail("close() never woke the reader")
+
+    def test_the_bus_performs_no_io(self):
+        """A publish that could touch a socket could block the capture path."""
+        source = inspect.getsource(EventBus) + inspect.getsource(Subscription)
+        for forbidden in ("socket", "open(", "requests", "urllib", "subprocess"):
+            self.assertNotIn(forbidden, source, forbidden)
+
+
+class GestureEventOutputEmitterTests(unittest.TestCase):
+    """The detector feeds two sinks and neither may break the other."""
+
+    def setUp(self):
+        self.source = SourceSpec.from_mapping({"type": "webcam"})
+        self.scene = SceneFrame(self.source, 3, 0.0, np.zeros((2, 2, 3)),
+                                faces=[Face(0, 0, 5, 5, "Toby", 0.2, True)],
+                                gestures=[Gesture("Victory", 0.9, 0, 0, 5, 5)])
+
+    def test_the_local_callback_and_the_emitter_both_see_the_gesture(self):
+        bus = EventBus()
+        emitter = GestureEmitter(bus, identity=EmitterIdentity.for_process(host="t"))
+        local = []
+        output = GestureEventOutput(local.append, hold_frames=1, enabled=True,
+                                    clock=Mock(return_value=1.0), emitter=emitter)
+        output.publish(self.scene)
+        self.assertEqual(len(local), 1)
+        self.assertEqual(bus.seq, 1)
+
+    def test_the_local_event_dict_is_unchanged_by_the_emitter(self):
+        """The rule engine's contract must not answer to the wire's."""
+        without = []
+        GestureEventOutput(without.append, hold_frames=1, enabled=True,
+                           clock=Mock(return_value=1.0)).publish(self.scene)
+        with_emitter = []
+        GestureEventOutput(
+            with_emitter.append, hold_frames=1, enabled=True,
+            clock=Mock(return_value=1.0),
+            emitter=GestureEmitter(EventBus())).publish(self.scene)
+        self.assertEqual(without, with_emitter)
+
+    def test_a_broken_emitter_cannot_stop_the_local_rules(self):
+        class Exploding:
+            def publish_gesture(self, event, scene):
+                raise RuntimeError("subscriber transport is on fire")
+
+        local = []
+        output = GestureEventOutput(local.append, hold_frames=1, enabled=True,
+                                    clock=Mock(return_value=1.0),
+                                    emitter=Exploding())
+        with self.assertLogs("acesvision.events", level="WARNING") as logged:
+            output.publish(self.scene)
+        self.assertEqual(len(local), 1)
+        self.assertIn("on fire", "\n".join(logged.output))
+
+    def test_no_emitter_is_the_pre_existing_behaviour(self):
+        local = []
+        output = GestureEventOutput(local.append, hold_frames=1, enabled=True,
+                                    clock=Mock(return_value=1.0))
+        output.publish(self.scene)
+        self.assertEqual(len(local), 1)
+
+    def test_no_emit_serves_the_endpoint_but_publishes_nothing(self):
+        bus = EventBus()
+        emitter = GestureEmitter(bus, publishing=False)
+        self.assertIsNone(emitter.publish_gesture(gesture_event(),
+                                                  scene_for(self.source)))
+        self.assertEqual(bus.seq, 0)
+        # And it says so, so "switched off" reads differently from "dead".
+        self.assertIs(emitter.hello(0)["publishing"], False)
+
+
+# --- the publish filter ----------------------------------------------------
+
+
+class PublishFilterTests(unittest.TestCase):
+    def test_the_defaults_are_the_behaviour_that_already_existed(self):
+        allowed = PublishFilter()
+        self.assertTrue(allowed.enabled)
+        self.assertIsNone(allowed.gestures)
+        self.assertTrue(allowed.publish_identity)
+        self.assertTrue(allowed.publish_source_label)
+        self.assertEqual(allowed.allows("Open_Palm", 0.0), (True, ""))
+
+    def test_disabled_publishes_nothing(self):
+        allowed, reason = PublishFilter(enabled=False).allows("Open_Palm", 1.0)
+        self.assertFalse(allowed)
+        self.assertIn("disabled", reason)
+
+    def test_an_allowlist_is_exactly_that_list(self):
+        filtered = PublishFilter(gestures=("Open_Palm",))
+        self.assertTrue(filtered.allows("Open_Palm", 1.0)[0])
+        self.assertFalse(filtered.allows("Victory", 1.0)[0])
+        self.assertIn("allowlist", filtered.allows("Victory", 1.0)[1])
+
+    def test_an_empty_allowlist_means_none_not_all(self):
+        """The one place a permissive reading would silently invert the config."""
+        empty = PublishFilter.from_mapping({"gestures": []})
+        self.assertEqual(empty.gestures, ())
+        for gesture in CATALOG.ids:
+            self.assertFalse(empty.allows(gesture, 1.0)[0], gesture)
+
+        absent = PublishFilter.from_mapping({})
+        self.assertIsNone(absent.gestures)
+        for gesture in CATALOG.ids:
+            self.assertTrue(absent.allows(gesture, 1.0)[0], gesture)
+
+    def test_min_confidence_is_inclusive_at_the_threshold(self):
+        filtered = PublishFilter(min_confidence=0.6)
+        self.assertTrue(filtered.allows("Open_Palm", 0.6)[0])
+        self.assertFalse(filtered.allows("Open_Palm", 0.5999)[0])
+        self.assertIn("0.600", filtered.allows("Open_Palm", 0.1)[1])
+
+    def test_allowlist_names_are_normalised_against_the_catalog(self):
+        filtered = PublishFilter.from_mapping({"gestures": ["open_palm", "VICTORY"]})
+        self.assertEqual(filtered.gestures, ("Open_Palm", "Victory"))
+        self.assertTrue(filtered.allows("Open_Palm", 1.0)[0])
+
+    def test_an_unknown_allowlist_name_is_quarantined_not_fatal(self):
+        """It can only ever fail closed, and one typo must not take the emitter
+        down — but it is named rather than silently swallowed."""
+        filtered = PublishFilter.from_mapping({"gestures": ["Open_Palm", "wave"]})
+        self.assertEqual(filtered.gestures, ("Open_Palm",))
+        self.assertEqual(filtered.rejected, (("wave", "not in the gesture catalog"),))
+        self.assertFalse(filtered.allows("wave", 1.0)[0])
+
+    def test_duplicate_allowlist_entries_collapse(self):
+        filtered = PublishFilter.from_mapping(
+            {"gestures": ["Open_Palm", "open palm", "OPEN_PALM"]})
+        self.assertEqual(filtered.gestures, ("Open_Palm",))
+
+    def test_a_malformed_filter_is_refused(self):
+        for bad in ([], "nope", 7):
+            with self.assertRaises(ValueError):
+                PublishFilter.from_mapping(bad)
+        with self.assertRaises(ValueError):
+            PublishFilter.from_mapping({"gestures": "Open_Palm"})
+
+    def test_a_missing_file_is_the_defaults(self):
+        with tempfile.TemporaryDirectory() as directory:
+            filtered = PublishFilter.load(Path(directory) / "absent.json")
+            self.assertEqual(filtered, PublishFilter())
+
+    def test_a_file_is_read_from_disk(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "publish.json"
+            path.write_text(json.dumps({"gestures": ["Shush"],
+                                        "min_confidence": 0.8,
+                                        "publish_identity": False}))
+            filtered = PublishFilter.load(path)
+            self.assertEqual(filtered.gestures, ("Shush",))
+            self.assertEqual(filtered.min_confidence, 0.8)
+            self.assertFalse(filtered.publish_identity)
+
+    def test_without_identity_narrows_and_changes_nothing_else(self):
+        filtered = PublishFilter(gestures=("Shush",), min_confidence=0.4)
+        narrowed = filtered.without_identity()
+        self.assertFalse(narrowed.publish_identity)
+        self.assertEqual(narrowed.gestures, ("Shush",))
+        self.assertEqual(narrowed.min_confidence, 0.4)
+        self.assertTrue(filtered.publish_identity)          # the original is frozen
+
+    def test_the_advertised_filter_never_lists_a_person(self):
+        advertised = PublishFilter(gestures=("Shush",)).as_dict()
+        self.assertEqual(sorted(advertised),
+                         ["enabled", "gestures", "min_confidence",
+                          "publish_identity", "publish_source_label"])
+
+    def test_a_blocked_gesture_never_reaches_the_bus(self):
+        bus, emitter, source = emitter_for(
+            PublishFilter(gestures=("Shush",), min_confidence=0.5))
+        self.assertIsNone(emitter.publish_gesture(gesture_event(gesture="Victory"),
+                                                  scene_for(source)))
+        self.assertIsNone(emitter.publish_gesture(
+            gesture_event(gesture="Shush", confidence=0.4), scene_for(source)))
+        self.assertIsNotNone(emitter.publish_gesture(
+            gesture_event(gesture="Shush", confidence=0.9), scene_for(source)))
+        self.assertEqual(bus.seq, 1)
+        self.assertEqual(emitter.suppressed, 2)
+
+
+# --- the security decisions, each on its own -------------------------------
+
+
+class BindPolicyTests(unittest.TestCase):
+    def test_loopback_is_recognised_in_every_spelling(self):
+        for host in ("127.0.0.1", "127.1.2.3", "::1", "localhost", "LOCALHOST",
+                     "[::1]"):
+            self.assertTrue(is_loopback(host), host)
+        for host in ("0.0.0.0", "192.168.68.10", "example.com", "", None,
+                     "127.0.0.1.evil.com"):
+            self.assertFalse(is_loopback(host), host)
+
+    def test_a_loopback_bind_needs_no_flag(self):
+        self.assertEqual(resolve_bind("127.0.0.1", False), "127.0.0.1")
+        self.assertEqual(resolve_bind("", False), "127.0.0.1")
+
+    def test_a_non_loopback_bind_is_refused_without_allow_remote(self):
+        for host in ("192.168.68.10", "10.0.0.5", "fd00::1"):
+            with self.assertRaises(BindRefused) as caught:
+                resolve_bind(host, False)
+            self.assertIn("--allow-remote", str(caught.exception))
+            self.assertEqual(resolve_bind(host, True), host)
+
+    def test_a_wildcard_bind_is_refused_even_with_the_flag(self):
+        """Answering only to `Host: 0.0.0.0` means every request 403s and the
+        flag silently does nothing; dropping the check trades a real defence for
+        a working flag. Naming the interface keeps both."""
+        for host in ("0.0.0.0", "::", "*"):
+            for allow_remote in (False, True):
+                with self.assertRaises(BindRefused) as caught:
+                    resolve_bind(host, allow_remote)
+                self.assertIn("name the interface", str(caught.exception))
+
+    def test_allowing_remote_forces_identity_publishing_off(self):
+        from acesvision.__main__ import build_parser, build_emitter
+
+        args = build_parser().parse_args(["--bind", "192.168.68.10",
+                                          "--allow-remote"])
+        emitter, host = build_emitter(args, publish_filter=PublishFilter())
+        self.assertEqual(host, "192.168.68.10")
+        self.assertFalse(emitter.filter.publish_identity)
+
+        args = build_parser().parse_args([])
+        emitter, host = build_emitter(args, publish_filter=PublishFilter())
+        self.assertEqual(host, "127.0.0.1")
+        self.assertTrue(emitter.filter.publish_identity)
+
+    def test_the_runner_refuses_a_bare_non_loopback_bind(self):
+        from acesvision.__main__ import build_parser, build_emitter
+
+        args = build_parser().parse_args(["--bind", "192.168.68.10"])
+        with self.assertRaises(BindRefused):
+            build_emitter(args, publish_filter=PublishFilter())
+
+
+class HostHeaderTests(unittest.TestCase):
+    """DNS rebinding: the socket cannot tell, the Host header can."""
+
+    def test_loopback_hosts_are_accepted_with_and_without_a_port(self):
+        for header in ("127.0.0.1:8765", "127.0.0.1", "localhost:8765",
+                       "[::1]:8765", "[::1]"):
+            self.assertTrue(host_header_ok(header, ()), header)
+
+    def test_a_rebound_name_is_refused_however_it_resolves(self):
+        for header in ("evil.example", "evil.example:8765",
+                       "acesvision.local", "127.0.0.1.evil.example"):
+            self.assertFalse(host_header_ok(header, ()), header)
+
+    def test_a_missing_host_header_fails_closed(self):
+        self.assertFalse(host_header_ok("", ()))
+        self.assertFalse(host_header_ok(None, ()))
+
+    def test_an_explicitly_bound_address_is_also_answerable(self):
+        self.assertTrue(host_header_ok("192.168.68.10:8765", {"192.168.68.10"}))
+        self.assertFalse(host_header_ok("192.168.68.11:8765", {"192.168.68.10"}))
+
+
+class TokenTests(unittest.TestCase):
+    def test_the_comparison_is_constant_time(self):
+        """== returns as soon as two bytes differ, so its timing tells the
+        caller how much of the prefix was right."""
+        with patch.object(server_module.hmac, "compare_digest",
+                          wraps=hmac.compare_digest) as spy:
+            self.assertTrue(token_matches("abcdef", "abcdef"))
+            self.assertFalse(token_matches("abcdeg", "abcdef"))
+        self.assertEqual(spy.call_count, 2)
+        self.assertIn("hmac.compare_digest",
+                      inspect.getsource(token_matches))
+
+    def test_a_near_miss_is_still_a_miss(self):
+        for wrong in ("abcde", "abcdef ", "abcdeF", "", "abcdefg"):
+            self.assertFalse(token_matches(wrong, "abcdef"), repr(wrong))
+
+    def test_an_absent_token_on_either_side_never_matches(self):
+        self.assertFalse(token_matches("", "abcdef"))
+        self.assertFalse(token_matches("abcdef", ""))
+        self.assertFalse(token_matches(None, "abcdef"))
+
+    def test_the_bearer_header_is_read_and_the_query_is_the_fallback(self):
+        self.assertEqual(presented_token({"Authorization": "Bearer abc"}, {}), "abc")
+        self.assertEqual(presented_token({"Authorization": "bearer abc"}, {}), "abc")
+        self.assertEqual(presented_token({}, {"token": ["abc"]}), "abc")
+        self.assertEqual(presented_token({}, {}), "")
+        # A malformed Authorization header is not silently downgraded to the
+        # query string — the caller said which mechanism it was using.
+        self.assertEqual(presented_token({"Authorization": "Basic abc"},
+                                         {"token": ["abc"]}), "")
+
+    def test_the_token_file_is_created_once_and_kept_private(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config" / "emitter.token"
+            token, created = load_or_create_token(path)
+            self.assertTrue(created)
+            self.assertGreaterEqual(len(token), 40)     # 32 bytes, url-safe
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
+
+            again, created_again = load_or_create_token(path)
+            self.assertEqual((again, created_again), (token, False))
+
+    def test_a_world_readable_token_is_refused_not_repaired(self):
+        """Repairing it would hide that something already had the chance to
+        read it."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "emitter.token"
+            path.write_text("leaked-token")
+            path.chmod(0o644)
+            with self.assertRaises(PermissionError) as caught:
+                load_or_create_token(path)
+            self.assertIn("group or others", str(caught.exception))
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
+
+    def test_an_existing_loose_directory_is_tightened(self):
+        """mkdir(mode=0o700, exist_ok=True) applies the mode only when it
+        creates the directory. ~/.config/acesvision usually already exists —
+        the rule store makes it — so the mode argument alone was a comment
+        dressed as a control."""
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "acesvision"
+            config.mkdir(mode=0o775)
+            self.assertEqual(stat.S_IMODE(config.stat().st_mode), 0o775)
+
+            load_or_create_token(config / "emitter.token")
+            self.assertEqual(stat.S_IMODE(config.stat().st_mode), 0o700)
+
+    def test_an_already_written_token_still_gets_its_directory_tightened(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "acesvision"
+            config.mkdir(mode=0o700)
+            token, _ = load_or_create_token(config / "emitter.token")
+            config.chmod(0o755)                     # as if written before this check
+            again, created = load_or_create_token(config / "emitter.token")
+            self.assertEqual((again, created), (token, False))
+            self.assertEqual(stat.S_IMODE(config.stat().st_mode), 0o700)
+
+    def test_hardening_never_widens_a_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "narrow"
+            config.mkdir(mode=0o500)
+            harden_directory(config)
+            self.assertEqual(stat.S_IMODE(config.stat().st_mode), 0o500)
+
+    def test_writing_a_secret_refuses_to_follow_a_planted_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "emitter.token"
+            write_secret_file(path, "first")
+            with self.assertRaises(FileExistsError):
+                write_secret_file(path, "second")
+            self.assertEqual(path.read_text(), "first")
+
+    def test_generated_tokens_are_unique(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tokens = set()
+            for index in range(20):
+                tokens.add(load_or_create_token(
+                    Path(directory) / f"t{index}.token")[0])
+            self.assertEqual(len(tokens), 20)
+
+
+class SseFramingTests(unittest.TestCase):
+    def test_a_frame_carries_id_event_and_data(self):
+        self.assertEqual(sse_frame("gesture", {"a": 1}, event_id=7),
+                         b'id: 7\nevent: gesture\ndata: {"a":1}\n\n')
+
+    def test_an_id_is_optional(self):
+        self.assertEqual(sse_frame("hello", "x"), b"event: hello\ndata: x\n\n")
+
+    def test_a_newline_in_the_data_becomes_a_second_data_line(self):
+        """A bare newline inside a value would otherwise end the frame early."""
+        frame = sse_frame("gesture", "one\ntwo", event_id=1)
+        self.assertEqual(frame, b"id: 1\nevent: gesture\ndata: one\ndata: two\n\n")
+        self.assertEqual(frame.count(b"\n\n"), 1)
+
+    def test_the_payload_is_canonical_json(self):
+        frame = sse_frame("gesture", {"b": 2, "a": 1})
+        self.assertIn(b'data: {"a":1,"b":2}', frame)
+
+    def test_a_keepalive_is_a_comment_and_carries_no_data(self):
+        self.assertEqual(keepalive_frame(), b": keepalive\n\n")
+
+
+class ReplayPointTests(unittest.TestCase):
+    def test_the_last_event_id_header_wins_over_the_query(self):
+        """An EventSource reconnect re-requests the original URL and adds the
+        header. Honouring the query would replay the same range every time."""
+        self.assertEqual(parse_since({"since": ["5"]},
+                                     {"Last-Event-ID": "42"}), (42, None))
+
+    def test_the_query_is_used_when_there_is_no_header(self):
+        self.assertEqual(parse_since({"since": ["5"]}, {}), (5, None))
+
+    def test_no_replay_requested_is_not_a_replay_from_zero(self):
+        self.assertEqual(parse_since({}, {}), (None, None))
+
+    def test_a_malformed_query_is_an_error_and_a_malformed_header_is_not(self):
+        since, error = parse_since({"since": ["abc"]}, {})
+        self.assertIsNone(since)
+        self.assertIn("must be an integer", error)
+        # The caller did not type the header; their HTTP client did.
+        self.assertEqual(parse_since({}, {"Last-Event-ID": "abc"}), (None, None))
+
+    def test_negative_replay_points_clamp_to_zero(self):
+        self.assertEqual(parse_since({"since": ["-9"]}, {}), (0, None))
+
+
+# --- the HTTP surface, over a real socket ----------------------------------
+
+
+class EmitterEndpointTests(EmitterHarnessCase):
+    def test_health_is_open_and_says_nothing_else(self):
+        status, payload = self.harness.json("/api/health", token=None)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {"ok": True, "schema": SCHEMA_GESTURE})
+
+    def test_health_is_the_only_open_endpoint(self):
+        for path in ("/", "/index.html", "/latest.jpg", "/api/state",
+                     "/api/catalog", "/api/events", "/api/events/recent"):
+            status, _ = self.harness.request(path, token=None)
+            self.assertEqual(status, 401, path)
+
+    def test_the_live_camera_frame_is_no_longer_readable_without_a_token(self):
+        """It used to be served to any process that could guess the port."""
+        self.assertEqual(self.harness.request("/latest.jpg", token=None)[0], 401)
+        status, body = self.harness.request("/latest.jpg")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"\xff\xd8jpeg")
+
+    def test_a_wrong_token_is_refused_and_a_right_one_is_not(self):
+        self.assertEqual(self.harness.request("/api/catalog",
+                                              token="wrong")[0], 401)
+        self.assertEqual(self.harness.request("/api/catalog",
+                                              token=TEST_TOKEN[:-1])[0], 401)
+        self.assertEqual(self.harness.request("/api/catalog")[0], 200)
+
+    def test_a_token_may_travel_in_the_query_for_browsers(self):
+        status, _ = self.harness.request(f"/api/catalog?token={TEST_TOKEN}",
+                                         token=None)
+        self.assertEqual(status, 200)
+        status, _ = self.harness.request("/api/catalog?token=wrong", token=None)
+        self.assertEqual(status, 401)
+
+    def test_an_origin_header_is_refused_outright(self):
+        for origin in ("https://evil.example", "null", "http://127.0.0.1:8765"):
+            status, body = self.harness.request(
+                "/api/events", headers={"Origin": origin})
+            self.assertEqual(status, 403, origin)
+            self.assertIn(b"cross-origin", body)
+
+    def test_a_rebound_host_header_is_refused(self):
+        status, body = self.harness.request(
+            "/api/catalog", headers={"Host": "evil.example"})
+        self.assertEqual(status, 403)
+        self.assertIn(b"Host", body)
+
+    def test_the_rebinding_check_runs_before_the_token_check(self):
+        """So a hostile page cannot use the status code to probe a guess."""
+        status, _ = self.harness.request(
+            "/api/catalog", token="wrong", headers={"Host": "evil.example"})
+        self.assertEqual(status, 403)
+        status, _ = self.harness.request(
+            "/api/catalog", token="wrong", headers={"Origin": "https://evil.example"})
+        self.assertEqual(status, 403)
+
+    def test_health_is_not_exempt_from_the_rebinding_check(self):
+        status, _ = self.harness.request("/api/health", token=None,
+                                         headers={"Host": "evil.example"})
+        self.assertEqual(status, 403)
+
+    def test_the_catalog_is_served_with_a_hash_a_subscriber_can_recompute(self):
+        status, payload = self.harness.json("/api/catalog")
+        self.assertEqual(status, 200)
+        served_hash = payload.pop("sha256")
+        self.assertEqual(served_hash, CATALOG.sha256)
+        self.assertEqual(
+            hashlib.sha256(canonical_json(payload).encode()).hexdigest(),
+            served_hash)
+        self.assertEqual([entry["id"] for entry in payload["gestures"]],
+                         list(CATALOG.ids))
+
+    def test_no_endpoint_enumerates_identities(self):
+        self.harness.publish(actor="Toby", attribution="unique")
+        for path in ("/api/catalog", "/api/state", "/api/health", "/",
+                     "/api/events/recent"):
+            _, body = self.harness.request(path)
+            self.assertNotIn(b"Toby", body, path)
+
+    def test_an_unknown_path_is_a_json_404(self):
+        status, payload = self.harness.json("/api/nope")
+        self.assertEqual(status, 404)
+        self.assertEqual(payload, {"error": "not found"})
+
+
+class RecentEndpointTests(EmitterHarnessCase):
+    def test_a_first_poll_gets_a_starting_point_not_a_ring_dump(self):
+        for _ in range(3):
+            self.harness.publish()
+        status, payload = self.harness.json("/api/events/recent")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["events"], [])
+        self.assertEqual(payload["seq"], 3)
+        self.assertEqual(payload["oldest_available"], 1)
+
+    def test_since_returns_everything_after_it(self):
+        for name in ("Open_Palm", "Victory", "Shush"):
+            self.harness.publish(gesture=name)
+        _, payload = self.harness.json("/api/events/recent?since=1")
+        self.assertEqual([event["gesture"] for event in payload["events"]],
+                         ["Victory", "Shush"])
+        self.assertEqual([event["seq"] for event in payload["events"]], [2, 3])
+
+    def test_the_polled_events_are_whole_schema_objects(self):
+        self.harness.publish()
+        _, payload = self.harness.json("/api/events/recent?since=0")
+        event = payload["events"][0]
+        self.assertEqual(event["schema"], SCHEMA_GESTURE)
+        self.assertEqual(event["dropped"], 0)   # gaps show as gaps in seq here
+
+    def test_a_malformed_since_is_a_400(self):
+        status, payload = self.harness.json("/api/events/recent?since=abc")
+        self.assertEqual(status, 400)
+        self.assertIn("integer", payload["error"])
+
+
+class SseStreamTests(EmitterHarnessCase):
+    def test_hello_bootstraps_a_subscriber_in_one_round_trip(self):
+        self.harness.publish()
+        connection, _, stream = self.harness.stream()
+        self.addCleanup(connection.close)
+        event, event_id, hello = stream.frame()
+        self.assertEqual(event, "hello")
+        self.assertEqual(event_id, 1)
+        self.assertEqual(hello["schema"], SCHEMA_HELLO)
+        self.assertEqual(hello["seq"], 1)
+        self.assertEqual(hello["supported_schemas"], [SCHEMA_GESTURE])
+        self.assertEqual(hello["emitter"]["instance"], "instance-1")
+        self.assertEqual(hello["catalog"]["sha256"], CATALOG.sha256)
+        self.assertEqual([entry["id"] for entry in hello["catalog"]["gestures"]],
+                         list(CATALOG.ids))
+        self.assertTrue(hello["publishing"])
+        self.assertNotIn("replay", hello)       # none was requested
+
+    def test_a_live_gesture_arrives_on_the_stream(self):
+        connection, _, stream = self.harness.stream()
+        self.addCleanup(connection.close)
+        stream.frame()                          # hello
+        self.harness.publish(gesture="Shush", actor=None, attribution="none")
+        event, event_id, payload = stream.frame()
+        self.assertEqual(event, "gesture")
+        self.assertEqual(event_id, 1)
+        self.assertEqual(payload["gesture"], "Shush")
+        self.assertEqual(payload["seq"], 1)
+        self.assertEqual(payload["identity_state"], "unknown")
+
+    def test_the_content_type_is_the_sse_one(self):
+        connection, response, _ = self.harness.stream()
+        self.addCleanup(connection.close)
+        self.assertEqual(response.status, 200)
+        self.assertIn("text/event-stream", response.getheader("Content-Type"))
+        self.assertEqual(response.getheader("Cache-Control"), "no-store")
+
+    def test_frames_survive_being_read_one_byte_at_a_time(self):
+        """A frame boundary and a read boundary have nothing to do with each
+        other on a real socket."""
+        connection, _, stream = self.harness.stream(chunk=1)
+        self.addCleanup(connection.close)
+        self.assertEqual(stream.frame()[0], "hello")
+        for name in ("Open_Palm", "Victory", "Shush"):
+            self.harness.publish(gesture=name)
+        received = [stream.frame() for _ in range(3)]
+        self.assertEqual([payload["gesture"] for _, _, payload in received],
+                         ["Open_Palm", "Victory", "Shush"])
+        self.assertEqual([event_id for _, event_id, _ in received], [1, 2, 3])
+
+    def test_replay_by_since_then_live_traffic(self):
+        for name in ("Open_Palm", "Victory", "Shush"):
+            self.harness.publish(gesture=name)
+        connection, _, stream = self.harness.stream("/api/events?since=1")
+        self.addCleanup(connection.close)
+        _, hello_id, hello = stream.frame()
+        self.assertEqual(hello_id, 1)
+        self.assertEqual(hello["replay"],
+                         {"requested_since": 1, "oldest_available": 1,
+                          "gap": False})
+        replayed = [stream.frame() for _ in range(2)]
+        self.assertEqual([payload["gesture"] for _, _, payload in replayed],
+                         ["Victory", "Shush"])
+        self.harness.publish(gesture="Thumb_Up")
+        self.assertEqual(stream.frame()[2]["gesture"], "Thumb_Up")
+
+    def test_replay_by_last_event_id_is_the_reconnect_path(self):
+        for name in ("Open_Palm", "Victory"):
+            self.harness.publish(gesture=name)
+        connection, _, stream = self.harness.stream(
+            headers={"Last-Event-ID": "1"})
+        self.addCleanup(connection.close)
+        stream.frame()
+        self.assertEqual(stream.frame()[2]["gesture"], "Victory")
+
+    def test_the_header_beats_the_query_on_reconnect(self):
+        for name in ("Open_Palm", "Victory", "Shush"):
+            self.harness.publish(gesture=name)
+        connection, _, stream = self.harness.stream(
+            "/api/events?since=0", headers={"Last-Event-ID": "2"})
+        self.addCleanup(connection.close)
+        stream.frame()
+        # since=0 would have replayed all three; the header says two are known.
+        self.assertEqual(stream.frame()[2]["gesture"], "Shush")
+
+    def test_a_gap_the_ring_cannot_cover_is_declared(self):
+        harness = EmitterHarness(ring_size=2, poll_s=0.02)
+        self.addCleanup(harness.stop)
+        for _ in range(6):
+            harness.publish()
+        connection, _, stream = harness.stream("/api/events?since=1")
+        self.addCleanup(connection.close)
+        _, _, hello = stream.frame()
+        self.assertEqual(hello["replay"],
+                         {"requested_since": 1, "oldest_available": 5,
+                          "gap": True})
+
+    def test_a_ring_that_still_covers_the_request_reports_no_gap(self):
+        harness = EmitterHarness(ring_size=8, poll_s=0.02)
+        self.addCleanup(harness.stop)
+        for _ in range(4):
+            harness.publish()
+        connection, _, stream = harness.stream("/api/events?since=3")
+        self.addCleanup(connection.close)
+        self.assertFalse(stream.frame()[2]["replay"]["gap"])
+
+    def test_keepalives_separate_an_idle_emitter_from_a_dead_one(self):
+        harness = EmitterHarness(keepalive_s=0.15, poll_s=0.02)
+        self.addCleanup(harness.stop)
+        connection, _, stream = harness.stream()
+        self.addCleanup(connection.close)
+        self.assertEqual(stream.frame()[0], "hello")
+        comments = [stream.raw_frame() for _ in range(3)]
+        self.assertEqual(comments, [": keepalive"] * 3)
+
+    def test_a_keepalive_never_displaces_a_real_event(self):
+        harness = EmitterHarness(keepalive_s=0.15, poll_s=0.02)
+        self.addCleanup(harness.stop)
+        connection, _, stream = harness.stream()
+        self.addCleanup(connection.close)
+        stream.frame()
+        time.sleep(0.4)                          # let some keepalives go out
+        harness.publish(gesture="Victory")
+        event, _, payload = stream.frame()       # skips the comments
+        self.assertEqual((event, payload["gesture"]), ("gesture", "Victory"))
+
+    def test_a_ninth_subscriber_is_refused_with_503(self):
+        harness = EmitterHarness(max_subscribers=2, poll_s=0.02)
+        self.addCleanup(harness.stop)
+        held = []
+        for _ in range(2):
+            connection, response, stream = harness.stream()
+            held.append(connection)
+            self.addCleanup(connection.close)
+            stream.frame()                       # connected, not merely opened
+        status, body = harness.request("/api/events")
+        self.assertEqual(status, 503)
+        self.assertIn(b"limit 2", body)
+
+    def test_a_departed_subscriber_frees_its_slot(self):
+        harness = EmitterHarness(max_subscribers=1, poll_s=0.02)
+        self.addCleanup(harness.stop)
+        connection, _, stream = harness.stream()
+        stream.frame()
+        self.assertEqual(harness.request("/api/events")[0], 503)
+        connection.close()
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            harness.publish()                    # a write is what notices the hangup
+            if harness.bus.subscriber_count == 0:
+                break
+            time.sleep(0.05)
+        second, _, stream = harness.stream()
+        self.addCleanup(second.close)
+        self.assertEqual(stream.frame()[0], "hello")
+
+    def test_two_subscribers_both_receive_the_same_event(self):
+        connection_a, _, stream_a = self.harness.stream()
+        connection_b, _, stream_b = self.harness.stream()
+        self.addCleanup(connection_a.close)
+        self.addCleanup(connection_b.close)
+        stream_a.frame()
+        stream_b.frame()
+        self.harness.publish(gesture="ILoveYou")
+        for stream in (stream_a, stream_b):
+            self.assertEqual(stream.frame()[2]["gesture"], "ILoveYou")
+
+    def test_a_malformed_since_is_a_400_before_any_stream_starts(self):
+        status, payload = self.harness.json("/api/events?since=abc")
+        self.assertEqual(status, 400)
+        self.assertEqual(self.harness.bus.subscriber_count, 0)
+
+    def test_stopping_the_server_releases_a_parked_subscriber(self):
+        harness = EmitterHarness(keepalive_s=30.0, poll_s=0.02)
+        connection, _, stream = harness.stream()
+        self.addCleanup(connection.close)
+        stream.frame()
+        started = time.monotonic()
+        harness.stop()                           # must not wait on the keepalive
+        self.assertLess(time.monotonic() - started, 10.0)
+        with self.assertRaises(EOFError):
+            stream.raw_frame()
+
+
+class NoEmitStreamTests(unittest.TestCase):
+    def test_the_stream_stays_open_and_says_it_is_not_publishing(self):
+        harness = EmitterHarness(publishing=False, keepalive_s=0.15, poll_s=0.02)
+        self.addCleanup(harness.stop)
+        connection, _, stream = harness.stream()
+        self.addCleanup(connection.close)
+        _, _, hello = stream.frame()
+        self.assertFalse(hello["publishing"])
+        harness.publish()
+        self.assertEqual(stream.raw_frame(), ": keepalive")
+
+
+class HeadlessEmitterRunnerTests(unittest.TestCase):
+    def test_the_new_flags_exist_with_safe_defaults(self):
+        from acesvision.__main__ import build_parser
+
+        args = build_parser().parse_args([])
+        self.assertEqual(args.bind, "127.0.0.1")
+        self.assertEqual(args.port, 8765)
+        self.assertFalse(args.no_emit)
+        self.assertFalse(args.print_token)
+        self.assertFalse(args.allow_remote)
+
+    def test_the_old_preview_port_spelling_still_works(self):
+        from acesvision.__main__ import build_parser
+
+        self.assertEqual(build_parser().parse_args(["--preview-port", "9001"]).port,
+                         9001)
+        self.assertEqual(build_parser().parse_args(["--port", "9002"]).port, 9002)
+
+    def test_no_emit_reaches_the_emitter(self):
+        from acesvision.__main__ import build_parser, build_emitter
+
+        args = build_parser().parse_args(["--no-emit"])
+        emitter, _ = build_emitter(args, publish_filter=PublishFilter())
+        self.assertFalse(emitter.publishing)
+
+    def test_the_gesture_output_is_wired_to_the_emitter(self):
+        from acesvision.__main__ import build_parser, build_gesture_output
+
+        bus = EventBus()
+        emitter = GestureEmitter(bus)
+        output = build_gesture_output(build_parser().parse_args([]),
+                                      callback=lambda event: None,
+                                      emitter=emitter)
+        self.assertIs(output.emitter, emitter)
+        output.publish(SceneFrame(
+            SourceSpec.from_mapping({"type": "webcam"}), 1, 0.0,
+            np.zeros((2, 2, 3)),
+            gestures=[Gesture("Victory", 0.9, 0, 0, 5, 5)]))
+        self.assertEqual(bus.seq, 0)      # hold_frames is 6 by default
+        for _ in range(5):
+            output.publish(SceneFrame(
+                SourceSpec.from_mapping({"type": "webcam"}), 1, 0.0,
+                np.zeros((2, 2, 3)),
+                gestures=[Gesture("Victory", 0.9, 0, 0, 5, 5)]))
+        self.assertEqual(bus.seq, 1)
 
 
 if __name__ == "__main__":

@@ -35,19 +35,48 @@ python -m acesvision --source droidcam --url http://PHONE_IP:4747/video
 python -m acesvision --obs
 python -m acesvision --no-events            # suppress gesture events
 python -m acesvision --hold-frames 3 --cooldown-s 0.5
+python -m acesvision --print-token          # the token subscribers need
+python -m acesvision --port 8765 --bind 127.0.0.1
+python -m acesvision --no-emit              # serve the event API, publish nothing
 ```
 
 Gesture events are emitted (dry-run) by default; the runner prints
-`[events] enabled` at startup. The temporary browser preview is at
-`http://127.0.0.1:8765`.
+`[events] enabled` at startup. The browser preview and the event API are both
+on `http://127.0.0.1:8765`, and both require the token — including
+`/latest.jpg`, which is live camera video.
+
+### The event API
+
+AcesVision publishes what it saw. It does not know what anybody does about it.
+Gesture events go out over HTTP as Server-Sent Events, and a subscriber — a
+lighting daemon, a home-automation bridge, a logger — needs no code in this
+repository.
+
+```bash
+python -m acesvision --print-token
+curl -N -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8765/api/events
+```
+
+[`docs/EVENTS.md`](docs/EVENTS.md) is the normative wire contract: the
+`acesvision.gesture/1` schema, the four-value `identity_state`, replay and
+reconnection, the publish filter, and the obligations a subscriber takes on.
+Read it before writing one — in particular, `liveness_state` is always
+`not_evaluated` and `security_authorized` is always `false`, so no correct
+subscriber can bind a sensitive action to a gesture today.
 
 ### Gesture and action vocabulary
 
-[`gesture_catalog.py`](gesture_catalog.py) is the single vocabulary shared by
-this repo, AcesVision and AceRGB: the seven MediaPipe built-ins plus the two
-landmark-derived poses `Middle_Finger` and `Shush`, and the typed action
-catalog. Rules validate gesture and actor names against it at entry, so a
-mistyped rule is rejected instead of being silently unfireable.
+[`gestures.json`](gestures.json) holds the recognisable gestures — the seven
+MediaPipe built-ins plus the two landmark-derived poses `Middle_Finger` and
+`Shush` — with a `catalog_version` and a sha256 over its canonical
+serialisation, so an out-of-process subscriber can pin the vocabulary it was
+built against instead of assuming it. `acesvision/catalog.py` is the only
+reader; `GET /api/catalog` serves it whole.
+
+[`gesture_catalog.py`](gesture_catalog.py) re-exports that vocabulary, holds
+the typed action catalog, and holds the landmark geometry that recognises the
+two custom poses. Rules validate gesture and actor names against it at entry,
+so a mistyped rule is rejected instead of being silently unfireable.
 
 `Shush` is the real-world shush — index finger up, held to the lips. MediaPipe
 labels that same hand `Pointing_Up`, which is bound to `ledctl next-theme`, so
