@@ -110,7 +110,7 @@ from acesvision.policy import (
     validate_gesture,
 )
 from acesvision.processor import FaceGestureProcessor
-from acesvision.sources import open_source
+from acesvision.sources import LatestFrameReader, open_source
 
 Face = namedtuple("Face", "x y w h name conf known")
 Gesture = namedtuple("Gesture", "name score x y w h")
@@ -1330,6 +1330,211 @@ class PipelineTests(unittest.TestCase):
 
         self.assertEqual(opened[:2], ["webcam", "phone"])
         self.assertTrue(webcam_capture.released)
+
+
+class ScriptedCapture:
+    """A capture that hands out a scripted list of frames, then parks.
+
+    Parking rather than returning ``(False, None)`` is what a live network
+    source does between frames, and it is the state the reader has to be
+    correct in: the producer is idle, not finished.
+    """
+
+    def __init__(self, frames, *, fail_at_end=False):
+        self._frames = list(frames)
+        self._fail_at_end = fail_at_end
+        self.reads = 0
+        self.released = False
+        self.exhausted = threading.Event()
+        self._resume = threading.Event()
+        self._lock = threading.Lock()
+
+    def resume(self, frames=()):
+        with self._lock:
+            self._frames.extend(frames)
+        self.exhausted.clear()
+        self._resume.set()
+
+    def isOpened(self):                     # noqa: N802 - cv2 spelling
+        return not self.released
+
+    def read(self):
+        while True:
+            with self._lock:
+                if self._frames:
+                    self.reads += 1
+                    return True, self._frames.pop(0)
+            if self._fail_at_end:
+                return False, None
+            self.exhausted.set()
+            self._resume.clear()
+            if self.released:
+                return False, None
+            self._resume.wait(2.0)
+            if self.released:
+                return False, None
+
+    def release(self):
+        self.released = True
+        self._resume.set()
+
+    def set(self, *_):
+        return True
+
+    def get(self, *_):
+        return 0.0
+
+
+class LatestFrameReaderTests(unittest.TestCase):
+    """Decode off the capture loop, keep the newest frame, drop the rest.
+
+    The fault this closes is not throughput, it is age. Read in order from the
+    capture loop, a network source hands the pipeline every frame it ever sent,
+    including the ones from several seconds ago, and face recognition on a
+    frame from several seconds ago is wrong rather than slow.
+    """
+
+    def reader(self, capture, **kwargs):
+        reader = LatestFrameReader(capture, **kwargs)
+        self.addCleanup(reader.release)
+        return reader
+
+    def test_the_producer_never_waits_for_the_consumer(self):
+        """Ten frames arrive while the consumer has not called read() once."""
+        capture = ScriptedCapture(range(10))
+        reader = self.reader(capture)
+        self.assertTrue(capture.exhausted.wait(2.0),
+                        "the reader thread stalled behind an idle consumer")
+        self.assertEqual(capture.reads, 10)
+
+    def test_the_consumer_gets_the_newest_frame_and_the_rest_are_counted(self):
+        capture = ScriptedCapture(range(10))
+        reader = self.reader(capture)
+        self.assertTrue(capture.exhausted.wait(2.0))
+
+        ok, frame = reader.read()
+        self.assertTrue(ok)
+        self.assertEqual(frame, 9)          # newest, not the nine before it
+        self.assertEqual(reader.dropped, 9)
+
+    def test_a_waiting_frame_is_handed_over_without_waiting(self):
+        capture = ScriptedCapture([1])
+        reader = self.reader(capture)
+        self.assertTrue(capture.exhausted.wait(2.0))
+
+        started = time.monotonic()
+        ok, frame = reader.read()
+        self.assertEqual((ok, frame), (True, 1))
+        self.assertLess(time.monotonic() - started, 0.05)
+
+    def test_a_frame_is_never_delivered_twice(self):
+        capture = ScriptedCapture([1])
+        reader = self.reader(capture, read_timeout_s=0.05)
+        self.assertEqual(reader.read(), (True, 1))
+        # Nothing new has arrived; the old frame must not be served again as
+        # if it were current.
+        self.assertEqual(reader.read(), (False, None))
+
+        capture.resume([2])
+        self.assertEqual(reader.read(), (True, 2))
+
+    def test_a_dead_source_is_reported_as_not_ok(self):
+        capture = ScriptedCapture([], fail_at_end=True)
+        reader = self.reader(capture)
+        self.assertEqual(reader.read(), (False, None))
+        self.assertFalse(reader.isOpened())
+
+    def test_a_source_that_goes_quiet_gives_up_at_its_timeout(self):
+        """The signal VisionPipeline already reads as 'reconnect'."""
+        capture = ScriptedCapture([])
+        reader = self.reader(capture, read_timeout_s=0.05)
+        started = time.monotonic()
+        self.assertEqual(reader.read(), (False, None))
+        self.assertLess(time.monotonic() - started, 2.0)
+
+    def test_release_stops_the_thread_and_releases_the_capture(self):
+        capture = ScriptedCapture([])
+        reader = LatestFrameReader(capture)
+        reader.release()
+        self.assertTrue(capture.released)
+        self.assertFalse(reader._thread.is_alive())
+        self.assertFalse(reader.isOpened())
+
+    def test_control_calls_reach_the_capture_underneath(self):
+        capture = ScriptedCapture([])
+        capture.set = Mock(return_value=True)
+        reader = self.reader(capture)
+        reader.set(cv2_prop := 38, 1)
+        capture.set.assert_called_once_with(cv2_prop, 1)
+
+
+class ThreadedSourceWiringTests(unittest.TestCase):
+    """open_source and VisionPipeline, with the reader actually in the path."""
+
+    def test_network_sources_are_wrapped_and_webcams_are_not(self):
+        capture = ScriptedCapture([])
+        phone = SourceSpec.from_mapping({
+            "type": "droidcam", "url": "http://phone:4747/video",
+        })
+        opened = open_source(phone, capture_factory=lambda *_: capture)
+        self.addCleanup(opened.release)
+        self.assertIsInstance(opened, LatestFrameReader)
+
+        webcam = SourceSpec.from_mapping({"type": "webcam", "index": 0})
+        # A webcam takes camera-control set() calls from the capture loop while
+        # it runs, and OpenCV is not safe to set() and read() at once. That is
+        # why the reader stops at the network boundary.
+        self.assertIs(open_source(webcam, webcam_opener=lambda _: capture),
+                      capture)
+
+    def test_a_failed_network_open_is_still_none_not_a_reader(self):
+        capture = FakeCapture([], opened=False)
+        phone = SourceSpec.from_mapping({
+            "type": "droidcam", "url": "http://phone:4747/video",
+        })
+        self.assertIsNone(open_source(phone, capture_factory=lambda *_: capture))
+        self.assertTrue(capture.released)
+
+    def test_switching_sources_through_the_reader_releases_the_old_one(self):
+        """The switch contract of test_switches_from_webcam_to_droidcam...,
+        re-run with real LatestFrameReaders in the capture slot."""
+        first = SourceSpec.from_mapping({
+            "id": "phone", "type": "droidcam", "url": "http://one:4747/video",
+        })
+        second = SourceSpec.from_mapping({
+            "id": "tablet", "type": "droidcam", "url": "http://two:4747/video",
+        })
+        captures = {"phone": ScriptedCapture(["one"] * 50),
+                    "tablet": ScriptedCapture(["two"] * 50)}
+        opened = []
+        delivered = threading.Event()
+
+        def opener(source):
+            opened.append(source.id)
+            return open_source(source,
+                               capture_factory=lambda *_: captures[source.id])
+
+        def processor(frame, source, sequence, captured_at):
+            if source.id == "phone":
+                pipeline.switch_source(second)
+            return SceneFrame(source, sequence, captured_at, frame)
+
+        def receive(scene):
+            if scene.source.id == "tablet":
+                delivered.set()
+
+        pipeline = VisionPipeline(first, processor, [CallbackOutput(receive)],
+                                  opener=opener, retry_min_s=0.001,
+                                  retry_max_s=0.002)
+        pipeline.start()
+        self.addCleanup(pipeline.join, 2.0)
+        self.addCleanup(pipeline.stop)
+        self.assertTrue(delivered.wait(5.0), "the switched source never arrived")
+        pipeline.stop()
+        pipeline.join(2.0)
+
+        self.assertEqual(opened[:2], ["phone", "tablet"])
+        self.assertTrue(captures["phone"].released)
 
 
 class PolicyTests(unittest.TestCase):

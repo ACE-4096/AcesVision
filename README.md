@@ -262,6 +262,71 @@ The camera selector shows the Linux camera number, hardware name, capture type,
 and `/dev/videoN` path. AcesVision starts with the first real colour camera;
 IR and virtual devices remain available for explicit selection.
 
+### The network capture path: newest frame wins
+
+A network source is read on its own thread and only the newest frame is kept
+(`acesvision/sources.py`, `LatestFrameReader`). This is the same drop-old
+contract `_OutputWorker` and `EventBus` already use, applied at the other end
+of the pipeline.
+
+Read straight from the capture loop, `cv2.VideoCapture` delivers every frame,
+in order, and drops none. That sounds like a feature and is not. The consumer
+here is YOLO plus ArcFace, it is slower than the phone, and the frames it has
+not read do not evaporate — they queue in the socket buffer and the FFMPEG
+demuxer, so every frame it eventually draws a box on is further into the past
+than the one before it. Measured against a 1280x720 MJPEG source at 18.9 FPS
+with a 90 ms consumer, over a real socket:
+
+| | throughput | frame age at the end of a 25 s run | frames skipped |
+|---|---|---|---|
+| raw JPEG off the wire, no decode | 11.08 FPS | — | — |
+| `cv2.VideoCapture`, in order | 10.86 FPS | **10.56 s** | 0 |
+| threaded, newest frame only | 11.07 FPS | **0.06 s** | 193 |
+
+Throughput is not the story — all three are within 2% of each other, and the
+figure that matters is the middle column. Recognising a face on a ten-second-old
+frame is not slow, it is wrong. The reader trades 193 frames nobody needed for
+a live one.
+
+Decode cost is real but second order: a 1280x720 JPEG costs **3.45 ms** to
+decode on this host, a 290 FPS ceiling. Moving it off the capture loop is worth
+doing and the reader does it, but decode was never where an 18.9 FPS source
+became a 10 FPS pipeline. The consumer's own cost was.
+
+**Why MJPEG stays.** H.264 would cut bandwidth and is hardware-decodable, and
+it is still the wrong trade here. Every MJPEG frame is independently coded, so
+throwing a stale one away costs nothing and corrupts nothing — which is the
+single property the table above depends on. An H.264 stream carries decoder
+state between frames; a dropped frame is a reference a later frame needs, and
+drop-old stops being free. Lower bandwidth would be paid for in the one
+behaviour that matters.
+
+**Hardware decode: available, and slower.** The RX 6600's VCN block does decode
+4:2:0 MJPEG — `ffmpeg -hwaccel vaapi -vaapi_device /dev/dri/renderD128` runs a
+1280x720 MJPEG file at 16.9x realtime. Software decode of the same file runs at
+**49.9x**, three times faster, because at this resolution libjpeg-turbo beats
+the round trip through GPU memory. It is also unreachable from here regardless:
+this OpenCV build reports `FFMPEG: YES`, `GStreamer: NO`, `VA: NO`, so
+`cv2.VideoCapture` has no VAAPI path without rebuilding OpenCV. Not pursued, on
+both counts. (`vainfo` is not installed and was not installed to find this out;
+`ffmpeg -hwaccels` does list `vaapi` on this host.)
+
+**Source resolution: unresolved, and marked as such.** Asking the phone for a
+smaller frame would be the cheapest win available, and it is the one thing here
+that is not settled. `/mjpegfeed?640x480` is reported to 404 on this DroidCam
+build; that has not been re-checked, because the DroidCam endpoint was not
+reachable when this was written and a stale result is worse than an open
+question. What this build does honour is still to be determined, and if the
+answer is "resolution is set in the phone app only", that is the answer and it
+belongs here rather than in a wish.
+
+Worth knowing before that work is done: nothing in this pipeline downscales for
+inference. The detector JPEG-encodes the **full** frame for the YOLO worker
+(`acesvision/perception.py`), and `FACE_ID_W`/`FACE_ID_H` default to 1280x720.
+So a smaller source frame is a real saving end to end, not a pixel budget that
+gets thrown away later — but it is a saving in the detector's encode and the
+worker's inference, not in a decode step that was ever the bottleneck.
+
 ### DroidCam discovery: what it scans, and what it will not
 
 The DroidCam scan is manual — it runs when you click Scan, never on startup —
