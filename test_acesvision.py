@@ -447,6 +447,287 @@ class AsyncProcessorTests(unittest.TestCase):
         self.assertEqual(scene.faces[0].name, "Toby")
 
 
+class CountingObjectDetector:
+    """Object detector that reports how often the object stage actually ran."""
+
+    def __init__(self, detections=(), model="test:yolo"):
+        self.detections = list(detections)
+        self.model = model
+        self.calls = 0
+        self.closed = False
+
+    def detect(self, _frame):
+        self.calls += 1
+        return list(self.detections), {"inference": 1.0}, self.model
+
+    def close(self):
+        self.closed = True
+
+
+PERSON = Detection(0, 0, 20, 20, "person", 0.9, 1)
+
+
+def drive(processor, source, frame, sequence, cycles=1, timeout_s=1.0):
+    """Feed frames until the inference loop has published `cycles` new ones.
+
+    The loop is asynchronous, so a test that submits one frame and reads the
+    metrics immediately is reading the *previous* cycle. Returns the sequence
+    number to carry on from.
+    """
+    started = processor.metrics()["inference_sequence"]
+    seen = 0
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        processor(frame, source, sequence, time.monotonic())
+        sequence += 1
+        published = processor.metrics()["inference_sequence"]
+        if published != started:
+            started = published
+            seen += 1
+            if seen >= cycles:
+                return sequence
+        time.sleep(0.005)
+    raise AssertionError(f"the inference loop published {seen}/{cycles} cycles")
+
+
+class StageControlTests(unittest.TestCase):
+    """The three perception knobs were constructor-only. Now they are live.
+
+    Every stage cost the GUI wants to show is produced by this loop, and every
+    knob that moves those costs is read by it on every cycle. So each setter is
+    tested against a *running* loop, not against the attribute it writes.
+    """
+
+    def setUp(self):
+        self.source = SourceSpec.from_mapping({"type": "webcam"})
+        self.frame = np.zeros((40, 40, 3), dtype=np.uint8)
+        self.objects = CountingObjectDetector([PERSON])
+        self.faces = Mock(return_value=[Face(1, 2, 3, 4, "Toby", 0.2, True)])
+        self.gestures = Mock(detect=Mock(
+            return_value=[Gesture("Shush", 1.0, 1, 1, 3, 3)]))
+
+    def processor(self, **kwargs):
+        # Both refresh rates default to "due every cycle" here on purpose. At
+        # the shipped 2 Hz and 15 Hz a stage would not be due again inside the
+        # few milliseconds a test cycle takes, so "the stage stopped running"
+        # would assert green whether or not disabling it did anything.
+        kwargs.setdefault("face_hz", 1000.0)
+        kwargs.setdefault("gesture_hz", 1000.0)
+        processor = FaceGestureProcessor(
+            face_detector=self.faces,
+            gesture_detector=self.gestures,
+            object_detector=self.objects,
+            **kwargs)
+        self.addCleanup(processor.close)
+        return processor
+
+    def assertRanEveryCycle(self, counter, processor, sequence, cycles=3):
+        """Prove the stage was live before a test claims disabling stopped it."""
+        before = counter()
+        sequence = drive(processor, self.source, self.frame, sequence,
+                         cycles=cycles)
+        self.assertGreaterEqual(counter() - before, cycles,
+                                "the stage was not running every cycle, so "
+                                "'it stopped' would prove nothing")
+        return sequence
+
+    def test_the_frame_divisor_changes_on_the_running_loop(self):
+        processor = self.processor()
+        self.assertEqual(processor.detect_every, 1)
+        processor.set_detect_every(4)
+        self.assertEqual(processor.detect_every, 4)
+        self.assertEqual(processor.metrics()["object_detect_every"], 4)
+        # Sequences 1..3 are not multiples of 4, so none of them may reach
+        # inference; sequence 4 must.
+        before = self.objects.calls
+        for sequence in (1, 2, 3):
+            processor(self.frame, self.source, sequence, time.monotonic())
+        time.sleep(0.05)
+        self.assertEqual(self.objects.calls, before)
+        drive(processor, self.source, self.frame, 4)
+        self.assertGreater(self.objects.calls, before)
+
+    def test_a_divisor_below_one_cannot_stall_the_loop(self):
+        processor = self.processor()
+        processor.set_detect_every(0)
+        self.assertEqual(processor.detect_every, 1)
+
+    def test_the_face_refresh_rate_changes_on_the_running_loop(self):
+        # Starts effectively never: one refresh on the first person, then no
+        # scheduled refresh for ten seconds.
+        processor = self.processor(face_hz=0.1)
+        sequence = drive(processor, self.source, self.frame, 0, cycles=3)
+        self.assertEqual(self.faces.call_count, 1)
+        processor.set_face_hz(1000.0)
+        drive(processor, self.source, self.frame, sequence, cycles=3)
+        self.assertGreater(self.faces.call_count, 1)
+        self.assertGreater(processor.metrics()["face_refresh_hz"], 100.0)
+
+    def test_the_gesture_refresh_rate_changes_on_the_running_loop(self):
+        processor = self.processor(gesture_hz=0.1)
+        sequence = drive(processor, self.source, self.frame, 0, cycles=3)
+        self.assertEqual(self.gestures.detect.call_count, 1)
+        processor.set_gesture_hz(1000.0)
+        drive(processor, self.source, self.frame, sequence, cycles=3)
+        self.assertGreater(self.gestures.detect.call_count, 1)
+
+    def test_a_rate_of_zero_is_clamped_instead_of_dividing_by_zero(self):
+        processor = self.processor()
+        processor.set_face_hz(0.0)
+        processor.set_gesture_hz(-5.0)
+        self.assertEqual(processor.metrics()["face_refresh_hz"], 0.1)
+        self.assertEqual(processor.metrics()["gesture_refresh_hz"], 0.1)
+
+    def test_disabling_the_object_stage_skips_yolo(self):
+        processor = self.processor()
+        sequence = self.assertRanEveryCycle(
+            lambda: self.objects.calls, processor, 0)
+        processor.set_stage_enabled("object", False)
+        ran = self.objects.calls
+        sequence = drive(processor, self.source, self.frame, sequence, cycles=3)
+        self.assertEqual(self.objects.calls, ran)
+        metrics = processor.metrics()
+        self.assertFalse(metrics["object_enabled"])
+        self.assertFalse(metrics["object_refreshed"])
+        self.assertEqual(metrics["object_stage_ms"], 0.0)
+        # And the metadata stops naming a model that is not being run.
+        self.assertEqual(metrics["object_model"], "stage disabled")
+
+    def test_disabling_the_face_stage_skips_it_and_clears_the_boxes(self):
+        processor = self.processor()
+        sequence = self.assertRanEveryCycle(
+            lambda: self.faces.call_count, processor, 0)
+        scene = processor(self.frame, self.source, sequence, time.monotonic())
+        self.assertTrue(scene.faces)
+        processor.set_stage_enabled("face", False)
+        ran = self.faces.call_count
+        sequence = drive(processor, self.source, self.frame, sequence + 1,
+                         cycles=3)
+        scene = processor(self.frame, self.source, sequence, time.monotonic())
+        self.assertEqual(self.faces.call_count, ran)
+        # Cleared, not frozen: a stale box that keeps rendering is
+        # indistinguishable from a live one.
+        self.assertEqual(scene.faces, [])
+        self.assertFalse(processor.metrics()["face_enabled"])
+        self.assertEqual(processor.metrics()["face_stage_ms"], 0.0)
+
+    def test_disabling_the_gesture_stage_skips_mediapipe(self):
+        processor = self.processor()
+        sequence = self.assertRanEveryCycle(
+            lambda: self.gestures.detect.call_count, processor, 0)
+        processor.set_stage_enabled("gesture", False)
+        ran = self.gestures.detect.call_count
+        sequence = drive(processor, self.source, self.frame, sequence, cycles=3)
+        scene = processor(self.frame, self.source, sequence, time.monotonic())
+        self.assertEqual(self.gestures.detect.call_count, ran)
+        self.assertEqual(scene.gestures, [])
+        self.assertFalse(processor.metrics()["gesture_enabled"])
+
+    def test_a_disabled_object_stage_starves_the_face_stage(self):
+        """Faces are only searched for inside person boxes. Say so in metrics.
+
+        This is the coupling the GUI warning exists for: switching objects off
+        takes the face stage down with it, one step removed.
+        """
+        processor = self.processor()
+        sequence = self.assertRanEveryCycle(
+            lambda: self.faces.call_count, processor, 0)
+        processor.set_stage_enabled("object", False)
+        ran = self.faces.call_count
+        sequence = drive(processor, self.source, self.frame, sequence, cycles=3)
+        scene = processor(self.frame, self.source, sequence, time.monotonic())
+        self.assertEqual(self.faces.call_count, ran)
+        self.assertEqual(scene.faces, [])
+        # The face stage itself is still *enabled*; it simply has nowhere to
+        # look. The metadata must not conflate the two.
+        self.assertTrue(processor.metrics()["face_enabled"])
+
+    def test_a_stage_comes_back_when_it_is_switched_on_again(self):
+        processor = self.processor()
+        drive(processor, self.source, self.frame, 0)
+        processor.set_stage_enabled("gesture", False)
+        sequence = drive(processor, self.source, self.frame, 1, cycles=2)
+        ran = self.gestures.detect.call_count
+        processor.set_stage_enabled("gesture", True)
+        drive(processor, self.source, self.frame, sequence, cycles=3)
+        self.assertGreater(self.gestures.detect.call_count, ran)
+
+    def test_an_unknown_stage_is_refused_rather_than_silently_ignored(self):
+        processor = self.processor()
+        with self.assertRaises(ValueError):
+            processor.set_stage_enabled("faces", False)
+        with self.assertRaises(ValueError):
+            processor.stage_enabled("everything")
+
+    def test_the_knobs_stay_coherent_under_concurrent_set_and_read(self):
+        """Reconfiguring under load must not tear a cycle or lose an update.
+
+        The inference loop reads all four knobs every cycle. This drives the
+        capture side, the setter side and the metrics side at once and asserts
+        that no cycle ever observed a value nobody set, that no stage blew up
+        mid-reconfiguration, and that the last write survives.
+        """
+        processor = self.processor()
+        rates = (0.5, 2.0, 8.0)
+        divisors = (1, 2, 3)
+        observed_hz, statuses = [], []
+        failures = []
+        stop = threading.Event()
+
+        def guarded(work):
+            def run():
+                try:
+                    work()
+                except Exception as exc:              # noqa: BLE001
+                    failures.append(exc)
+            return run
+
+        def writer():
+            while not stop.is_set():
+                for index, hz in enumerate(rates):
+                    processor.set_face_hz(hz)
+                    processor.set_gesture_hz(hz * 2)
+                    processor.set_detect_every(divisors[index])
+                    processor.set_stage_enabled("face", index != 1)
+                    processor.set_stage_enabled("object", index != 2)
+
+        def reader():
+            while not stop.is_set():
+                metrics = processor.metrics()
+                observed_hz.append(round(metrics["face_refresh_hz"], 6))
+                statuses.append(metrics["inference_status"])
+
+        def feeder():
+            sequence = 0
+            while not stop.is_set():
+                processor(self.frame, self.source, sequence, time.monotonic())
+                sequence += 1
+
+        threads = [threading.Thread(target=guarded(work), daemon=True)
+                   for work in (writer, reader, feeder)]
+        for thread in threads:
+            thread.start()
+        time.sleep(0.6)
+        stop.set()
+        for thread in threads:
+            thread.join(timeout=5.0)
+        self.assertEqual(failures, [])
+        self.assertGreater(len(observed_hz), 50)
+        self.assertEqual(set(observed_hz) - set(rates), set(),
+                         "a cycle published a rate nobody set")
+        self.assertNotIn("degraded", statuses,
+                         "a stage failed while the knobs were being moved")
+        # Last write wins: settle the loop and read it back.
+        processor.set_face_hz(3.0)
+        processor.set_stage_enabled("face", True)
+        processor.set_stage_enabled("object", True)
+        drive(processor, self.source, self.frame, 0, cycles=2)
+        metrics = processor.metrics()
+        self.assertEqual(round(metrics["face_refresh_hz"], 6), 3.0)
+        self.assertTrue(metrics["face_enabled"])
+        self.assertTrue(metrics["object_enabled"])
+
+
 class PipelineTests(unittest.TestCase):
     def test_camera_controls_are_clamped_and_applied(self):
         cap = FakeCapture([])
@@ -2817,7 +3098,9 @@ class GuiNotifyingPropertyTests(unittest.TestCase):
 
     LIVE_PROPERTIES = ("actorNames", "executableConnectors", "modelOptions",
                        "manualExposureSupported", "connectorNames",
-                       "gestureNames", "computeDevice")
+                       "gestureNames", "computeDevice", "stageIds",
+                       "stageStats", "shushWarning", "shushDegraded",
+                       "latestInferenceMs", "modelInferenceMs")
 
     def test_none_of_the_live_properties_are_declared_constant(self):
         backend = gui_backend()
@@ -2925,6 +3208,339 @@ class ComputeDeviceTests(unittest.TestCase):
         self.assertEqual(self.device(torch), "this machine")
 
 
+class RecordingProcessor:
+    """Stands in for FaceGestureProcessor: records knob calls, serves metrics.
+
+    Publishes the measured stage costs from the profiling run that motivated
+    the panel — object 12.3 ms, face 78.0 ms, gesture 19.6 ms, ~120 ms a cycle.
+    """
+
+    def __init__(self, **overrides):
+        self.calls = []
+        self.metrics_dict = {
+            "object_model": "test:yolo",
+            "inference_status": "live",
+            "inference_fps": 8.3,
+            "inference_ms": 120.0,
+            "latest_inference_ms": 121.0,
+            "model_inference_ms": 9.9,
+            "object_stage_ms": 12.3,
+            "object_refreshed": True,
+            "object_detect_every": 1,
+            "object_enabled": True,
+            "face_stage_ms": 78.0,
+            "face_refreshed": True,
+            "face_refresh_hz": 2.0,
+            "face_enabled": True,
+            "gesture_stage_ms": 19.6,
+            "gesture_refreshed": True,
+            "gesture_refresh_hz": 15.0,
+            "gesture_enabled": True,
+        }
+        self.metrics_dict.update(overrides)
+
+    def __call__(self, frame, source, sequence, captured_at):
+        return SceneFrame(source, sequence, captured_at, frame)
+
+    def metrics(self):
+        return dict(self.metrics_dict)
+
+    def set_stage_enabled(self, stage, enabled):
+        self.calls.append(("set_stage_enabled", stage, bool(enabled)))
+        self.metrics_dict[f"{stage}_enabled"] = bool(enabled)
+
+    def set_detect_every(self, frames):
+        self.calls.append(("set_detect_every", frames))
+        self.metrics_dict["object_detect_every"] = frames
+
+    def set_face_hz(self, hz):
+        self.calls.append(("set_face_hz", hz))
+        self.metrics_dict["face_refresh_hz"] = hz
+
+    def set_gesture_hz(self, hz):
+        self.calls.append(("set_gesture_hz", hz))
+        self.metrics_dict["gesture_refresh_hz"] = hz
+
+    def close(self):
+        pass
+
+
+class StagePanelTestCase(unittest.TestCase):
+    def controlled_backend(self, **overrides):
+        processor = RecordingProcessor(**overrides)
+        return gui_backend(processor=processor), processor
+
+    @staticmethod
+    def poll(backend, processor):
+        """One 100 ms tick, carrying what the inference loop is publishing."""
+        pipeline_state(backend, status="live",
+                       metrics=dict(processor.metrics(), capture_fps=14.9))
+        backend._refresh()
+
+    @staticmethod
+    def rows(backend):
+        return {row["id"]: row for row in backend.stageStats}
+
+
+class GuiStageControlTests(StagePanelTestCase):
+    """The GUI computed all of this and then threw it away.
+
+    processor.py has published per-stage cost, refresh and rate every cycle.
+    The poll kept `inference_ms` and `object_model` and dropped the rest, so
+    one 120 ms number stood in for three stages — and the constructor took no
+    knobs at all, so the desktop app could not reach the controls the headless
+    runner already had.
+    """
+
+    def test_the_poll_keeps_the_per_stage_measurements(self):
+        backend, processor = self.controlled_backend()
+        self.poll(backend, processor)
+        self.assertEqual({stage: row["ms"] for stage, row in
+                          self.rows(backend).items()},
+                         {"object": 12.3, "face": 78.0, "gesture": 19.6})
+        # And the two cycle-level numbers that were also being dropped.
+        self.assertEqual(backend.latestInferenceMs, 121.0)
+        self.assertEqual(backend.modelInferenceMs, 9.9)
+
+    def test_stage_stats_carry_the_documented_shape(self):
+        backend, processor = self.controlled_backend()
+        self.poll(backend, processor)
+        stats = backend.stageStats
+        self.assertEqual([row["id"] for row in stats], list(backend.stageIds))
+        for row in stats:
+            self.assertTrue(
+                {"id", "label", "ms", "hz", "enabled", "refreshed"}.issubset(row),
+                row)
+            self.assertIsInstance(row["label"], str)
+            self.assertIsInstance(row["enabled"], bool)
+            self.assertIsInstance(row["refreshed"], bool)
+
+    def test_stage_stats_notify_when_the_measurements_move(self):
+        backend, processor = self.controlled_backend()
+        fired = []
+        backend.stagesChanged.connect(lambda: fired.append(True))
+        self.poll(backend, processor)
+        self.assertEqual(len(fired), 1)
+        self.poll(backend, processor)
+        self.assertEqual(len(fired), 1, "an unchanged tick churned the panel")
+        processor.metrics_dict["face_stage_ms"] = 91.4
+        self.poll(backend, processor)
+        self.assertEqual(len(fired), 2)
+        self.assertEqual(self.rows(backend)["face"]["ms"], 91.4)
+
+    def test_the_stage_set_does_not_churn_with_the_measurements(self):
+        # The QML Repeater is driven off stageIds. If that list re-notified on
+        # every poll, every switch and slider would be rebuilt ten times a
+        # second and become undraggable.
+        backend, processor = self.controlled_backend()
+        fired = []
+        backend.stageSetChanged.connect(lambda: fired.append(True))
+        for _ in range(5):
+            processor.metrics_dict["face_stage_ms"] += 1.0
+            self.poll(backend, processor)
+        self.assertEqual(fired, [])
+
+    def test_switching_a_stage_reaches_the_processor(self):
+        backend, processor = self.controlled_backend()
+        backend.setStageEnabled("gesture", False)
+        self.assertIn(("set_stage_enabled", "gesture", False), processor.calls)
+        self.assertFalse(self.rows(backend)["gesture"]["enabled"])
+        backend.setStageEnabled("gesture", True)
+        self.assertTrue(self.rows(backend)["gesture"]["enabled"])
+
+    def test_each_stage_rate_reaches_its_own_setter(self):
+        backend, processor = self.controlled_backend()
+        backend.setStageRate("object", 3.0)
+        backend.setStageRate("face", 4.5)
+        backend.setStageRate("gesture", 20.0)
+        self.assertEqual(processor.calls, [
+            ("set_detect_every", 3),
+            ("set_face_hz", 4.5),
+            ("set_gesture_hz", 20.0),
+        ])
+        rates = {stage: row["rate"] for stage, row in self.rows(backend).items()}
+        self.assertEqual(rates, {"object": 3.0, "face": 4.5, "gesture": 20.0})
+
+    def test_a_rate_outside_the_advertised_range_is_clamped(self):
+        backend, processor = self.controlled_backend()
+        backend.setStageRate("face", 400.0)
+        backend.setStageRate("object", 0.0)
+        self.assertEqual(processor.calls,
+                         [("set_face_hz", 10.0), ("set_detect_every", 1)])
+
+    def test_an_unknown_stage_is_named_rather_than_ignored(self):
+        backend, _ = self.controlled_backend()
+        backend.setStageEnabled("faces", False)
+        self.assertIn("Unknown perception stage", backend.lastError)
+
+    def test_stage_control_is_refused_when_no_inference_loop_is_running(self):
+        """Better to decline the click than to show a stage off while it runs."""
+        backend = gui_backend()                 # smoke shell, no processor
+        backend.setStageEnabled("face", False)
+        self.assertIn("no inference loop", backend.lastError)
+        self.assertTrue(all(row["enabled"] for row in backend.stageStats))
+
+    def test_the_gui_hands_its_own_knobs_to_the_processor(self):
+        """gui.py built FaceGestureProcessor() with no arguments at all.
+
+        __main__.py has always passed detect_every, face_hz and gesture_hz, so
+        the desktop app was pinned to the defaults with no way to say otherwise.
+        """
+        with patch("acesvision.gui.FaceGestureProcessor") as factory:
+            factory.return_value = RecordingProcessor()
+            backend = gui_backend(initialize_models=True, detect_every=3,
+                                  face_hz=4.0, gesture_hz=12.0)
+        self.assertEqual(factory.call_args.kwargs,
+                         {"detect_every": 3, "face_hz": 4.0, "gesture_hz": 12.0})
+        self.assertEqual([row["rate"] for row in backend.stageStats],
+                         [3.0, 4.0, 12.0])
+
+    def test_the_desktop_entry_point_accepts_the_same_knobs(self):
+        import subprocess
+
+        _require_qt()
+        environment = dict(os.environ, QT_QPA_PLATFORM="offscreen")
+        environment.pop("DISPLAY", None)
+        environment.pop("WAYLAND_DISPLAY", None)
+        completed = subprocess.run(
+            [sys.executable, "-m", "acesvision.gui", "--smoke-test",
+             "--preview-port", "8792", "--detect-every", "2",
+             "--face-hz", "3", "--gesture-hz", "20"],
+            cwd=str(Path(__file__).parent), env=environment,
+            capture_output=True, text=True, timeout=180)
+        self.assertEqual(completed.returncode, 0, completed.stderr[-2000:])
+
+
+class ShushDegradationTests(unittest.TestCase):
+    """Disabling the face stage does not drop a shush. It rebinds it.
+
+    ShushGestureTests already proves the perception half: a finger at the lips
+    with no face boxes classifies as Pointing_Up. These tests hold the panel to
+    saying so, and hold the message to facts that are checked against the files
+    that define them rather than written as prose.
+    """
+
+    def warning(self, object_enabled=True, face_enabled=True, face_hz=2.0):
+        from acesvision.gui import shush_degradation
+
+        return shush_degradation(object_enabled, face_enabled, face_hz)
+
+    def test_a_healthy_configuration_says_nothing(self):
+        self.assertEqual(self.warning(), "")
+
+    def test_switching_the_face_stage_off_warns_about_the_lights(self):
+        text = self.warning(face_enabled=False)
+        self.assertIn("face stage is switched off", text)
+        self.assertIn("Pointing_Up", text)
+        self.assertIn("ledctl next-theme", text)
+        self.assertIn("lights", text)
+
+    def test_starving_the_face_stage_of_refreshes_warns_the_same_way(self):
+        from acesvision.gui import SAFE_FACE_HZ
+
+        self.assertEqual(self.warning(face_hz=SAFE_FACE_HZ), "")
+        text = self.warning(face_hz=SAFE_FACE_HZ - 0.1)
+        self.assertIn("Pointing_Up", text)
+        self.assertIn("ledctl next-theme", text)
+
+    def test_switching_objects_off_warns_because_faces_need_person_boxes(self):
+        text = self.warning(object_enabled=False)
+        self.assertIn("person boxes", text)
+        self.assertIn("ledctl next-theme", text)
+
+    def test_the_warning_states_a_binding_that_actually_exists(self):
+        """The gesture and the command are read out of the shipped files.
+
+        A warning that names a binding nobody has is worse than no warning: it
+        trains the operator to ignore the panel.
+        """
+        from acesvision.gui import (SHUSH_FALLBACK_ACTION,
+                                    SHUSH_FALLBACK_GESTURE)
+
+        automations = json.loads(
+            (Path(__file__).parent / "automations.example.json").read_text())
+        bound = [entry.get("command") for entry in automations
+                 if entry.get("event") == "gesture"
+                 and entry.get("gesture") == SHUSH_FALLBACK_GESTURE]
+        self.assertIn(SHUSH_FALLBACK_ACTION, bound)
+        self.assertIn(SHUSH_FALLBACK_GESTURE, gesture_catalog.GESTURE_IDS)
+        self.assertIn(gesture_catalog.SHUSH, gesture_catalog.GESTURE_IDS)
+
+    def test_the_premise_holds_end_to_end_without_a_face_box(self):
+        """No face boxes -> Pointing_Up -> the theme command. All three links."""
+        from acesvision.gui import (SHUSH_FALLBACK_ACTION,
+                                    SHUSH_FALLBACK_GESTURE)
+        from gestures import classify_hands
+
+        Category = namedtuple("Category", "category_name score")
+        rows = classify_hands([pointing_hand(AT_LIPS)],
+                              [[Category("Pointing_Up", 0.95)]],
+                              FRAME_W, FRAME_H, 0.5, faces=[])
+        self.assertEqual([row.name for row in rows], [SHUSH_FALLBACK_GESTURE])
+        rule = Rule.create(SHUSH_FALLBACK_GESTURE, "acergb", "next_theme")
+        self.assertEqual(rule.gesture, SHUSH_FALLBACK_GESTURE)
+        self.assertIn("next-theme", SHUSH_FALLBACK_ACTION)
+
+
+class GuiShushGuardTests(StagePanelTestCase):
+    """Putting that one click away without saying so is the failure."""
+
+    def test_switching_the_face_stage_off_raises_the_warning(self):
+        backend, processor = self.controlled_backend()
+        self.poll(backend, processor)
+        self.assertFalse(backend.shushDegraded)
+        self.assertEqual(backend.shushWarning, "")
+        fired = []
+        backend.stagesChanged.connect(lambda: fired.append(True))
+        backend.setStageEnabled("face", False)
+        self.assertTrue(backend.shushDegraded)
+        self.assertIn("ledctl next-theme", backend.shushWarning)
+        self.assertEqual(len(fired), 1)
+
+    def test_the_warning_is_attached_to_the_stage_that_caused_it(self):
+        backend, processor = self.controlled_backend()
+        backend.setStageEnabled("face", False)
+        rows = self.rows(backend)
+        self.assertIn("Pointing_Up", rows["face"]["warning"])
+        self.assertEqual(rows["gesture"]["warning"], "")
+        self.assertEqual(rows["object"]["warning"], "")
+
+    def test_switching_objects_off_blames_the_object_stage(self):
+        backend, processor = self.controlled_backend()
+        backend.setStageEnabled("object", False)
+        rows = self.rows(backend)
+        self.assertIn("person boxes", rows["object"]["warning"])
+        self.assertEqual(rows["face"]["warning"], "")
+
+    def test_dropping_the_face_rate_too_low_warns_without_disabling_anything(self):
+        from acesvision.gui import SAFE_FACE_HZ
+
+        backend, processor = self.controlled_backend()
+        backend.setStageRate("face", SAFE_FACE_HZ)
+        self.assertFalse(backend.shushDegraded)
+        backend.setStageRate("face", 0.2)
+        self.assertTrue(backend.shushDegraded)
+        self.assertIn("0.2 Hz", backend.shushWarning)
+        self.assertTrue(self.rows(backend)["face"]["enabled"])
+
+    def test_the_warning_survives_the_refresh_tick(self):
+        # The tick rewrites the whole stage snapshot from the inference loop.
+        # A guard that a 100 ms timer can erase is not a guard.
+        backend, processor = self.controlled_backend()
+        backend.setStageEnabled("face", False)
+        for _ in range(10):
+            self.poll(backend, processor)
+        self.assertTrue(backend.shushDegraded)
+
+    def test_turning_the_stage_back_on_clears_it(self):
+        backend, processor = self.controlled_backend()
+        backend.setStageEnabled("face", False)
+        backend.setStageEnabled("face", True)
+        self.poll(backend, processor)
+        self.assertFalse(backend.shushDegraded)
+        self.assertEqual(backend.shushWarning, "")
+
+
 class QmlSourceTests(unittest.TestCase):
     """Cheap deterministic guards over the shipped QML text."""
 
@@ -2989,6 +3605,27 @@ class QmlSourceTests(unittest.TestCase):
 
     def test_the_overlay_grid_can_render_a_custom_card(self):
         self.assertIn("vision.customOverlayReady", self.qml)
+
+    def test_the_stage_panel_is_wired_to_the_backend(self):
+        for binding in ("vision.stageIds", "vision.stageStats",
+                        "vision.setStageEnabled(", "vision.setStageRate(",
+                        "vision.shushWarning", "vision.shushDegraded",
+                        "vision.latestInferenceMs"):
+            self.assertIn(binding, self.qml)
+
+    def test_the_stage_repeater_is_not_driven_off_the_polled_measurements(self):
+        # A Repeater rebuilds every delegate when its model changes, and
+        # stageStats changes on the 100 ms poll. Binding the repeater to it
+        # would recreate the switches and sliders ten times a second.
+        self.assertIn("model: vision.stageIds", self.qml)
+        self.assertNotIn("model: vision.stageStats", self.qml)
+
+    def test_the_page_count_is_unchanged_by_the_stage_panel(self):
+        # The panel belongs on Models and Security, beside the model picker it
+        # shares a subject with. A seventh nav page would have been a new
+        # information architecture smuggled in under a controls change.
+        self.assertEqual(self.qml.count("ScrollView {"), 6)
+        self.assertEqual(self.qml.count("NavButton {"), 6)
 
 
 def _require_qt():
@@ -3140,6 +3777,150 @@ class QmlLayoutTests(unittest.TestCase):
 
     def test_loading_and_resizing_the_ui_logs_no_qml_warnings(self):
         self.assertEqual(self.report["messages"], [])
+
+
+QML_STAGE_PROBE = '''
+import json, os, sys
+from PySide6.QtCore import QUrl, QTimer, QEventLoop, qInstallMessageHandler
+from PySide6.QtGui import QGuiApplication
+from PySide6.QtQml import QQmlApplicationEngine
+from PySide6.QtQuick import QQuickItem
+from acesvision.contracts import SceneFrame
+from acesvision.gui import VisionBackend, QML_PATH
+
+messages = []
+qInstallMessageHandler(lambda kind, ctx, text: messages.append(text))
+
+
+class FakeProcessor:
+    """Enough of FaceGestureProcessor for the panel's slots to be accepted."""
+
+    def __call__(self, frame, source, sequence, captured_at):
+        return SceneFrame(source, sequence, captured_at, frame)
+
+    def metrics(self):
+        return {}
+
+    def set_stage_enabled(self, stage, enabled):
+        pass
+
+    def set_detect_every(self, frames):
+        pass
+
+    def set_face_hz(self, hz):
+        pass
+
+    def set_gesture_hz(self, hz):
+        pass
+
+
+app = QGuiApplication(sys.argv[:1])
+backend = VisionBackend(initialize_models=False, load_saved_rules=False,
+                        processor=FakeProcessor())
+engine = QQmlApplicationEngine()
+engine.rootContext().setContextProperty("vision", backend)
+engine.load(QUrl.fromLocalFile(str(QML_PATH)))
+window = engine.rootObjects()[0]
+
+def settle(ms=150):
+    loop = QEventLoop()
+    QTimer.singleShot(ms, loop.quit)
+    loop.exec()
+
+def find_type(item, prefix):
+    for child in item.childItems():
+        if child.metaObject().className().startswith(prefix):
+            return child
+        found = find_type(child, prefix)
+        if found is not None:
+            return found
+    return None
+
+def find_all(item, prefix, found=None):
+    found = [] if found is None else found
+    for child in item.childItems():
+        if child.metaObject().className().startswith(prefix):
+            found.append(child)
+        find_all(child, prefix, found)
+    return found
+
+def collect():
+    window.setProperty("currentPage", 5)
+    settle(300)
+    # By objectName, not by child index: a StackLayout does not promise that
+    # childItems() comes back in page order.
+    page = window.findChild(QQuickItem, "page5")
+    card = window.findChild(QQuickItem, "shushWarningCard")
+    text = window.findChild(QQuickItem, "shushWarningText")
+    # Controls styled by the Material theme are QML-defined, so they report as
+    # "Switch_QMLTYPE_n" rather than QQuickSwitch. The trailing underscore
+    # keeps SwitchIndicator and SliderHandle out of the counts.
+    report = {
+        "switches": [item.property("text") for item in find_all(page, "Switch_")],
+        "sliders": len(find_all(page, "Slider_")),
+        "warningVisibleBefore": bool(card.isVisible()),
+    }
+    backend.setStageEnabled("face", False)
+    settle(200)
+    report["warningVisibleAfter"] = bool(card.isVisible())
+    report["warningHeight"] = card.height()
+    report["warningText"] = text.property("text")
+    backend.setStageEnabled("face", True)
+    settle(200)
+    report["warningVisibleRestored"] = bool(card.isVisible())
+    report["lastError"] = backend.lastError
+    report["messages"] = messages
+    sys.stdout.write("PROBE" + json.dumps(report) + "\\n")
+    sys.stdout.flush()
+
+def run():
+    try:
+        collect()
+    except BaseException:
+        import traceback
+        traceback.print_exc()
+        os._exit(3)
+    os._exit(0)
+
+QTimer.singleShot(60000, lambda: os._exit(4))
+QTimer.singleShot(50, run)
+app.exec()
+'''
+
+
+class QmlStagePanelTests(unittest.TestCase):
+    """Measure the rendered panel, not the QML text that was meant to build it."""
+
+    report = None
+
+    @classmethod
+    def setUpClass(cls):
+        _require_qt()
+        completed = _run_qml_probe(QML_STAGE_PROBE)
+        marker = "PROBE"
+        if completed.returncode != 0 or marker not in completed.stdout:
+            raise AssertionError(
+                "the stage-panel probe did not report:\n"
+                + (completed.stderr or "")[-2000:])
+        cls.report = json.loads(completed.stdout.split(marker, 1)[1])
+
+    def test_every_stage_gets_a_switch_and_a_rate_control(self):
+        self.assertEqual(len(self.report["switches"]), 3, self.report["switches"])
+        self.assertEqual(self.report["sliders"], 3)
+        for label in self.report["switches"]:
+            self.assertTrue(label, "a stage switch rendered with no label")
+
+    def test_the_shush_warning_is_hidden_until_the_face_stage_goes_off(self):
+        self.assertFalse(self.report["warningVisibleBefore"])
+        self.assertTrue(self.report["warningVisibleAfter"])
+        # Visible and actually occupying the page, not a zero-height stub.
+        self.assertGreater(self.report["warningHeight"], 20)
+        self.assertIn("ledctl next-theme", self.report["warningText"])
+        self.assertFalse(self.report["warningVisibleRestored"])
+
+    def test_driving_the_panel_logs_no_qml_warnings(self):
+        self.assertEqual(self.report["messages"], [])
+        self.assertEqual(self.report["lastError"], "")
 
 
 class QmlTeardownTests(unittest.TestCase):

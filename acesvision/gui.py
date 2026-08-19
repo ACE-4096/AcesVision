@@ -25,7 +25,12 @@ from .overlay import MINIMAL, PROFILES, OverlayProfile
 from .pipeline import VisionPipeline
 from .policy import CONNECTORS, Rule, RuleEngine, RuleStore, known_actors
 from .server import VisionServer, load_or_create_token
-from .processor import FaceGestureProcessor
+from .processor import (
+    DEFAULT_DETECT_EVERY,
+    DEFAULT_FACE_HZ,
+    DEFAULT_GESTURE_HZ,
+    FaceGestureProcessor,
+)
 from .perception import file_sha256
 
 QML_PATH = Path(__file__).parent / "qml" / "Main.qml"
@@ -46,6 +51,116 @@ PREVIEW_STALE_AFTER_S = 2.0
 # The refresh timer runs at 100 ms. Filesystem and registry re-scans are far
 # too coarse for that, so they ride a slower tick.
 SLOW_REFRESH_TICKS = 20
+
+# The three perception stages the operator can drive, in the order the
+# inference loop runs them. Held as data because the panel, the two slots and
+# the guard all have to agree about what exists; three copy-pasted branches
+# would let them drift.
+#
+# `rate` means a different thing per stage and says so: the object stage is
+# gated by a frame divisor (run on one frame in N), the other two by a refresh
+# frequency. Both are the knob the runtime actually has — inventing a uniform
+# "Hz" for the object stage would have made the number a lie.
+PERCEPTION_STAGES = (
+    {
+        "id": "object",
+        "label": "Objects — YOLO",
+        "detail": ("Finds people. The face stage only searches inside the "
+                   "person boxes this produces, so switching this off stops "
+                   "faces too."),
+        "rateLabel": "Run on one frame in",
+        "rateKind": "every",
+        "rateSuffix": " frames",
+        "rateMin": 1.0,
+        "rateMax": 10.0,
+        "rateStep": 1.0,
+    },
+    {
+        "id": "face",
+        "label": "Faces — YuNet and dlib",
+        "detail": ("Recognises enrolled people, and gives the gesture stage "
+                   "the mouth position that separates Shush from Pointing_Up."),
+        "rateLabel": "Refresh rate",
+        "rateKind": "hz",
+        "rateSuffix": " Hz",
+        "rateMin": 0.2,
+        "rateMax": 10.0,
+        "rateStep": 0.1,
+    },
+    {
+        "id": "gesture",
+        "label": "Gestures — MediaPipe",
+        "detail": "Classifies hands on every cycle the refresh rate is due.",
+        "rateLabel": "Refresh rate",
+        "rateKind": "hz",
+        "rateSuffix": " Hz",
+        "rateMin": 1.0,
+        "rateMax": 30.0,
+        "rateStep": 1.0,
+    },
+)
+
+STAGE_IDS = tuple(stage["id"] for stage in PERCEPTION_STAGES)
+STAGE_BY_ID = {stage["id"]: stage for stage in PERCEPTION_STAGES}
+
+# The processor setter each stage's rate knob drives. The object stage's knob
+# is a frame divisor and the other two are frequencies, so this cannot be one
+# generic call.
+STAGE_RATE_SETTERS = {
+    "object": "set_detect_every",
+    "face": "set_face_hz",
+    "gesture": "set_gesture_hz",
+}
+
+# Below this rate the newest face box the gesture stage can consult is over a
+# second old, which is longer than a head stays still in conversation. This is
+# a stated judgement, not a measurement — but see shush_degradation for why
+# erring toward warning is the right side to be wrong on.
+SAFE_FACE_HZ = 1.0
+
+# What a lost Shush turns into, and what that then does. Named here so the
+# warning copy and the tests quote the same two facts.
+SHUSH_FALLBACK_GESTURE = "Pointing_Up"
+SHUSH_FALLBACK_ACTION = "ledctl next-theme"
+
+
+def shush_degradation(object_enabled, face_enabled, face_hz):
+    """Name it when the perception knobs have silently rebound the lighting.
+
+    Shush is only separable from Pointing_Up by where the fingertip sits
+    relative to a detected mouth — that is term 3 of
+    ``gesture_catalog.is_shush``, and with no face box it returns False and
+    MediaPipe's own ``Pointing_Up`` label stands. ``automations.example.json``
+    binds Pointing_Up to ``ledctl next-theme``.
+
+    So turning the face stage off does not merely *drop* the shush. It
+    converts every shush into a lighting-theme change. Starving the stage of
+    refreshes is the same failure arriving slowly: the boxes the gesture stage
+    consults go stale, stop covering the mouth, and the same fallback fires.
+
+    Disabling the object stage does it too, at one remove — faces are only
+    searched for inside person boxes, so no objects means no faces means no
+    Shush.
+
+    Returns the operator-facing warning, or "" when nothing is degraded.
+    """
+    reason = ""
+    if not face_enabled:
+        reason = "The face stage is switched off"
+    elif not object_enabled:
+        reason = ("The object stage is switched off, so the face stage has no "
+                  "person boxes to search")
+    elif float(face_hz) < SAFE_FACE_HZ:
+        reason = (f"The face stage is refreshing at {float(face_hz):.1f} Hz, "
+                  f"below the {SAFE_FACE_HZ:g} Hz needed for a face box to "
+                  "still describe where the mouth is")
+    if not reason:
+        return ""
+    return (f"{reason}. Shush is only told apart from {SHUSH_FALLBACK_GESTURE} "
+            f"by a fingertip near a detected mouth, so a shush will now be "
+            f"read as {SHUSH_FALLBACK_GESTURE} — which the example automations "
+            f"bind to `{SHUSH_FALLBACK_ACTION}`. Shushing will cycle your "
+            f"lights.")
 
 
 def describe_compute_device(torch_module=None):
@@ -93,13 +208,23 @@ class VisionBackend(QObject):
     gesturesChanged = Signal()
     overlayProfilesChanged = Signal()
     computeChanged = Signal()
+    # Per-cycle stage measurements plus the knob positions they were measured
+    # under. Fires on the 100 ms poll whenever any of it moves.
+    stagesChanged = Signal()
+    # The *set* of stages, which is fixed. Kept apart from stagesChanged on
+    # purpose: a QML Repeater rebuilds every delegate when its model changes,
+    # so driving the repeater off stageStats would tear down and rebuild the
+    # switches and sliders ten times a second and make them undraggable.
+    stageSetChanged = Signal()
 
     gestureFromWorker = Signal(str)
     droidScanFinished = Signal(str)
 
     def __init__(self, preview_port=8765, initialize_models=True,
                  load_saved_rules=True, executor=None, parent=None,
-                 clock=time.monotonic):
+                 clock=time.monotonic, processor=None,
+                 detect_every=DEFAULT_DETECT_EVERY, face_hz=DEFAULT_FACE_HZ,
+                 gesture_hz=DEFAULT_GESTURE_HZ):
         super().__init__(parent)
         self._clock = clock
         self._status = "starting"
@@ -131,7 +256,19 @@ class VisionBackend(QObject):
         self._capture_fps = 0.0
         self._inference_fps = 0.0
         self._inference_ms = 0.0
+        self._latest_inference_ms = 0.0
+        self._model_inference_ms = 0.0
         self._model_summary = "Models warming up"
+        # Seeded from the same knobs the processor is built with, so the panel
+        # reads true before the first inference cycle publishes anything.
+        self._stage_rate = {
+            "object": float(max(1, int(detect_every))),
+            "face": float(face_hz),
+            "gesture": float(gesture_hz),
+        }
+        self._stage_enabled = {stage: True for stage in STAGE_IDS}
+        self._stage_ms = {stage: 0.0 for stage in STAGE_IDS}
+        self._stage_refreshed = {stage: False for stage in STAGE_IDS}
         self._image_warning = ""
         self._image_mean = 0.0
         self._auto_exposure = True
@@ -184,10 +321,17 @@ class VisionBackend(QObject):
         })
         self.latest = LatestFrameOutput(MINIMAL)
         self.gestures = GestureEventOutput(self._receive_gesture)
-        processor = FaceGestureProcessor() if initialize_models else (
-            lambda frame, src, sequence, captured_at:
-            SceneFrame(src, sequence, captured_at, frame)
-        )
+        # The GUI used to build FaceGestureProcessor() with no arguments while
+        # __main__ passed all three knobs, so the desktop app was pinned to the
+        # defaults and had no way to reach its own runtime controls.
+        if processor is None:
+            processor = FaceGestureProcessor(
+                detect_every=detect_every, face_hz=face_hz,
+                gesture_hz=gesture_hz,
+            ) if initialize_models else (
+                lambda frame, src, sequence, captured_at:
+                SceneFrame(src, sequence, captured_at, frame)
+            )
         self.processor = processor
         self.pipeline = VisionPipeline(source, processor, [self.latest, self.gestures])
         # The preview server carries a token now — /latest.jpg is live camera
@@ -293,15 +437,23 @@ class VisionBackend(QObject):
         capture_fps = float(metrics.get("capture_fps", 0.0))
         inference_fps = float(metrics.get("inference_fps", 0.0))
         inference_ms = float(metrics.get("inference_ms", 0.0))
+        latest_ms = float(metrics.get("latest_inference_ms", 0.0))
+        model_ms = float(metrics.get("model_inference_ms", 0.0))
         model_summary = str(metrics.get("object_model", "Models warming up"))
         performance = (round(capture_fps, 1), round(inference_fps, 1),
-                       round(inference_ms, 1), model_summary)
+                       round(inference_ms, 1), round(latest_ms, 1),
+                       round(model_ms, 1), model_summary)
         previous = (round(self._capture_fps, 1), round(self._inference_fps, 1),
-                    round(self._inference_ms, 1), self._model_summary)
+                    round(self._inference_ms, 1),
+                    round(self._latest_inference_ms, 1),
+                    round(self._model_inference_ms, 1), self._model_summary)
         if performance != previous:
             self._capture_fps, self._inference_fps = capture_fps, inference_fps
             self._inference_ms, self._model_summary = inference_ms, model_summary
+            self._latest_inference_ms = latest_ms
+            self._model_inference_ms = model_ms
             self.performanceChanged.emit()
+        self._absorb_stage_metrics(metrics)
         image_warning = str(metrics.get("image_warning", ""))
         image_mean = float(metrics.get("image_mean", 0.0))
         image_std = float(metrics.get("image_std", 0.0))
@@ -504,6 +656,164 @@ class VisionBackend(QObject):
     @Property(str, notify=performanceChanged)
     def modelSummary(self):
         return self._model_summary
+
+    @Property(float, notify=performanceChanged)
+    def latestInferenceMs(self):
+        """The most recent cycle, not the 30-cycle average `inferenceMs` is."""
+        return self._latest_inference_ms
+
+    @Property(float, notify=performanceChanged)
+    def modelInferenceMs(self):
+        """Time inside the object model itself, excluding worker round-trip."""
+        return self._model_inference_ms
+
+    # ---- per-stage perception control --------------------------------------
+
+    def _absorb_stage_metrics(self, metrics):
+        """Keep the per-stage measurements this poll used to throw away.
+
+        processor.py has published each stage's cost, refresh flag and rate
+        every cycle since the stages were split apart. The poll read
+        `inference_ms` and `object_model` out of that dict and dropped the
+        rest, so the single ~120 ms number on screen could not be attributed
+        to any stage — and the knobs behind those numbers were unreachable.
+        """
+        if "object_stage_ms" not in metrics:
+            return                      # no inference loop (smoke-test shell)
+        rates = {
+            "object": float(metrics.get("object_detect_every",
+                                        self._stage_rate["object"])),
+            "face": float(metrics.get("face_refresh_hz",
+                                      self._stage_rate["face"])),
+            "gesture": float(metrics.get("gesture_refresh_hz",
+                                         self._stage_rate["gesture"])),
+        }
+        enabled = {stage: bool(metrics.get(f"{stage}_enabled", True))
+                   for stage in STAGE_IDS}
+        stage_ms = {stage: float(metrics.get(f"{stage}_stage_ms", 0.0))
+                    for stage in STAGE_IDS}
+        refreshed = {stage: bool(metrics.get(f"{stage}_refreshed", False))
+                     for stage in STAGE_IDS}
+        if (self._stage_snapshot(rates, enabled, stage_ms, refreshed)
+                == self._stage_snapshot(self._stage_rate, self._stage_enabled,
+                                        self._stage_ms,
+                                        self._stage_refreshed)):
+            return
+        self._stage_rate, self._stage_enabled = rates, enabled
+        self._stage_ms, self._stage_refreshed = stage_ms, refreshed
+        self.stagesChanged.emit()
+
+    @staticmethod
+    def _stage_snapshot(rates, enabled, stage_ms, refreshed):
+        """Comparable form. Costs are float noise below 0.1 ms; don't churn."""
+        return (
+            {stage: round(value, 2) for stage, value in rates.items()},
+            dict(enabled),
+            {stage: round(value, 1) for stage, value in stage_ms.items()},
+            dict(refreshed),
+        )
+
+    def _stage_hz(self, stage):
+        """How often this stage actually refreshes, in Hz.
+
+        Face and gesture are gated by a target frequency, and that target is
+        their refresh rate. The object stage runs once per inference cycle, so
+        its refresh rate is the measured cycle rate — which already accounts
+        for the frame divisor and for whatever the camera can deliver.
+        """
+        if stage == "object":
+            return self._inference_fps
+        return self._stage_rate[stage]
+
+    def _degradation(self):
+        """(stage id, warning) for the shush degradation, or (None, "")."""
+        warning = shush_degradation(self._stage_enabled["object"],
+                                    self._stage_enabled["face"],
+                                    self._stage_rate["face"])
+        if not warning:
+            return None, ""
+        if not self._stage_enabled["face"]:
+            return "face", warning
+        if not self._stage_enabled["object"]:
+            return "object", warning
+        return "face", warning
+
+    @Property("QVariantList", notify=stageSetChanged)
+    def stageIds(self):
+        """The stage set, which is fixed — see stageSetChanged for why."""
+        return list(STAGE_IDS)
+
+    @Property("QVariantList", notify=stagesChanged)
+    def stageStats(self):
+        """One row per stage: what it costs, how often it runs, and its knob."""
+        source, warning = self._degradation()
+        stats = []
+        for spec in PERCEPTION_STAGES:
+            stage = spec["id"]
+            row = dict(spec)
+            row.update({
+                "ms": round(self._stage_ms[stage], 1),
+                "hz": round(self._stage_hz(stage), 2),
+                "enabled": self._stage_enabled[stage],
+                "refreshed": self._stage_refreshed[stage],
+                "rate": self._stage_rate[stage],
+                "warning": warning if stage == source else "",
+            })
+            stats.append(row)
+        return stats
+
+    @Property(str, notify=stagesChanged)
+    def shushWarning(self):
+        """Visible whenever these knobs have rebound Shush onto the lights."""
+        return self._degradation()[1]
+
+    @Property(bool, notify=stagesChanged)
+    def shushDegraded(self):
+        return bool(self._degradation()[1])
+
+    def _stage_setter(self, stage, name):
+        """The processor's setter, or None with the reason already on screen."""
+        if stage not in STAGE_IDS:
+            self._set_action_error(f"Unknown perception stage: {stage}")
+            return None
+        setter = getattr(self.processor, name, None)
+        if setter is None:
+            # Refusing beats accepting. Showing a stage as switched off while
+            # it is still running would be a worse lie than declining the click.
+            self._set_action_error(
+                "Perception stages cannot be controlled: "
+                "no inference loop is running.")
+            return None
+        return setter
+
+    @Slot(str, bool)
+    def setStageEnabled(self, stage, enabled):
+        setter = self._stage_setter(stage, "set_stage_enabled")
+        if setter is None:
+            return
+        setter(stage, bool(enabled))
+        self._stage_enabled[stage] = bool(enabled)
+        self.stagesChanged.emit()
+
+    @Slot(str, float)
+    def setStageRate(self, stage, value):
+        setter = self._stage_setter(stage, STAGE_RATE_SETTERS.get(stage, ""))
+        if setter is None:
+            return
+        value = self._clamp_rate(stage, value)
+        setter(int(value) if STAGE_BY_ID[stage]["rateKind"] == "every"
+               else value)
+        self._stage_rate[stage] = value
+        self.stagesChanged.emit()
+
+    @staticmethod
+    def _clamp_rate(stage, value):
+        """Hold the knob inside the range the panel advertises."""
+        spec = STAGE_BY_ID[stage]
+        value = max(spec["rateMin"], min(spec["rateMax"], float(value)))
+        if spec["rateKind"] == "every":
+            value = float(round(value))
+        return value
 
     @Property("QVariantList", notify=modelsChanged)
     def modelOptions(self):
@@ -813,6 +1123,14 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="AcesVision desktop GUI")
     parser.add_argument("--preview-port", type=int, default=8765)
     parser.add_argument("--smoke-test", action="store_true")
+    # The same three knobs the headless runner takes. They are starting
+    # positions only — the Perception stages panel drives them live from here.
+    parser.add_argument("--detect-every", type=int, default=DEFAULT_DETECT_EVERY,
+                        help="submit one captured frame in every N to inference")
+    parser.add_argument("--face-hz", type=float, default=DEFAULT_FACE_HZ,
+                        help="face stage refresh rate")
+    parser.add_argument("--gesture-hz", type=float, default=DEFAULT_GESTURE_HZ,
+                        help="gesture stage refresh rate")
     args = parser.parse_args(argv)
 
     app = QGuiApplication(sys.argv[:1])
@@ -822,6 +1140,9 @@ def main(argv=None):
     backend = VisionBackend(preview_port=args.preview_port,
                             initialize_models=not args.smoke_test,
                             load_saved_rules=not args.smoke_test,
+                            detect_every=args.detect_every,
+                            face_hz=args.face_hz,
+                            gesture_hz=args.gesture_hz,
                             parent=app)
     # Deliberately unparented: Python owns the engine, so dropping the last
     # reference below destroys the QML tree at a point we choose.

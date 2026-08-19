@@ -877,6 +877,150 @@ ApplicationWindow {
                             Text { text: "Active: " + vision.modelSummary; color: window.textMuted }
                         }
                     }
+
+                    Card {
+                        Layout.fillWidth: true
+                        implicitHeight: stageHeader.implicitHeight + 28
+                        ColumnLayout {
+                            id: stageHeader
+                            anchors.fill: parent
+                            anchors.margins: 14
+                            spacing: 8
+                            Text { text: "Perception stages"; color: window.textMain; font.bold: true; font.pixelSize: 17 }
+                            Text {
+                                text: "All three stages run in sequence on one inference cycle, so the cycle cost is their sum. Switching a stage off or slowing it down buys frame rate back — and each one is measured here rather than estimated."
+                                color: window.textMuted
+                                wrapMode: Text.Wrap
+                                Layout.fillWidth: true
+                            }
+                            Text {
+                                objectName: "cycleCost"
+                                text: "Cycle: " + vision.latestInferenceMs.toFixed(0) + " ms latest, "
+                                      + vision.inferenceMs.toFixed(0) + " ms average over 30, "
+                                      + vision.inferenceFps.toFixed(1) + " FPS"
+                                color: window.textMuted
+                            }
+                        }
+                    }
+
+                    // The guard, and it is not decoration. Without a face box a
+                    // shush is not merely dropped: MediaPipe labels the same hand
+                    // Pointing_Up, which the example automations bind to
+                    // `ledctl next-theme`. Switching the face stage off one click
+                    // above this line silently rebinds shushing onto the lights,
+                    // so this says so, in the panel that did it.
+                    Card {
+                        objectName: "shushWarningCard"
+                        Layout.fillWidth: true
+                        visible: vision.shushDegraded
+                        color: "#2a2214"
+                        border.color: "#7a6031"
+                        implicitHeight: shushRow.implicitHeight + 24
+                        RowLayout {
+                            id: shushRow
+                            anchors.fill: parent
+                            anchors.margins: 12
+                            Text {
+                                objectName: "shushWarningText"
+                                text: vision.shushWarning
+                                color: window.warning
+                                wrapMode: Text.Wrap
+                                Layout.fillWidth: true
+                            }
+                        }
+                    }
+
+                    Repeater {
+                        // Driven off the fixed stage id list, never off
+                        // stageStats. A Repeater rebuilds every delegate when
+                        // its model changes, and stageStats changes on the
+                        // 100 ms poll — binding to it would tear down and
+                        // recreate these switches and sliders ten times a
+                        // second and leave them undraggable.
+                        model: vision.stageIds
+                        delegate: Card {
+                            id: stageCard
+                            required property int index
+                            required property string modelData
+                            readonly property var stats: index < vision.stageStats.length
+                                                         ? vision.stageStats[index] : null
+                            readonly property bool degraded:
+                                stats !== null && stats.warning.length > 0
+                            Layout.fillWidth: true
+                            implicitHeight: stageBody.implicitHeight + 28
+                            border.color: stageCard.degraded ? window.warning : window.border
+                            ColumnLayout {
+                                id: stageBody
+                                anchors.fill: parent
+                                anchors.margins: 14
+                                spacing: 8
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    Switch {
+                                        text: stageCard.stats ? stageCard.stats.label : ""
+                                        checked: stageCard.stats ? stageCard.stats.enabled : false
+                                        onToggled: vision.setStageEnabled(stageCard.modelData, checked)
+                                    }
+                                    Item { Layout.fillWidth: true }
+                                    Text {
+                                        text: stageCard.stats
+                                              ? stageCard.stats.ms.toFixed(1) + " ms  ·  "
+                                                + stageCard.stats.hz.toFixed(1) + " Hz"
+                                                + (stageCard.stats.refreshed ? "" : "  (idle)")
+                                              : ""
+                                        color: window.textMain
+                                        font.bold: true
+                                    }
+                                }
+                                Text {
+                                    text: stageCard.stats ? stageCard.stats.detail : ""
+                                    color: window.textMuted
+                                    wrapMode: Text.Wrap
+                                    Layout.fillWidth: true
+                                }
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    enabled: stageCard.stats ? stageCard.stats.enabled : false
+                                    Text {
+                                        text: stageCard.stats ? stageCard.stats.rateLabel : ""
+                                        color: window.textMuted
+                                        Layout.preferredWidth: 150
+                                    }
+                                    Slider {
+                                        id: stageRate
+                                        from: stageCard.stats ? stageCard.stats.rateMin : 0
+                                        to: stageCard.stats ? stageCard.stats.rateMax : 1
+                                        stepSize: stageCard.stats ? stageCard.stats.rateStep : 1
+                                        snapMode: Slider.SnapAlways
+                                        value: stageCard.stats ? stageCard.stats.rate : 0
+                                        Layout.fillWidth: true
+                                        // onMoved, not onValueChanged: value is bound
+                                        // to the knob the backend publishes, so
+                                        // reacting to every change would echo the
+                                        // backend's own updates straight back at it.
+                                        onMoved: vision.setStageRate(stageCard.modelData, value)
+                                    }
+                                    Text {
+                                        text: stageCard.stats
+                                              ? stageRate.value.toFixed(
+                                                    stageCard.stats.rateStep < 1 ? 1 : 0)
+                                                + stageCard.stats.rateSuffix
+                                              : ""
+                                        color: window.textMain
+                                        Layout.preferredWidth: 80
+                                    }
+                                }
+                                Text {
+                                    visible: stageCard.degraded
+                                    text: stageCard.stats ? stageCard.stats.warning : ""
+                                    color: window.warning
+                                    wrapMode: Text.Wrap
+                                    Layout.fillWidth: true
+                                }
+                            }
+                        }
+                    }
+
                     Card {
                         Layout.fillWidth: true
                         implicitHeight: 150
