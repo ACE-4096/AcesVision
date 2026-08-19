@@ -1,14 +1,36 @@
 """calibrate_threshold.py — Genuine vs impostor threshold calibration.
 
-Downloads LFW deep-funneled images (~173 MB) to /tmp/lfw_calibration/,
-encodes a large sample of impostor faces with the SAME pipeline as scan_photos.py
-(YuNet detect + dlib ResNet encode), then computes genuine and impostor distance
-distributions and reports FAR/recall at key thresholds.
+Downloads LFW deep-funneled images (~173 MB) to /tmp/lfw_calibration/, encodes
+a large sample of impostor faces with the SAME pipeline the chosen engine uses
+in production, then computes genuine and impostor score distributions and
+reports FAR/recall at every threshold.
+
+The output of this script is the only defensible source for a threshold. A
+threshold with no measured false-accept rate is a guess, and ``matching.py``
+refuses to ship one.
+
+Engines
+-------
+``--engine arcface`` (default)
+    YuNet detect + ArcFace ONNX embed, through ``arcface.ArcFacePipeline`` —
+    the same object ``engine._build_arcface`` and ``scan_photos`` use, so the
+    same-detector invariant holds by construction rather than by comment.
+    Scores COSINE SIMILARITY: higher is better, and a threshold is a floor.
+
+``--engine dlib``
+    YuNet detect (HOG fallback) + dlib ResNet encode. Scores EUCLIDEAN
+    DISTANCE: lower is better, and a threshold is a ceiling. This reproduces
+    ticket a3c3c709.
+
+The two numbers are not interchangeable in either direction. Every table
+below is labelled with its metric for that reason.
 
 Cleanup: removes /tmp/lfw_calibration/ on exit (unless --keep-downloads).
 
 Usage:
-    python calibrate_threshold.py [--max-impostors 2000] [--jobs 4] [--keep-downloads]
+    python calibrate_threshold.py --engine arcface --arcface-model w600k_r50
+    python calibrate_threshold.py --engine arcface --arcface-model w600k_mbf
+    python calibrate_threshold.py --engine dlib
 """
 from __future__ import annotations
 
@@ -32,7 +54,9 @@ except ImportError:
 
 import cv2
 import numpy as np
-from PIL import Image, ImageOps
+
+import arcface
+import matching
 
 # -----------------------------------------------------------------------
 # Paths
@@ -47,18 +71,52 @@ LFW_TGZ = LFW_TMP / "lfw.tgz"
 # Figshare file is lfw_funneled (13k images, 5749 identities) — valid for calibration
 LFW_DIR = LFW_TMP / "lfw_funneled"
 
+# Per-worker ArcFace pipeline, built once by the pool initializer. An ONNX
+# session is cheap to call and expensive to create; one per process, not one
+# per image.
+_WORKER_PIPELINE = None
+
+
 # -----------------------------------------------------------------------
-# Step 1: Enroll Toby embeddings (same path as engine._load_known_encodings)
+# Step 1: Enrol genuine embeddings (the SAME path production enrols with)
 # -----------------------------------------------------------------------
 
-def load_toby_encodings() -> list[np.ndarray]:
-    """Return dlib 128-dim encodings for every enrolled image.
+def load_genuine_arcface(variant: str) -> list[np.ndarray]:
+    """ArcFace embeddings for every enrolled photo, via ArcFacePipeline.
 
-    DETECTOR ORDER: YuNet first, HOG fallback — MUST match engine._load_known_encodings
-    and scan_photos._encode_image so the genuine LOO distances reflect the same embedding
-    space as production queries. HOG-first here produced the invalidated calibration
-    (ticket a3c3c709): genuine max was 0.418 but production genuine distances reach ~0.55
-    due to the cross-detector ~0.13 penalty.
+    This is literally the function ``engine._build_arcface`` enrols with. If
+    it is wrong, production is wrong the same way, which is the only kind of
+    calibration worth having.
+    """
+    pipeline = arcface.ArcFacePipeline.load(variant)
+    print(f"  ArcFace {variant} on providers {pipeline.embedder.providers}")
+    print(f"  embedding space: {pipeline.embedding_space()}")
+
+    encs: list[np.ndarray] = []
+    toby_dir = KNOWN_DIR / "Toby"
+    if not toby_dir.exists():
+        raise RuntimeError(f"known_faces/Toby/ not found at {toby_dir}")
+    for img_path in sorted(toby_dir.iterdir()):
+        if img_path.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
+            continue
+        emb = pipeline.encode_file(img_path)
+        if emb is None:
+            print(f"  [warn] no face in {img_path.name}, skipping")
+            continue
+        encs.append(emb)
+    print(f"  Loaded {len(encs)} genuine embeddings from {toby_dir}")
+    return encs
+
+
+def load_genuine_dlib() -> list[np.ndarray]:
+    """dlib 128-d encodings for every enrolled image.
+
+    DETECTOR ORDER: YuNet first, HOG fallback — MUST match
+    engine._load_known_encodings and scan_photos._encode_image so the genuine
+    LOO distances reflect the same embedding space as production queries.
+    HOG-first here produced the invalidated calibration (ticket a3c3c709):
+    genuine max was 0.418 but production genuine distances reach ~0.55 due to
+    the cross-detector ~0.13 penalty.
     """
     import face_recognition as _fr
 
@@ -76,7 +134,6 @@ def load_toby_encodings() -> list[np.ndarray]:
         if img_path.suffix.lower() not in IMG_EXT:
             continue
         arr = _fr.load_image_file(str(img_path))
-        # YuNet first — same order as scan_photos._encode_image and engine._load_known_encodings
         locs = []
         if yn is not None:
             bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
@@ -97,7 +154,7 @@ def load_toby_encodings() -> list[np.ndarray]:
         if found:
             encs.append(found[0])
 
-    print(f"  Loaded {len(encs)} Toby encodings from {toby_dir}")
+    print(f"  Loaded {len(encs)} genuine encodings from {toby_dir}")
     return encs
 
 
@@ -156,8 +213,6 @@ def collect_impostor_paths(max_impostors: int) -> list[Path]:
         if "toby" not in d.name.lower() and "bellramsay" not in d.name.lower()
     ]
 
-    # Collect one image per identity first (max diversity), then fill with more
-    all_paths: list[Path] = []
     per_identity_first: list[Path] = []
     per_identity_extra: list[Path] = []
 
@@ -183,13 +238,28 @@ def collect_impostor_paths(max_impostors: int) -> list[Path]:
 
 
 # -----------------------------------------------------------------------
-# Step 4: Encode one impostor image (worker function — runs in subprocess)
+# Step 4: Encode one impostor image (worker functions — run in subprocesses)
 # -----------------------------------------------------------------------
 
-def _encode_impostor(path_str: str, yunet_path_str: str) -> list[float] | None:
+def _init_arcface_worker(variant: str) -> None:
+    """One ArcFace pipeline per worker process, built once."""
+    global _WORKER_PIPELINE
+    # Each worker is already a whole core; letting ORT fan out inside it too
+    # just makes the workers fight each other for the same CPUs.
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    _WORKER_PIPELINE = arcface.ArcFacePipeline.load(variant)
+
+
+def _encode_impostor_arcface(path_str: str) -> list[float] | None:
+    """Embed the most confident face in one impostor image, or None."""
+    emb = _WORKER_PIPELINE.encode_file(Path(path_str))
+    return None if emb is None else [float(v) for v in emb]
+
+
+def _encode_impostor_dlib(path_str: str, yunet_path_str: str) -> list[float] | None:
     """
-    Encode a single impostor image. Returns first face's 128-dim encoding
-    as a list, or None if no face found.
+    Encode a single impostor image with the dlib pipeline. Returns the first
+    face's 128-dim encoding as a list, or None if no face found.
     Runs inside a ProcessPoolExecutor — all imports must be local.
     """
     import face_recognition as _fr
@@ -243,28 +313,44 @@ def _encode_impostor(path_str: str, yunet_path_str: str) -> list[float] | None:
 # Step 5: Compute distributions
 # -----------------------------------------------------------------------
 
-def compute_genuine_distances(toby_encs: list[np.ndarray]) -> np.ndarray:
-    """Leave-one-out: for each Toby encoding, min dist to ALL others."""
-    E = np.stack(toby_encs)  # (N, 128)
-    dists = []
-    for i in range(len(E)):
-        others = np.delete(E, i, axis=0)
-        d = np.linalg.norm(others - E[i], axis=1)
-        dists.append(float(d.min()))
-    return np.array(dists)
+def compute_genuine_scores(genuine: list[np.ndarray], metric: str) -> np.ndarray:
+    """Leave-one-out: each genuine vector's BEST score against the others.
+
+    "Best" follows the metric's direction — the minimum distance, or the
+    maximum similarity. Getting this backwards would silently invert the
+    whole report, which is why the direction is read from METRICS and never
+    hard-coded.
+    """
+    stacked = np.stack(genuine)
+    scores = []
+    for i in range(len(stacked)):
+        others = np.delete(stacked, i, axis=0)
+        row = matching.score_gallery(others, stacked[i], metric)
+        scores.append(float(row[matching.best_index(row, metric)]))
+    return np.array(scores)
 
 
-def compute_impostor_distances(
-    impostor_encs: list[np.ndarray],
-    toby_encs: list[np.ndarray],
-) -> np.ndarray:
-    """For each impostor, min distance to ANY of Toby's enrolled encodings."""
-    T = np.stack(toby_encs)  # (N_toby, 128)
-    dists = []
-    for imp in impostor_encs:
-        d = np.linalg.norm(T - imp, axis=1)
-        dists.append(float(d.min()))
-    return np.array(dists)
+def compute_impostor_scores(impostors: list[np.ndarray],
+                            genuine: list[np.ndarray],
+                            metric: str) -> np.ndarray:
+    """Each impostor's BEST score against the enrolled gallery.
+
+    Best, not average: a gallery is matched nearest-neighbour, so the impostor
+    who gets in is the one whose single closest gallery photo lets them in.
+    """
+    gallery = np.stack(genuine)
+    scores = []
+    for imp in impostors:
+        row = matching.score_gallery(gallery, imp, metric)
+        scores.append(float(row[matching.best_index(row, metric)]))
+    return np.array(scores)
+
+
+def accepts(scores: np.ndarray, threshold: float, metric: str) -> np.ndarray:
+    """Boolean mask of which scores this threshold would accept."""
+    if matching.METRICS[metric].higher_is_better:
+        return scores >= threshold
+    return scores <= threshold
 
 
 # -----------------------------------------------------------------------
@@ -277,9 +363,10 @@ def percentiles_str(arr: np.ndarray) -> str:
             f"p50={p[3]:.3f} p75={p[4]:.3f} p90={p[5]:.3f} p95={p[6]:.3f}")
 
 
-def histogram_str(arr: np.ndarray, bins: int = 20, width: int = 40) -> str:
-    counts, edges = np.histogram(arr, bins=bins, range=(0.0, 1.0))
-    max_c = max(counts) if counts.max() > 0 else 1
+def histogram_str(arr: np.ndarray, lo: float, hi: float,
+                  bins: int = 20, width: int = 40) -> str:
+    counts, edges = np.histogram(arr, bins=bins, range=(lo, hi))
+    max_c = max(int(counts.max()), 1)
     lines = []
     for i, c in enumerate(counts):
         bar = "#" * int(width * c / max_c)
@@ -287,100 +374,129 @@ def histogram_str(arr: np.ndarray, bins: int = 20, width: int = 40) -> str:
     return "\n".join(lines)
 
 
-def report(
-    genuine_dists: np.ndarray,
-    impostor_dists: np.ndarray,
-    thresholds: list[float],
-) -> None:
+def sweep_range(metric: str) -> np.ndarray:
+    if metric == matching.COSINE_SIMILARITY:
+        return np.round(np.arange(0.00, 1.001, 0.01), 3)
+    return np.round(np.arange(0.30, 0.801, 0.01), 3)
+
+
+def report(genuine_scores: np.ndarray, impostor_scores: np.ndarray,
+           metric: str, engine_label: str) -> tuple[float | None, dict]:
+    """Print the full report; return (recommended_threshold, stats)."""
+    higher = matching.METRICS[metric].higher_is_better
+    direction = "HIGHER is better" if higher else "LOWER is better"
+    comparator = ">=" if higher else "<="
+
     print("\n" + "=" * 70)
-    print("THRESHOLD CALIBRATION REPORT")
+    print(f"THRESHOLD CALIBRATION REPORT — {engine_label}")
+    print(f"METRIC: {metric} ({direction}); a threshold accepts when "
+          f"score {comparator} threshold")
     print("=" * 70)
 
-    print(f"\nGENUINE distribution  (n={len(genuine_dists)} leave-one-out)")
-    print(f"  min={genuine_dists.min():.3f}  max={genuine_dists.max():.3f}  "
-          f"mean={genuine_dists.mean():.3f}  std={genuine_dists.std():.3f}")
-    print(f"  {percentiles_str(genuine_dists)}")
+    for title, arr in (("GENUINE  (leave-one-out)", genuine_scores),
+                       ("IMPOSTOR (LFW faces)", impostor_scores)):
+        print(f"\n{title}  n={len(arr)}")
+        print(f"  min={arr.min():.4f}  max={arr.max():.4f}  "
+              f"mean={arr.mean():.4f}  std={arr.std():.4f}")
+        print(f"  {percentiles_str(arr)}")
 
-    print(f"\nIMPOSTOR distribution  (n={len(impostor_dists)} LFW faces)")
-    print(f"  min={impostor_dists.min():.3f}  max={impostor_dists.max():.3f}  "
-          f"mean={impostor_dists.mean():.3f}  std={impostor_dists.std():.3f}")
-    print(f"  {percentiles_str(impostor_dists)}")
+    lo = min(0.0, float(min(genuine_scores.min(), impostor_scores.min())))
+    hi = max(1.0, float(max(genuine_scores.max(), impostor_scores.max())))
+    print(f"\nDISTRIBUTION HISTOGRAMS ({lo:.2f} -> {hi:.2f})")
+    print(f"\n  Genuine (n={len(genuine_scores)}):")
+    print(histogram_str(genuine_scores, lo, hi))
+    print(f"\n  Impostor (n={len(impostor_scores)}):")
+    print(histogram_str(impostor_scores, lo, hi))
 
-    print("\nDISTRIBUTION HISTOGRAMS (distance 0.0 → 1.0)")
-    print(f"\n  Genuine (n={len(genuine_dists)}):")
-    print(histogram_str(genuine_dists))
-    print(f"\n  Impostor (n={len(impostor_dists)}):")
-    print(histogram_str(impostor_dists))
-
-    print("\nTHRESHOLD ANALYSIS")
+    print(f"\nFULL SWEEP (step 0.01) — FAR = strangers accepted, "
+          f"Recall = enrolled accepted")
     print(f"  {'Threshold':>10}  {'FAR (%)':>10}  {'Recall (%)':>12}  "
           f"{'FA count':>10}  {'Miss count':>12}")
-    print("  " + "-" * 60)
+    print("  " + "-" * 62)
 
-    recommended_thr = None
-    for thr in sorted(thresholds):
-        fa_count = int((impostor_dists <= thr).sum())
-        far = 100.0 * fa_count / len(impostor_dists)
-        recall_count = int((genuine_dists <= thr).sum())
-        recall = 100.0 * recall_count / len(genuine_dists)
-        miss_count = len(genuine_dists) - recall_count
-        print(f"  {thr:>10.2f}  {far:>10.2f}  {recall:>12.2f}  "
-              f"{fa_count:>10}  {miss_count:>12}")
-        if far < 1.0 and recommended_thr is None:
-            recommended_thr = thr
+    best_zero_far = None
+    for thr in sweep_range(metric):
+        fa = int(accepts(impostor_scores, thr, metric).sum())
+        far = 100.0 * fa / len(impostor_scores)
+        hit = int(accepts(genuine_scores, thr, metric).sum())
+        recall = 100.0 * hit / len(genuine_scores)
+        print(f"  {thr:>10.2f}  {far:>10.3f}  {recall:>12.2f}  "
+              f"{fa:>10}  {len(genuine_scores) - hit:>12}")
+        # The best threshold at FAR 0 is the most permissive one that still
+        # lets nobody in: highest recall subject to zero false accepts.
+        if far == 0.0 and (best_zero_far is None
+                           or recall > best_zero_far[1]):
+            best_zero_far = (float(thr), recall)
 
-    # Sweep for exact <0.5% FAR threshold
-    far_targets = [0.5, 1.0]
-    print(f"\nFINE-GRAINED SWEEP (step 0.01)")
-    print(f"  {'Threshold':>10}  {'FAR (%)':>10}  {'Recall (%)':>12}")
-    print("  " + "-" * 40)
-    prev_far = 100.0
-    for thr_i in range(30, 70):
-        thr = thr_i / 100.0
-        fa = int((impostor_dists <= thr).sum())
-        far = 100.0 * fa / len(impostor_dists)
-        recall = 100.0 * (genuine_dists <= thr).sum() / len(genuine_dists)
-        for ft in list(far_targets):
-            if far <= ft and prev_far > ft:
-                print(f"  *** FAR drops below {ft}% at thr={thr:.2f} ***")
-                far_targets.remove(ft)
-        print(f"  {thr:>10.2f}  {far:>10.3f}  {recall:>12.1f}")
-        prev_far = far
-
-    # Separation gap analysis
-    g_max = genuine_dists.max()
-    i_min = impostor_dists.min()
-    overlap_g = (genuine_dists >= i_min).sum()
-    overlap_i = (impostor_dists <= g_max).sum()
+    # -- separation -------------------------------------------------------
+    if higher:
+        genuine_worst, impostor_best = genuine_scores.min(), impostor_scores.max()
+        clean = impostor_best < genuine_worst
+        gap = (impostor_best, genuine_worst)
+        overlap_i = int((impostor_scores >= genuine_worst).sum())
+        overlap_g = int((genuine_scores <= impostor_best).sum())
+    else:
+        genuine_worst, impostor_best = genuine_scores.max(), impostor_scores.min()
+        clean = impostor_best > genuine_worst
+        gap = (genuine_worst, impostor_best)
+        overlap_i = int((impostor_scores <= genuine_worst).sum())
+        overlap_g = int((genuine_scores >= impostor_best).sum())
 
     print("\nSEPARATION VERDICT")
-    if i_min > g_max:
-        print(f"  CLEAN GAP: impostor min ({i_min:.3f}) > genuine max ({g_max:.3f})")
-        print(f"  Perfect separation — any threshold in [{g_max:.3f}, {i_min:.3f}] is safe.")
+    print(f"  worst genuine  = {genuine_worst:.4f}")
+    print(f"  best impostor  = {impostor_best:.4f}")
+    if clean:
+        width = abs(gap[1] - gap[0])
+        print(f"  CLEAN GAP of {width:.4f} — [{gap[0]:.4f}, {gap[1]:.4f}]")
+        print("  Any threshold strictly inside the gap gives FAR 0% and "
+              "recall 100% on this sample.")
     else:
-        overlap_pct_i = 100.0 * overlap_i / len(impostor_dists)
-        overlap_pct_g = 100.0 * overlap_g / len(genuine_dists)
-        print(f"  OVERLAP: genuine_max={g_max:.3f}, impostor_min={i_min:.3f}")
-        print(f"  {overlap_i} impostors ({overlap_pct_i:.1f}%) score <= genuine max")
-        print(f"  {overlap_g} genuine ({overlap_pct_g:.1f}%) score >= impostor min")
-        if overlap_pct_i < 2.0:
-            print("  VERDICT: Tight overlap — usable at strict threshold (~<1% FAR achievable)")
-        elif overlap_pct_i < 10.0:
-            print("  VERDICT: Moderate overlap — usable with some recall trade-off")
-        else:
-            print("  VERDICT: HEAVY OVERLAP — distributions are NOT well-separated; "
-                  "dlib ResNet may not be discriminative enough for this identity")
+        print(f"  OVERLAP: {overlap_i} impostors ({100.0*overlap_i/len(impostor_scores):.2f}%) "
+              f"score at least as well as the worst genuine; "
+              f"{overlap_g} genuine ({100.0*overlap_g/len(genuine_scores):.2f}%) "
+              f"score no better than the best impostor.")
+        print("  There is no threshold with both FAR 0% and recall 100%.")
 
-    if recommended_thr is not None:
-        fa_final = int((impostor_dists <= recommended_thr).sum())
-        far_final = 100.0 * fa_final / len(impostor_dists)
-        rec_final = 100.0 * (genuine_dists <= recommended_thr).sum() / len(genuine_dists)
-        print(f"\nRECOMMENDED THRESHOLD: {recommended_thr:.2f}")
-        print(f"  FAR={far_final:.2f}%  Recall={rec_final:.1f}%")
+    stats = {
+        "metric": metric,
+        "engine": engine_label,
+        "n_genuine": int(len(genuine_scores)),
+        "n_impostors": int(len(impostor_scores)),
+        "genuine_worst": float(genuine_worst),
+        "impostor_best": float(impostor_best),
+        "clean_gap": bool(clean),
+        "gap": [float(gap[0]), float(gap[1])],
+    }
+
+    recommended = None
+    if clean:
+        # Midpoint of the gap: maximum distance from both distributions, so
+        # the smallest chance that an unseen face on either side crosses it.
+        recommended = round(float((gap[0] + gap[1]) / 2.0), 3)
+        fa = int(accepts(impostor_scores, recommended, metric).sum())
+        hit = int(accepts(genuine_scores, recommended, metric).sum())
+        print(f"\nRECOMMENDED THRESHOLD: {comparator} {recommended:.3f} "
+              f"(midpoint of the clean gap)")
+        print(f"  FAR = {100.0*fa/len(impostor_scores):.3f}%  "
+              f"Recall = {100.0*hit/len(genuine_scores):.3f}%")
+        stats["recommended"] = recommended
+        stats["far_percent"] = 100.0 * fa / len(impostor_scores)
+        stats["recall_percent"] = 100.0 * hit / len(genuine_scores)
+    elif best_zero_far is not None:
+        recommended = best_zero_far[0]
+        print(f"\nRECOMMENDED THRESHOLD: {comparator} {recommended:.3f} "
+              f"(most permissive threshold with zero false accepts)")
+        print(f"  FAR = 0.000%  Recall = {best_zero_far[1]:.3f}%")
+        stats["recommended"] = recommended
+        stats["far_percent"] = 0.0
+        stats["recall_percent"] = best_zero_far[1]
     else:
-        print("\nNo threshold in the tested range achieves FAR < 1% — see fine sweep above.")
+        print("\nNO THRESHOLD IN RANGE ACHIEVES FAR 0%. Do not ship a number "
+              "from this run — read the sweep and choose an explicit "
+              "FAR/recall trade-off, or improve the embedder.")
 
     print("\n" + "=" * 70)
+    return recommended, stats
 
 
 # -----------------------------------------------------------------------
@@ -389,24 +505,34 @@ def report(
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Threshold calibration for face-id.")
-    ap.add_argument("--max-impostors", type=int, default=2000,
-                    help="Max LFW impostor images to encode (default: 2000)")
+    ap.add_argument("--engine", choices=["arcface", "dlib"], default="arcface",
+                    help="Which embedder to calibrate (default: arcface)")
+    ap.add_argument("--arcface-model", default=arcface.DEFAULT_VARIANT,
+                    choices=sorted(arcface.VARIANTS),
+                    help=f"ArcFace variant (default: {arcface.DEFAULT_VARIANT})")
+    ap.add_argument("--max-impostors", type=int, default=2500,
+                    help="Max LFW impostor images to encode (default: 2500)")
     ap.add_argument("--jobs", type=int,
                     default=max(1, (os.cpu_count() or 4) // 2),
                     help="Parallel encoding workers")
     ap.add_argument("--keep-downloads", action="store_true",
                     help="Do not delete /tmp/lfw_calibration after run")
-    ap.add_argument("--thresholds", type=float, nargs="+",
-                    default=[0.40, 0.45, 0.50, 0.55, 0.60, 0.65],
-                    help="Threshold values to evaluate")
     args = ap.parse_args()
 
+    if args.engine == "arcface":
+        metric = matching.COSINE_SIMILARITY
+        engine_label = f"arcface/{args.arcface_model}"
+    else:
+        metric = matching.EUCLIDEAN_L2
+        engine_label = "dlib"
+
     print("=" * 70)
-    print("STEP 1: Loading Toby's enrolled encodings")
+    print(f"STEP 1: Loading enrolled genuine embeddings ({engine_label})")
     print("=" * 70)
-    toby_encs = load_toby_encodings()
-    if len(toby_encs) < 2:
-        print("ERROR: Need at least 2 Toby encodings for leave-one-out. Exiting.")
+    genuine = (load_genuine_arcface(args.arcface_model) if args.engine == "arcface"
+               else load_genuine_dlib())
+    if len(genuine) < 2:
+        print("ERROR: Need at least 2 genuine embeddings for leave-one-out. Exiting.")
         sys.exit(1)
 
     print("\n" + "=" * 70)
@@ -424,20 +550,25 @@ def main() -> None:
           f"({args.jobs} workers)")
     print("=" * 70)
 
-    yunet_str = str(YUNET_PATH)
     impostor_encs: list[np.ndarray] = []
-    failed = 0
-    no_face = 0
-
-    t0 = time.time()
-    done = 0
+    failed = no_face = done = 0
     total = len(impostor_paths)
+    t0 = time.time()
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=args.jobs) as pool:
-        futures = {
-            pool.submit(_encode_impostor, str(p), yunet_str): p
-            for p in impostor_paths
-        }
+    if args.engine == "arcface":
+        pool_kwargs = dict(max_workers=args.jobs,
+                           initializer=_init_arcface_worker,
+                           initargs=(args.arcface_model,))
+        def submit(pool, path):
+            return pool.submit(_encode_impostor_arcface, str(path))
+    else:
+        pool_kwargs = dict(max_workers=args.jobs)
+        yunet_str = str(YUNET_PATH)
+        def submit(pool, path):
+            return pool.submit(_encode_impostor_dlib, str(path), yunet_str)
+
+    with concurrent.futures.ProcessPoolExecutor(**pool_kwargs) as pool:
+        futures = [submit(pool, p) for p in impostor_paths]
         for fut in concurrent.futures.as_completed(futures):
             done += 1
             if done % 50 == 0 or done == total:
@@ -451,34 +582,43 @@ def main() -> None:
                 if enc is None:
                     no_face += 1
                 else:
-                    impostor_encs.append(np.array(enc))
-            except Exception as e:
+                    impostor_encs.append(np.array(enc, dtype=np.float64))
+            except Exception as exc:
                 failed += 1
+                if failed <= 3:
+                    print(f"\n  [error] {exc}")
 
     print(f"\n  Encoded: {len(impostor_encs)}  no-face: {no_face}  errors: {failed}")
+    print(f"  Encode wall time: {time.time()-t0:.1f}s")
 
     if len(impostor_encs) < 100:
         print("ERROR: Too few impostor encodings. Check LFW download and detector.")
         sys.exit(1)
 
     print("\n" + "=" * 70)
-    print("STEP 5: Computing genuine (leave-one-out) distances")
+    print("STEP 5: Computing genuine (leave-one-out) scores")
     print("=" * 70)
-    genuine_dists = compute_genuine_distances(toby_encs)
-    print(f"  {len(genuine_dists)} genuine distances computed")
+    genuine_scores = compute_genuine_scores(genuine, metric)
+    print(f"  {len(genuine_scores)} genuine scores computed")
 
     print("\n" + "=" * 70)
-    print("STEP 6: Computing impostor distances (min dist to Toby gallery)")
+    print("STEP 6: Computing impostor scores (best score vs enrolled gallery)")
     print("=" * 70)
-    impostor_dists = compute_impostor_distances(impostor_encs, toby_encs)
-    print(f"  {len(impostor_dists)} impostor distances computed")
+    impostor_scores = compute_impostor_scores(impostor_encs, genuine, metric)
+    print(f"  {len(impostor_scores)} impostor scores computed")
 
-    # Save raw numbers for reference
-    np_out = LFW_TMP / "calibration_results.npz"
-    np.savez(str(np_out), genuine=genuine_dists, impostor=impostor_dists)
-    print(f"  Raw distances saved to {np_out}")
+    out = LFW_TMP / f"calibration_{args.engine}_{args.arcface_model}.npz"
+    np.savez(str(out), genuine=genuine_scores, impostor=impostor_scores,
+             metric=metric, engine=engine_label)
+    print(f"  Raw scores saved to {out}")
 
-    report(genuine_dists, impostor_dists, args.thresholds)
+    recommended, _stats = report(genuine_scores, impostor_scores, metric, engine_label)
+
+    if recommended is not None:
+        print(f"\nTo adopt this, edit matching.{args.engine.upper()}_THRESHOLD "
+              f"— value, far_percent, recall_percent, n_impostors and "
+              f"provenance together. A value without the evidence beside it "
+              f"is refused by Threshold.require_evidence().")
 
     if not args.keep_downloads:
         print(f"\n[cleanup] Removing {LFW_TMP} ...")

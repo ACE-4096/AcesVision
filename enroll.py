@@ -11,6 +11,14 @@ the SAME camera, since a face encodes differently across cameras/lighting.
 
 Network cams are usually mounted at an awkward angle, so detection defaults to
 the slower-but-robust CNN model: after SPACE there's a ~2s pause while it checks.
+
+This script is engine-agnostic and deliberately so: it saves face-crop JPEGs
+and nothing else. No embedding is computed here and none is written to disk,
+so the crops stay valid across an engine or model change — whichever engine is
+selected re-encodes them from scratch at process start. dlib is used here only
+to *find* the face to crop; the recognition pipeline re-detects with its own
+detector when it enrols, which is what keeps enrolment and query in the same
+embedding space (engine.py, arcface.ArcFacePipeline).
 """
 import argparse
 import json

@@ -891,10 +891,14 @@ class ShushGestureTests(unittest.TestCase):
 
     def test_the_real_engine_face_type_drives_the_geometry(self):
         # The stand-in above mirrors engine.Face; prove the real one binds, so
-        # a field rename in engine.py cannot pass this suite silently.
+        # a field rename in engine.py cannot pass this suite silently. It has
+        # already earned its keep once: engine.Face grew a `metric` field when
+        # ArcFace landed, because `conf` stopped meaning "distance, lower is
+        # better", and this test is what refused to let that pass unnoticed.
         from engine import Face as EngineFace
+        import matching as _matching
 
-        face = EngineFace(*FACE_BOX)
+        face = EngineFace(*FACE_BOX, metric=_matching.EUCLIDEAN_L2)
         self.assertTrue(gesture_catalog.is_shush(pointing_hand(AT_LIPS),
                                                  [face], FRAME_W, FRAME_H))
 
@@ -4656,6 +4660,676 @@ class HeadlessEmitterRunnerTests(unittest.TestCase):
                 np.zeros((2, 2, 3)),
                 gestures=[Gesture("Victory", 0.9, 0, 0, 5, 5)]))
         self.assertEqual(bus.seq, 1)
+
+
+# ---------------------------------------------------------------------------
+# ArcFace: alignment, metric direction, thresholds, providers, concurrency.
+#
+# These cover the recogniser swap (YuNet + dlib -> YuNet + ArcFace). The
+# expensive risk in that change is not the model, it is the METRIC FLIP: the
+# calibrated 0.50 was a Euclidean distance where lower is better, and ArcFace
+# scores cosine similarity where higher is better. A wrong-direction
+# comparison does not crash or look odd, it silently accepts everybody.
+# ---------------------------------------------------------------------------
+
+import arcface
+import engine as face_engine
+import matching
+
+
+def executable_source(source):
+    """``source`` with comments and string literals blanked out.
+
+    A source-scanning test that reads prose is a test that fails the moment
+    someone documents the very rule it enforces — and these rules are exactly
+    the kind that deserve a paragraph of explanation next to them. Comment and
+    string spans are overwritten with spaces rather than deleted, so every
+    surviving line keeps its original layout and an assertion can still look
+    for real code like ``with _LOCK:``.
+    """
+    import io
+    import textwrap
+    import tokenize
+
+    lines = textwrap.dedent(source).splitlines(keepends=True)
+    for token in tokenize.generate_tokens(io.StringIO("".join(lines)).readline):
+        if token.type not in (tokenize.COMMENT, tokenize.STRING):
+            continue
+        (start_row, start_col), (end_row, end_col) = token.start, token.end
+        for row in range(start_row, end_row + 1):
+            line = lines[row - 1]
+            first = start_col if row == start_row else 0
+            last = end_col if row == end_row else len(line.rstrip("\n"))
+            lines[row - 1] = (line[:first] + " " * (last - first) + line[last:])
+    return "".join(lines)
+
+
+def rotate_scale_translate(points, degrees, scale, shift):
+    """Apply a known similarity transform to a point set."""
+    theta = np.deg2rad(degrees)
+    rotation = np.array([[np.cos(theta), -np.sin(theta)],
+                         [np.sin(theta), np.cos(theta)]])
+    return (scale * (np.asarray(points, dtype=np.float64) @ rotation.T)
+            + np.asarray(shift, dtype=np.float64))
+
+
+def apply_affine(matrix, points):
+    pts = np.asarray(points, dtype=np.float64)
+    return pts @ matrix[:, :2].T + matrix[:, 2]
+
+
+def yunet_row(landmarks, box=(10, 20, 100, 100), score=0.9):
+    """A YuNet detection row: [x, y, w, h, *10 landmark coords, score]."""
+    return np.array(list(box) + list(np.asarray(landmarks).ravel()) + [score],
+                    dtype=np.float64)
+
+
+class AlignmentTests(unittest.TestCase):
+    """The 112x112 ArcFace crop, built from YuNet's own five keypoints."""
+
+    def test_reference_template_is_the_arcface_one(self):
+        # Five points, and the subject's right eye (index 0) sits on the LEFT
+        # of the image, which is what makes YuNet's ordering line up with the
+        # template without a re-order.
+        self.assertEqual(arcface.ARCFACE_REFERENCE_5PT.shape, (5, 2))
+        self.assertLess(arcface.ARCFACE_REFERENCE_5PT[0][0],
+                        arcface.ARCFACE_REFERENCE_5PT[1][0])
+        # Eyes above nose above mouth.
+        eyes_y = arcface.ARCFACE_REFERENCE_5PT[:2, 1].mean()
+        nose_y = arcface.ARCFACE_REFERENCE_5PT[2, 1]
+        mouth_y = arcface.ARCFACE_REFERENCE_5PT[3:, 1].mean()
+        self.assertLess(eyes_y, nose_y)
+        self.assertLess(nose_y, mouth_y)
+
+    def test_umeyama_recovers_a_known_similarity_transform(self):
+        reference = arcface.ARCFACE_REFERENCE_5PT
+        moved = rotate_scale_translate(reference, degrees=17.0, scale=2.5,
+                                       shift=(120.0, -35.0))
+        matrix = arcface.umeyama(moved, reference)[:2, :]
+        recovered = apply_affine(matrix, moved)
+        np.testing.assert_allclose(recovered, reference, atol=1e-9)
+
+    def test_alignment_matrix_maps_landmarks_onto_the_template(self):
+        landmarks = rotate_scale_translate(arcface.ARCFACE_REFERENCE_5PT,
+                                           degrees=-30.0, scale=1.8,
+                                           shift=(400.0, 250.0))
+        matrix = arcface.alignment_matrix(landmarks)
+        np.testing.assert_allclose(apply_affine(matrix, landmarks),
+                                   arcface.ARCFACE_REFERENCE_5PT, atol=1e-9)
+
+    def test_alignment_of_the_template_itself_is_the_identity(self):
+        matrix = arcface.alignment_matrix(arcface.ARCFACE_REFERENCE_5PT)
+        np.testing.assert_allclose(matrix, np.array([[1.0, 0.0, 0.0],
+                                                     [0.0, 1.0, 0.0]]),
+                                   atol=1e-9)
+
+    def test_alignment_never_mirrors_the_face(self):
+        # A mirrored landmark set must still be fitted with a rotation, not a
+        # reflection: det > 0. A mirrored crop is not a valid alignment, it is
+        # a different face as far as the embedder is concerned.
+        mirrored = arcface.ARCFACE_REFERENCE_5PT.copy()
+        mirrored[:, 0] = 112.0 - mirrored[:, 0]
+        matrix = arcface.alignment_matrix(mirrored)
+        self.assertGreater(np.linalg.det(matrix[:, :2]), 0.0)
+
+    def test_align_places_a_marked_eye_at_the_template_eye(self):
+        # A synthetic frame with one bright pixel at the subject's right eye.
+        landmarks = rotate_scale_translate(arcface.ARCFACE_REFERENCE_5PT,
+                                           degrees=12.0, scale=2.0,
+                                           shift=(150.0, 90.0))
+        frame = np.zeros((400, 500, 3), dtype=np.uint8)
+        eye = np.round(landmarks[0]).astype(int)
+        frame[eye[1] - 1:eye[1] + 2, eye[0] - 1:eye[0] + 2] = 255
+        crop = arcface.align(frame, landmarks)
+        self.assertEqual(crop.shape, (112, 112, 3))
+        brightest = np.unravel_index(np.argmax(crop[:, :, 0]), crop.shape[:2])
+        expected = arcface.ARCFACE_REFERENCE_5PT[0]
+        self.assertLess(abs(brightest[1] - expected[0]), 2.5)
+        self.assertLess(abs(brightest[0] - expected[1]), 2.5)
+
+    def test_yunet_row_slice_is_the_five_landmarks(self):
+        landmarks = np.arange(10, dtype=np.float64).reshape(5, 2)
+        np.testing.assert_allclose(
+            arcface.yunet_landmarks(yunet_row(landmarks)), landmarks)
+
+    def test_short_yunet_row_is_refused(self):
+        with self.assertRaises(ValueError):
+            arcface.yunet_landmarks(np.zeros(6))
+
+    def test_wrong_landmark_count_is_refused(self):
+        with self.assertRaises(ValueError):
+            arcface.alignment_matrix(np.zeros((3, 2)))
+
+    def test_degenerate_landmarks_are_refused_not_silently_fitted(self):
+        with self.assertRaises(ValueError):
+            arcface.alignment_matrix(np.zeros((5, 2)))
+
+    def test_l2_normalise_puts_rows_on_the_unit_sphere(self):
+        rows = arcface.l2_normalise(np.array([[3.0, 4.0], [0.0, 0.0]]))
+        self.assertAlmostEqual(float(np.linalg.norm(rows[0])), 1.0, places=6)
+        # A zero row stays zero rather than becoming NaN; it can only ever
+        # score 0 similarity, which is the correct "no opinion".
+        self.assertTrue(np.all(np.isfinite(rows[1])))
+        self.assertAlmostEqual(float(np.linalg.norm(rows[1])), 0.0, places=6)
+
+
+class MetricDirectionTests(unittest.TestCase):
+    """The flip: lower-is-better became higher-is-better."""
+
+    def test_the_two_engines_do_not_share_a_metric(self):
+        self.assertEqual(matching.THRESHOLDS["dlib"].metric,
+                         matching.EUCLIDEAN_L2)
+        self.assertEqual(matching.THRESHOLDS["arcface"].metric,
+                         matching.COSINE_SIMILARITY)
+        self.assertFalse(matching.METRICS[matching.EUCLIDEAN_L2].higher_is_better)
+        self.assertTrue(matching.METRICS[matching.COSINE_SIMILARITY].higher_is_better)
+
+    def test_a_cosine_threshold_rejects_a_euclidean_shaped_comparison(self):
+        cosine = matching.THRESHOLDS["arcface"]
+        with self.assertRaises(matching.MetricMismatch):
+            cosine.accepts(0.42, matching.EUCLIDEAN_L2)
+
+    def test_a_euclidean_threshold_rejects_a_cosine_shaped_comparison(self):
+        with self.assertRaises(matching.MetricMismatch):
+            matching.THRESHOLDS["dlib"].accepts(0.83, matching.COSINE_SIMILARITY)
+
+    def test_lbph_is_its_own_metric_and_compares_to_neither(self):
+        lbph = matching.THRESHOLDS["lbph"]
+        self.assertNotIn(lbph.metric,
+                         (matching.EUCLIDEAN_L2, matching.COSINE_SIMILARITY))
+        with self.assertRaises(matching.MetricMismatch):
+            lbph.accepts(0.4, matching.EUCLIDEAN_L2)
+
+    def test_acceptance_runs_the_right_way_for_each_metric(self):
+        euclidean = matching.Threshold("t", matching.EUCLIDEAN_L2, 0.50)
+        self.assertTrue(euclidean.accepts(0.40, matching.EUCLIDEAN_L2))
+        self.assertFalse(euclidean.accepts(0.60, matching.EUCLIDEAN_L2))
+
+        cosine = matching.Threshold("t", matching.COSINE_SIMILARITY, 0.30)
+        self.assertTrue(cosine.accepts(0.62, matching.COSINE_SIMILARITY))
+        self.assertFalse(cosine.accepts(0.05, matching.COSINE_SIMILARITY))
+
+    def test_best_index_follows_the_metric_not_the_habit(self):
+        scores = np.array([0.9, 0.2, 0.5])
+        self.assertEqual(matching.best_index(scores, matching.COSINE_SIMILARITY), 0)
+        self.assertEqual(matching.best_index(scores, matching.EUCLIDEAN_L2), 1)
+
+    def test_match_refuses_a_bare_float(self):
+        # This is the exact shape of the bug: 0.50 is strict for dlib and wide
+        # open for ArcFace, and a float cannot tell you which it meant.
+        gallery = [np.array([1.0, 0.0])]
+        with self.assertRaises(TypeError):
+            matching.match(gallery, ["Toby"], np.array([1.0, 0.0]), 0.50)
+
+    def test_the_dlib_number_read_as_cosine_would_admit_a_stranger(self):
+        # Documents the size of the trap numerically. 0.50 as a cosine FLOOR
+        # accepts a 0.55-similarity face; 0.50 as a distance CEILING rejects
+        # the same pair. Same digits, opposite verdict.
+        as_cosine = matching.Threshold("wrong", matching.COSINE_SIMILARITY, 0.50)
+        as_distance = matching.Threshold("right", matching.EUCLIDEAN_L2, 0.50)
+        self.assertTrue(as_cosine.accepts(0.55, matching.COSINE_SIMILARITY))
+        self.assertFalse(as_distance.accepts(0.55, matching.EUCLIDEAN_L2))
+
+    def test_score_gallery_computes_each_metric_correctly(self):
+        gallery = np.array([[1.0, 0.0], [0.0, 1.0]])
+        query = np.array([1.0, 0.0])
+        np.testing.assert_allclose(
+            matching.score_gallery(gallery, query, matching.COSINE_SIMILARITY),
+            [1.0, 0.0], atol=1e-9)
+        np.testing.assert_allclose(
+            matching.score_gallery(gallery, query, matching.EUCLIDEAN_L2),
+            [0.0, np.sqrt(2.0)], atol=1e-9)
+
+    def test_an_empty_gallery_returns_the_worst_score_in_this_metric(self):
+        cosine = matching.Threshold("t", matching.COSINE_SIMILARITY, 0.30)
+        name, score, known = matching.match([], [], np.array([1.0, 0.0]), cosine)
+        self.assertIsNone(name)
+        self.assertFalse(known)
+        # 0.0, not 1.0: an empty gallery must not look like a perfect match.
+        self.assertEqual(score, 0.0)
+
+        euclidean = matching.Threshold("t", matching.EUCLIDEAN_L2, 0.50)
+        _, distance, _ = matching.match([], [], np.array([1.0, 0.0]), euclidean)
+        self.assertEqual(distance, float("inf"))
+
+    def test_format_score_names_the_metric_on_screen(self):
+        self.assertIn("cos", matching.format_score(0.62, matching.COSINE_SIMILARITY))
+        self.assertIn("d", matching.format_score(0.42, matching.EUCLIDEAN_L2))
+
+
+class PerEngineThresholdTests(unittest.TestCase):
+    """One threshold per engine, never one shared constant."""
+
+    def test_every_engine_has_its_own_entry(self):
+        self.assertEqual(sorted(matching.THRESHOLDS),
+                         ["arcface", "dlib", "lbph", "yunet"])
+        self.assertEqual(sorted(matching.THRESHOLD_ENV), sorted(matching.THRESHOLDS))
+
+    def test_threshold_for_returns_the_matching_metric(self):
+        self.assertEqual(matching.threshold_for("arcface", env={}).metric,
+                         matching.COSINE_SIMILARITY)
+        for name in ("dlib", "yunet"):
+            self.assertEqual(matching.threshold_for(name, env={}).metric,
+                             matching.EUCLIDEAN_L2)
+
+    def test_the_dlib_tolerance_variable_does_not_reach_arcface(self):
+        env = {"FACE_ID_TOLERANCE": "0.50"}
+        self.assertEqual(matching.threshold_for("dlib", env=env).value, 0.50)
+        arc = matching.threshold_for("arcface", env=env)
+        self.assertEqual(arc.value, matching.THRESHOLDS["arcface"].value)
+        self.assertIsNot(arc.provenance, None)
+
+    def test_the_arcface_variable_does_not_reach_dlib(self):
+        env = {"FACE_ID_ARCFACE_THRESHOLD": "0.9"}
+        self.assertEqual(matching.threshold_for("arcface", env=env).value, 0.9)
+        self.assertEqual(matching.threshold_for("dlib", env=env).value,
+                         matching.DLIB_TOLERANCE.value)
+
+    def test_an_override_keeps_the_metric_but_drops_the_evidence(self):
+        overridden = matching.threshold_for(
+            "arcface", env={"FACE_ID_ARCFACE_THRESHOLD": "0.42"})
+        self.assertEqual(overridden.metric, matching.COSINE_SIMILARITY)
+        self.assertEqual(overridden.value, 0.42)
+        self.assertIsNone(overridden.far_percent)
+        with self.assertRaises(matching.NotCalibrated):
+            overridden.require_evidence()
+
+    def test_an_unknown_engine_is_refused(self):
+        with self.assertRaises(KeyError):
+            matching.threshold_for("insightface", env={})
+
+    def test_an_unknown_metric_is_refused_at_construction(self):
+        with self.assertRaises(KeyError):
+            matching.Threshold("t", "made_up_metric", 0.5)
+
+    def test_a_threshold_without_a_measured_far_is_refused(self):
+        guess = matching.Threshold("t", matching.COSINE_SIMILARITY, 0.3)
+        with self.assertRaises(matching.NotCalibrated):
+            guess.require_evidence()
+
+    def test_the_shipped_arcface_threshold_carries_its_evidence(self):
+        shipped = matching.THRESHOLDS["arcface"]
+        shipped.require_evidence()
+        self.assertIsNotNone(shipped.n_impostors)
+        self.assertGreaterEqual(shipped.n_impostors, 1000)
+        self.assertNotIn("UNCALIBRATED", shipped.provenance)
+        # And it is not the dlib number wearing a new hat.
+        self.assertNotEqual(shipped.value, matching.DLIB_TOLERANCE.value)
+
+    def test_lbph_is_honest_about_never_having_been_calibrated(self):
+        with self.assertRaises(matching.NotCalibrated):
+            matching.THRESHOLDS["lbph"].require_evidence()
+
+
+class ProviderAssertionTests(unittest.TestCase):
+    """ROCm reports healthy on this host and runs on the CPU anyway."""
+
+    def test_default_is_cpu_only(self):
+        self.assertEqual(arcface.default_providers(env={}),
+                         ["CPUExecutionProvider"])
+
+    def test_the_operator_can_opt_in_explicitly(self):
+        self.assertEqual(
+            arcface.default_providers(env={"FACE_ID_ARCFACE_PROVIDERS":
+                                           "ROCMExecutionProvider, CPUExecutionProvider"}),
+            ["ROCMExecutionProvider", "CPUExecutionProvider"])
+
+    def test_thread_count_is_chosen_not_left_to_onnxruntime(self):
+        # Left to itself onnxruntime sizes the intra-op pool to every core,
+        # which on this 12-core host measured 48.5 ms per r50 embedding
+        # against 27.6 ms at six threads. The session is also shared by every
+        # camera thread, so oversubscribing turns extra cameras into
+        # contention rather than throughput.
+        self.assertEqual(arcface.default_intra_op_threads(env={}, cpu_count=12), 6)
+        self.assertEqual(arcface.default_intra_op_threads(env={}, cpu_count=4), 2)
+        self.assertEqual(arcface.default_intra_op_threads(env={}, cpu_count=1), 1)
+        self.assertEqual(arcface.default_intra_op_threads(env={}, cpu_count=64), 6)
+
+    def test_thread_count_can_be_handed_back_to_onnxruntime(self):
+        env = {"FACE_ID_ARCFACE_THREADS": "0"}
+        self.assertEqual(arcface.default_intra_op_threads(env=env, cpu_count=12), 0)
+        env = {"FACE_ID_ARCFACE_THREADS": "3"}
+        self.assertEqual(arcface.default_intra_op_threads(env=env, cpu_count=12), 3)
+
+    def test_a_bound_provider_passes(self):
+        self.assertEqual(
+            arcface.check_providers(["CPUExecutionProvider"],
+                                    ["CPUExecutionProvider"]),
+            ["CPUExecutionProvider"])
+
+    def test_an_unbound_provider_raises_instead_of_running_slowly(self):
+        with self.assertRaises(arcface.ProviderUnavailable) as caught:
+            arcface.check_providers(["CPUExecutionProvider"],
+                                    ["ROCMExecutionProvider"])
+        self.assertIn("ROCMExecutionProvider", str(caught.exception))
+
+    def test_the_loader_asks_the_session_never_the_build(self):
+        # onnxruntime.get_available_providers() lists ROCMExecutionProvider on
+        # this host for a build whose ROCm libraries are missing. It is a claim
+        # about the wheel, not about the session, and it must never be the
+        # thing that is checked. Comments and docstrings are stripped first:
+        # the rule is about what runs, and the prose is allowed to name the
+        # function it is warning against.
+        source = executable_source(inspect.getsource(arcface.ArcFaceEmbedder.load))
+        self.assertIn("session.get_providers()", source)
+        self.assertNotIn("get_available_providers", source)
+
+    def test_no_executable_line_anywhere_consults_the_build(self):
+        self.assertNotIn("get_available_providers",
+                         executable_source(inspect.getsource(arcface)))
+
+
+# --- fakes for the engine-level tests --------------------------------------
+
+class FakeVariant:
+    def __init__(self, name="w600k_r50", dim=512):
+        self.name = name
+        self.dim = dim
+        self.input_size = 112
+
+
+class FakeArcFacePipeline:
+    """Stands in for arcface.ArcFacePipeline without onnxruntime or a model file."""
+
+    def __init__(self, space="arcface:fake/yunet-5pt-align112", dim=4,
+                 vector=None, detections=(), on_detect=None):
+        self.variant = FakeVariant(name=space.split(":")[-1].split("/")[0],
+                                   dim=dim)
+        self._space = space
+        self._vector = np.ones(dim) / np.sqrt(dim) if vector is None else vector
+        self._detections = list(detections)
+        self._on_detect = on_detect
+        self.encode_calls = []
+
+    def embedding_space(self):
+        return self._space
+
+    def encode_file(self, path):
+        self.encode_calls.append(Path(path))
+        return self._vector
+
+    def detect(self, frame):
+        if self._on_detect is not None:
+            self._on_detect()
+        return self._detections
+
+
+def fake_detection(embedding, box=(1, 2, 3, 4)):
+    return arcface.DetectedFace(box[0], box[1], box[2], box[3],
+                                np.zeros((5, 2)), 0.99,
+                                np.asarray(embedding, dtype=np.float64))
+
+
+class EmbeddingSpaceCacheTests(unittest.TestCase):
+    """A stale gallery must not survive an engine or variant switch."""
+
+    def setUp(self):
+        face_engine.clear_known_cache()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(face_engine.clear_known_cache)
+        root = Path(self.tmp.name)
+        for person, count in (("Toby", 2), ("Ada", 1)):
+            (root / person).mkdir()
+            for i in range(count):
+                (root / person / f"{i}.jpg").write_bytes(b"")
+        patcher = patch.object(face_engine, "KNOWN_DIR", root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_enrolment_reads_the_photos_on_disk(self):
+        names = [name for name, _ in face_engine.enrolled_photos()]
+        self.assertEqual(names, ["Ada", "Toby", "Toby"])
+
+    def test_a_gallery_is_built_once_per_space(self):
+        calls = []
+
+        def encode(path):
+            calls.append(path)
+            return np.array([1.0, 0.0])
+
+        first = face_engine.known_embeddings("space-a", encode)
+        second = face_engine.known_embeddings("space-a", encode)
+        self.assertIs(first, second)
+        self.assertEqual(len(calls), 3)
+
+    def test_a_different_space_gets_its_own_gallery(self):
+        a = face_engine.known_embeddings("space-a", lambda p: np.zeros(128))
+        b = face_engine.known_embeddings("space-b", lambda p: np.zeros(512))
+        self.assertEqual(a[0][0].shape, (128,))
+        self.assertEqual(b[0][0].shape, (512,))
+
+    def test_photos_without_a_face_are_dropped_from_both_lists(self):
+        encodings, names = face_engine.known_embeddings(
+            "space-skip",
+            lambda p: None if p.parent.name == "Ada" else np.zeros(8))
+        self.assertEqual(len(encodings), len(names))
+        self.assertEqual(names, ["Toby", "Toby"])
+
+    def test_switching_arcface_variant_rebuilds_rather_than_reuses(self):
+        r50 = FakeArcFacePipeline(space=arcface.embedding_space_id("w600k_r50"), dim=512)
+        mbf = FakeArcFacePipeline(space=arcface.embedding_space_id("w600k_mbf"), dim=512,
+                           vector=np.eye(512)[7])
+        encs_r50, _, _ = face_engine.arcface_gallery(pipeline=r50)
+        encs_mbf, _, _ = face_engine.arcface_gallery(pipeline=mbf)
+        # Both pipelines were actually asked to encode: the second did not
+        # silently inherit the first one's vectors.
+        self.assertEqual(len(r50.encode_calls), 3)
+        self.assertEqual(len(mbf.encode_calls), 3)
+        self.assertFalse(np.allclose(encs_r50[0], encs_mbf[0]))
+
+    def test_the_two_arcface_variants_do_not_share_a_space_id(self):
+        self.assertNotEqual(arcface.embedding_space_id("w600k_r50"),
+                            arcface.embedding_space_id("w600k_mbf"))
+        self.assertNotEqual(arcface.embedding_space_id("w600k_r50"),
+                            face_engine.DLIB_EMBEDDING_SPACE)
+
+    def test_mismatched_dimensions_raise_instead_of_scoring(self):
+        # The failure mode this closes: a 128-d dlib gallery meeting a 512-d
+        # ArcFace query would otherwise need to be caught by someone noticing
+        # the numbers looked odd.
+        with self.assertRaises(ValueError):
+            matching.score_gallery(np.zeros((3, 128)), np.zeros(512),
+                                   matching.COSINE_SIMILARITY)
+
+    def test_clear_known_cache_forces_a_rebuild(self):
+        calls = []
+        face_engine.known_embeddings("space-c", lambda p: calls.append(p) or np.zeros(4))
+        face_engine.clear_known_cache()
+        face_engine.known_embeddings("space-c", lambda p: calls.append(p) or np.zeros(4))
+        self.assertEqual(len(calls), 6)
+
+
+class NoCachedEncodingArtifactTests(unittest.TestCase):
+    """Re-enrolment is cheap because nothing is persisted."""
+
+    def test_no_encoding_artifact_is_written_to_disk(self):
+        # If a .npy/.pkl/.npz gallery ever appears, an engine switch could
+        # load embeddings produced by a model that is no longer in use, and
+        # the space-keyed in-memory cache would not save us.
+        repo = Path(__file__).parent
+        skip = {".venv", ".git", "__pycache__", "node_modules"}
+        found = [
+            path for pattern in ("*.npy", "*.pkl", "*.npz", "*.pickle")
+            for path in repo.rglob(pattern)
+            if not skip & set(path.relative_to(repo).parts)
+        ]
+        self.assertEqual(found, [], f"unexpected persisted encodings: {found}")
+
+
+class ArcFaceEngineTests(unittest.TestCase):
+    """engine.build_detector's ArcFace path."""
+
+    def setUp(self):
+        face_engine.clear_known_cache()
+        self.addCleanup(face_engine.clear_known_cache)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        (root / "Toby").mkdir()
+        (root / "Toby" / "0.jpg").write_bytes(b"")
+        patcher = patch.object(face_engine, "KNOWN_DIR", root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.enrolled = np.eye(8)[0]
+
+    def build(self, detections=(), on_detect=None):
+        pipeline = FakeArcFacePipeline(dim=8, vector=self.enrolled,
+                               detections=list(detections), on_detect=on_detect)
+        return face_engine._build_arcface(pipeline=pipeline), pipeline
+
+    def test_faces_carry_the_metric_they_were_scored_in(self):
+        detect, _ = self.build([fake_detection(self.enrolled)])
+        face = detect(np.zeros((10, 10, 3), dtype=np.uint8))[0]
+        self.assertEqual(face.metric, matching.COSINE_SIMILARITY)
+        self.assertTrue(face.known)
+        self.assertEqual(face.name, "Toby")
+        self.assertAlmostEqual(face.conf, 1.0, places=6)
+
+    def test_a_stranger_is_rejected_and_scores_low_not_high(self):
+        detect, _ = self.build([fake_detection(np.eye(8)[3])])
+        face = detect(np.zeros((10, 10, 3), dtype=np.uint8))[0]
+        self.assertFalse(face.known)
+        self.assertIsNone(face.name)
+        # Higher is better here: an orthogonal stranger scores ~0.
+        self.assertLess(face.conf, matching.THRESHOLDS["arcface"].value)
+
+    def test_the_detector_advertises_its_metric_and_threshold(self):
+        detect, _ = self.build()
+        self.assertEqual(detect.engine, "arcface")
+        self.assertEqual(detect.metric, matching.COSINE_SIMILARITY)
+        self.assertEqual(detect.threshold, matching.THRESHOLDS["arcface"])
+        self.assertEqual(detect.people, ["Toby"])
+
+    def test_face_records_its_metric_field(self):
+        self.assertEqual(face_engine.Face._fields,
+                         ("x", "y", "w", "h", "name", "conf", "known", "metric"))
+
+    def test_an_unknown_engine_name_is_refused(self):
+        # It used to fall through to the yunet branch, so a typo in
+        # FACE_ID_ENGINE silently ran a different recogniser.
+        with self.assertRaises(ValueError):
+            face_engine.build_detector(engine="arcfase")
+
+    def test_arcface_is_the_default_engine(self):
+        self.assertEqual(face_engine.DEFAULT_ENGINE, "arcface")
+
+    def test_match_helper_refuses_a_bare_tolerance(self):
+        with self.assertRaises(TypeError):
+            face_engine._match([np.zeros(8)], ["Toby"], np.zeros(8), 0.50)
+
+
+class ArcFaceConcurrencyTests(unittest.TestCase):
+    """The process-wide dlib lock must not gate the ArcFace path."""
+
+    def setUp(self):
+        face_engine.clear_known_cache()
+        self.addCleanup(face_engine.clear_known_cache)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        (root / "Toby").mkdir()
+        (root / "Toby" / "0.jpg").write_bytes(b"")
+        patcher = patch.object(face_engine, "KNOWN_DIR", root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_three_camera_threads_are_inside_detect_at_the_same_time(self):
+        # A barrier can only be cleared if all three threads are genuinely
+        # concurrent. Re-introduce the lock around the ArcFace path and this
+        # test times out rather than merely running slower.
+        barrier = threading.Barrier(3, timeout=5.0)
+        detect = face_engine._build_arcface(
+            pipeline=FakeArcFacePipeline(dim=8, detections=[], on_detect=barrier.wait))
+
+        errors = []
+
+        def run():
+            try:
+                detect(np.zeros((8, 8, 3), dtype=np.uint8))
+            except Exception as exc:      # BrokenBarrierError on serialisation
+                errors.append(exc)
+
+        threads = [threading.Thread(target=run) for _ in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10.0)
+            self.assertFalse(t.is_alive())
+        self.assertEqual(errors, [])
+
+    def test_detect_completes_while_another_thread_holds_the_dlib_lock(self):
+        detect = face_engine._build_arcface(pipeline=FakeArcFacePipeline(dim=8))
+        done = threading.Event()
+
+        def run():
+            detect(np.zeros((8, 8, 3), dtype=np.uint8))
+            done.set()
+
+        with face_engine._LOCK:
+            worker = threading.Thread(target=run)
+            worker.start()
+            self.assertTrue(done.wait(timeout=5.0),
+                            "ArcFace detect blocked on the dlib lock")
+        worker.join(timeout=5.0)
+
+    def test_the_dlib_engines_still_take_the_lock(self):
+        # The lock is a dlib workaround, not dead code: dlib's detector and
+        # encoder are process-global C++ objects and concurrent calls segfault.
+        for builder in (face_engine._build_yunet, face_engine._build_dlib,
+                        face_engine._build_lbph):
+            self.assertIn("with _LOCK:",
+                          executable_source(inspect.getsource(builder)))
+        self.assertNotIn("_LOCK",
+                         executable_source(inspect.getsource(face_engine._build_arcface)))
+
+
+_ONNX_MODEL = arcface.model_path(arcface.DEFAULT_VARIANT)
+
+
+def _onnxruntime_available():
+    try:
+        import onnxruntime  # noqa: F401
+    except ImportError:
+        return False
+    return _ONNX_MODEL.is_file()
+
+
+@unittest.skipUnless(_onnxruntime_available(),
+                     "needs onnxruntime and the ArcFace weights installed")
+class ArcFaceSessionTests(unittest.TestCase):
+    """Checks that need a real ONNX session. Skipped when it is absent."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.embedder = arcface.ArcFaceEmbedder.load(arcface.DEFAULT_VARIANT)
+
+    def test_the_session_bound_the_provider_it_was_asked_for(self):
+        self.assertIn("CPUExecutionProvider", self.embedder.providers)
+
+    def test_batched_matches_serial_exactly(self):
+        # The InsightFace graphs declare a static (1, 512) output, so any
+        # batch > 1 makes onnxruntime log a shape warning. The annotation is
+        # stale, not the arithmetic — this is the check that says so, and the
+        # reason arcface.py raises the ORT log level.
+        rng = np.random.default_rng(7)
+        crops = [rng.integers(0, 256, (112, 112, 3), dtype=np.uint8)
+                 for _ in range(4)]
+        batched = self.embedder.embed_aligned_batch(crops)
+        serial = np.stack([self.embedder.embed_aligned(c) for c in crops])
+        np.testing.assert_array_equal(batched, serial)
+
+    def test_embeddings_come_out_l2_normalised(self):
+        crop = np.zeros((112, 112, 3), dtype=np.uint8)
+        vector = self.embedder.embed_aligned(crop)
+        self.assertAlmostEqual(float(np.linalg.norm(vector)), 1.0, places=5)
+
+    def test_a_missing_model_is_reported_not_downloaded(self):
+        with self.assertRaises(arcface.ModelMissing) as caught:
+            arcface.ArcFaceEmbedder.load(arcface.DEFAULT_VARIANT,
+                                         models_dir="/nonexistent")
+        self.assertIn("never downloads models automatically",
+                      str(caught.exception))
 
 
 if __name__ == "__main__":

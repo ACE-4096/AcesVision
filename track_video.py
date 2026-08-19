@@ -44,6 +44,7 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
 import engine as _engine
+import matching
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -90,7 +91,13 @@ class TrackState:
 # ---------------------------------------------------------------------------
 
 def _build_face_engine(tolerance: float):
-    """Build the YuNet-first face detect+encode engine (same as engine.py)."""
+    """Build the YuNet-first face detect+dlib-encode engine (engine.py's 'yunet').
+
+    This tracker stays on the dlib encoder deliberately: its ``face_distance``
+    column is a EUCLIDEAN DISTANCE and existing tracker JSON is compared
+    against it. It is not the ArcFace default, and its numbers are not
+    comparable to ArcFace cosine similarities in either direction.
+    """
     import face_recognition
 
     yn = None
@@ -103,7 +110,14 @@ def _build_face_engine(tolerance: float):
     # This guarantees the embedding space is IDENTICAL to enroll.py output —
     # critical so the calibrated 0.50 threshold is valid.
     encs, names = _engine._load_known_encodings(face_recognition)
-    return face_recognition, yn, encs, names, tolerance
+
+    # A Threshold, not a float: matching.match refuses a bare number because
+    # it carries neither its metric nor its direction.
+    threshold = matching.threshold_for("yunet")
+    if tolerance != threshold.value:
+        threshold = matching.threshold_for(
+            "yunet", env={"FACE_ID_TOLERANCE": str(tolerance)})
+    return face_recognition, yn, encs, names, threshold
 
 
 def _face_id_crop(
@@ -112,7 +126,7 @@ def _face_id_crop(
     yn,
     encs: list,
     names: list,
-    tolerance: float,
+    threshold,
 ) -> tuple[bool, Optional[float]]:
     """
     Run face detect + encode on a BGR crop.
@@ -153,7 +167,7 @@ def _face_id_crop(
     if not fencs:
         return False, None
 
-    _, dist, known = _engine._match(encs, names, fencs[0], tolerance)
+    _, dist, known = _engine._match(encs, names, fencs[0], threshold)
     return known, dist
 
 
@@ -214,10 +228,11 @@ def track_video(
     # --- Build face engine ---
     if verbose:
         print("[track] Building face-ID engine (YuNet + dlib)...")
-    face_recognition, yn, encs, names, tol = _build_face_engine(tolerance)
+    face_recognition, yn, encs, names, threshold = _build_face_engine(tolerance)
     if verbose:
         print(f"[track] Enrolled embeddings: {len(encs)} | people: {sorted(set(names))}")
-        print(f"[track] Face tolerance: {tol} | Face-ID interval: {face_interval} frames")
+        print(f"[track] {threshold.describe()} | "
+              f"Face-ID interval: {face_interval} frames")
 
     # --- Video info ---
     cap = cv2.VideoCapture(str(source))
@@ -296,7 +311,7 @@ def track_video(
                     crop = frame_bgr[y1:mid_y, x1:x2]
                     try:
                         is_match, fd = _face_id_crop(
-                            crop, face_recognition, yn, encs, names, tol
+                            crop, face_recognition, yn, encs, names, threshold
                         )
                     except Exception as exc:
                         is_match, fd = False, None
