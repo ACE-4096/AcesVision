@@ -13,7 +13,22 @@ jeepney>=0.8
 # kernel module installed via apt + modprobe — see README "OBS integration".
 pyvirtualcam
 
-# Optional: the modern dlib stack (recognize.py). More accurate, esp. for kids.
+# ArcFace face recognition (arcface.py) — the DEFAULT engine, FACE_ID_ENGINE=arcface.
+# CPU only. Do NOT substitute onnxruntime-rocm on this host: it advertises
+# ROCMExecutionProvider from get_available_providers() and then executes on the
+# CPU anyway, because libhipblas.so.3 / libamdhip64.so.7 are missing (host is
+# ROCm 6.3.1, the wheel wants 7.x). arcface.check_providers() turns that into a
+# loud failure rather than a silent slowdown, but the honest fix is to stay on
+# the CPU build. Weights are NOT installed by pip — see README "Model binaries".
+onnxruntime>=1.17
+
+# MediaPipe hand/gesture landmarks (gestures.py, gesture_catalog.py). Imported
+# at runtime and previously undeclared here, so a fresh install of this file
+# produced an environment that could not run the gesture pipeline at all.
+mediapipe>=0.10
+
+# The dlib stack. No longer the default engine, kept because FACE_ID_ENGINE=dlib
+# and =yunet still select it and its 0.50 tolerance is still calibrated.
 face_recognition==1.3.0
 setuptools<81                 # face_recognition_models imports pkg_resources, removed in setuptools 81+
 

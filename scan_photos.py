@@ -1,15 +1,26 @@
 """scan_photos.py — batch face-search over a photo library.
 
 Finds every image in --source that contains Toby's (or any enrolled person's)
-face, using the same dlib ResNet 128-dim encoder and YuNet detector as the
-live camera pipeline.  Runs headlessly; no cv2.imshow.
+face, using the same detector and embedder as the live camera pipeline.  Runs
+headlessly; no cv2.imshow.
+
+    --engine arcface (default)  YuNet + ArcFace ONNX. Scores COSINE
+                                SIMILARITY: higher is better.
+    --engine dlib               YuNet + dlib ResNet 128-d. Scores EUCLIDEAN
+                                DISTANCE: lower is better.
+
+The two scores are not interchangeable, which is why ``--tolerance`` (a dlib
+distance) is refused for ArcFace and ``--threshold`` names the engine-agnostic
+knob instead. The manifest records ``metric`` alongside every score for the
+same reason.
 
 Usage:
     python scan_photos.py --source /run/user/1000/gvfs/afc:.../DCIM
-    python scan_photos.py --source ~/Pictures --tolerance 0.55 --jobs 8 --copy
+    python scan_photos.py --source ~/Pictures --jobs 8 --copy
+    python scan_photos.py --source ~/Pictures --engine dlib --tolerance 0.55
 
 Outputs:
-    <output_dir>/manifest.json  — [{path, matched, best_distance, num_faces}]
+    <output_dir>/manifest.json  — [{path, matched, best_score, metric, num_faces}]
     <output_dir>/matches/       — symlinks (or copies with --copy) of matched images
 
 Tickets resolved: 4c9d92f7 (batch scanner), fc99f189 (HEIC support)
@@ -45,6 +56,8 @@ import cv2
 import numpy as np
 from PIL import Image, ImageOps
 
+import matching
+
 # ---------------------------------------------------------------------------
 # Supported extensions (lower-case).  HEIC added when pillow-heif is present.
 # ---------------------------------------------------------------------------
@@ -61,12 +74,19 @@ YUNET_PATH = _REPO / "models" / "face_detection_yunet.onnx"
 
 
 # ---------------------------------------------------------------------------
-# Encoding loader — delegate entirely to engine._load_known_encodings so the
-# embedding space is IDENTICAL to what was used during enroll.py.
+# Encoding loader — delegate entirely to engine so the embedding space is
+# IDENTICAL to what the live pipeline enrols with.
 # ---------------------------------------------------------------------------
 
-def load_enrolled() -> tuple[list, list]:
-    """Return (encodings, names) from engine._load_known_encodings."""
+def load_enrolled(engine: str = "arcface", variant: str | None = None) -> tuple[list, list]:
+    """Return (embeddings, names) for the requested engine.
+
+    Never re-implements enrolment. ``engine.py`` owns it, this file asks.
+    """
+    if engine == "arcface":
+        import engine as _engine
+        encs, names, _pipeline = _engine.arcface_gallery(variant)
+        return encs, names
     import face_recognition
     from engine import _load_known_encodings
     return _load_known_encodings(face_recognition)
@@ -88,6 +108,42 @@ def _open_image_rgb(path: Path) -> np.ndarray | None:
     except Exception as exc:
         print(f"[skip] {path.name}: {exc}", flush=True)
         return None
+
+
+# One ArcFace pipeline per worker process, built once by the pool initializer.
+# An ONNX session is cheap to call and expensive to create.
+_WORKER_PIPELINE = None
+
+
+def _init_arcface_worker(variant: str) -> None:
+    import arcface
+    # Each worker already owns a core; letting ORT fan out inside it as well
+    # just makes the workers fight each other for the same CPUs.
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    global _WORKER_PIPELINE
+    _WORKER_PIPELINE = arcface.ArcFacePipeline.load(variant)
+
+
+def _encode_image_arcface(path_str: str) -> dict:
+    """Embed every face in one image with ArcFace.
+
+    Same return shape as _encode_image so the scan loop does not branch.
+    """
+    import arcface
+
+    result = {"path": path_str, "encodings": [], "num_faces": 0, "error": None}
+    image = arcface.load_bgr(path_str)
+    if image is None:
+        result["error"] = "could not open image"
+        return result
+    try:
+        found = _WORKER_PIPELINE.detect(image)
+    except Exception as exc:
+        result["error"] = str(exc)
+        return result
+    result["num_faces"] = len(found)
+    result["encodings"] = [[float(v) for v in f.embedding] for f in found]
+    return result
 
 
 def _encode_image(
@@ -161,18 +217,14 @@ def _best_match(
     query_enc: list | np.ndarray,
     enrolled_encs: list,
     enrolled_names: list,
-    tolerance: float,
+    threshold,
 ) -> tuple[str | None, float]:
-    """Return (name_or_None, best_distance)."""
-    if not enrolled_encs:
-        return None, 1.0
-    q = np.asarray(query_enc)
-    dists = np.linalg.norm(np.asarray(enrolled_encs) - q, axis=1)
-    bi = int(np.argmin(dists))
-    dist = float(dists[bi])
-    if dist <= tolerance:
-        return enrolled_names[bi], dist
-    return None, dist
+    """Return (name_or_None, best_score) in ``threshold``'s metric.
+
+    ``threshold`` is a ``matching.Threshold``, never a float: the direction of
+    "best" depends on the metric, and a bare number does not carry one.
+    """
+    return matching.match(enrolled_encs, enrolled_names, query_enc, threshold)[:2]
 
 
 # ---------------------------------------------------------------------------
@@ -263,18 +315,31 @@ class _Progress:
 # Main scan logic
 # ---------------------------------------------------------------------------
 
+def _default_variant() -> str:
+    import arcface
+    return arcface.DEFAULT_VARIANT
+
+
+def _is_better(score: float, incumbent: float, threshold) -> bool:
+    """Direction-aware comparison. Never `<` on a similarity."""
+    return (score > incumbent if threshold.higher_is_better
+            else score < incumbent)
+
 def scan(
     source: Path,
     output: Path,
-    tolerance: float,
+    threshold,
     jobs: int,
     copy: bool,
+    engine: str = "arcface",
+    variant: str | None = None,
 ) -> None:
     t_start = time.time()
 
     # --- Load enrolled embeddings ---
-    print("[load] Loading enrolled face encodings...")
-    enrolled_encs, enrolled_names = load_enrolled()
+    print(f"[load] Loading enrolled faces for engine={engine} ...")
+    print(f"[load] {threshold.describe()}")
+    enrolled_encs, enrolled_names = load_enrolled(engine, variant)
     if not enrolled_encs:
         print("[error] No enrolled faces found in known_faces/. Run enroll.py first.")
         sys.exit(1)
@@ -295,20 +360,29 @@ def scan(
     matches_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Parallel encoding ---
-    print(f"[run] Encoding with {jobs} worker(s), tolerance={tolerance} ...")
+    print(f"[run] Encoding with {jobs} worker(s) ...")
     prog = _Progress(len(images))
 
     manifest: list[dict] = []
     n_matched = 0
 
-    yunet_str = str(YUNET_PATH)
     path_strs = [str(p) for p in images]
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=jobs) as pool:
-        futures = {
-            pool.submit(_encode_image, ps, yunet_str): ps
-            for ps in path_strs
-        }
+    if engine == "arcface":
+        pool_kwargs = dict(max_workers=jobs, initializer=_init_arcface_worker,
+                           initargs=(variant or _default_variant(),))
+
+        def submit(pool, ps):
+            return pool.submit(_encode_image_arcface, ps)
+    else:
+        yunet_str = str(YUNET_PATH)
+        pool_kwargs = dict(max_workers=jobs)
+
+        def submit(pool, ps):
+            return pool.submit(_encode_image, ps, yunet_str)
+
+    with concurrent.futures.ProcessPoolExecutor(**pool_kwargs) as pool:
+        futures = [submit(pool, ps) for ps in path_strs]
         for future in concurrent.futures.as_completed(futures):
             prog.tick()
             res = future.result()
@@ -319,19 +393,22 @@ def scan(
                 manifest.append({
                     "path": str(path),
                     "matched": False,
-                    "best_distance": None,
+                    "best_score": None,
+                    "metric": threshold.metric,
                     "num_faces": 0,
                     "error": res["error"],
                 })
                 continue
 
-            # Check each detected face against enrolled set
+            # Check each detected face against the enrolled set. "Best" runs in
+            # the metric's own direction — max similarity, or min distance.
             matched = False
-            best_dist: float | None = None
+            best_score: float | None = None
             for enc_list in res["encodings"]:
-                name, dist = _best_match(enc_list, enrolled_encs, enrolled_names, tolerance)
-                if best_dist is None or dist < best_dist:
-                    best_dist = dist
+                name, score = _best_match(enc_list, enrolled_encs,
+                                          enrolled_names, threshold)
+                if best_score is None or _is_better(score, best_score, threshold):
+                    best_score = score
                 if name is not None:
                     matched = True
                     break  # one confirmed face is enough
@@ -339,7 +416,8 @@ def scan(
             manifest.append({
                 "path": str(path),
                 "matched": matched,
-                "best_distance": round(best_dist, 4) if best_dist is not None else None,
+                "best_score": round(best_score, 4) if best_score is not None else None,
+                "metric": threshold.metric,
                 "num_faces": res["num_faces"],
             })
 
@@ -377,12 +455,27 @@ Examples:
   # Scan USB-mounted iPhone DCIM
   python scan_photos.py --source /run/user/1000/gvfs/afc:host=.../DCIM
 
-  # Strict match, 8 parallel workers, hard-copy matches instead of symlink
-  python scan_photos.py --source ~/Pictures --tolerance 0.50 --jobs 8 --copy
+  # 8 parallel workers, hard-copy matches instead of symlink
+  python scan_photos.py --source ~/Pictures --jobs 8 --copy
+
+  # The previous dlib pipeline, with its own calibrated distance
+  python scan_photos.py --source ~/Pictures --engine dlib --tolerance 0.50
 
   # Auto-detect a GVFS-mounted phone
   python scan_photos.py
 """,
+    )
+    parser.add_argument(
+        "--engine",
+        choices=["arcface", "dlib"],
+        default="arcface",
+        help="Embedder. arcface (default) scores cosine similarity; dlib "
+             "scores Euclidean distance. Default: arcface",
+    )
+    parser.add_argument(
+        "--arcface-model",
+        default=None,
+        help="ArcFace variant (w600k_r50 or w600k_mbf). Default: w600k_r50",
     )
     parser.add_argument(
         "--source",
@@ -399,13 +492,24 @@ Examples:
     parser.add_argument(
         "--tolerance",
         type=float,
-        default=0.50,
+        default=None,
         help=(
-            "dlib distance threshold — lower = stricter match. "
+            "dlib ONLY. dlib distance threshold — lower = stricter match. "
             "0.50 is calibrated against 2500 LFW impostors with the YuNet-first "
             "pipeline: FAR=0%%, Recall=100%% (genuine max=0.452, impostor min=0.500). "
             "Do not raise above 0.50 without re-calibrating — 0.60 accepts ~8%% of "
-            "strangers. See calibrate_threshold.py. Default: 0.50"
+            "strangers. Refused with --engine arcface, whose scores run the "
+            "other way. See calibrate_threshold.py."
+        ),
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=None,
+        help=(
+            "Override the calibrated threshold for the chosen engine, in that "
+            "engine's own metric. An override has no measured FAR — it is a "
+            "knob for experiments, not a number to ship."
         ),
     )
     parser.add_argument(
@@ -420,6 +524,25 @@ Examples:
         help="Hard-copy matched images to output/matches/ instead of symlinking",
     )
     args = parser.parse_args()
+
+    # --tolerance is a dlib Euclidean distance. Under ArcFace, "0.50" would
+    # not be a stricter or looser version of the same thing — it would be a
+    # floor on cosine similarity, a completely different decision. Refuse it
+    # rather than silently reinterpret it.
+    if args.tolerance is not None and args.engine != "dlib":
+        parser.error(
+            "--tolerance is a dlib Euclidean distance and means nothing to "
+            f"--engine {args.engine}, which scores cosine similarity (higher "
+            "is better). Use --threshold, or --engine dlib."
+        )
+
+    engine_key = "dlib" if args.engine == "dlib" else "arcface"
+    override = args.threshold if args.threshold is not None else args.tolerance
+    if override is None:
+        threshold = matching.threshold_for(engine_key)
+    else:
+        threshold = matching.threshold_for(
+            engine_key, env={matching.THRESHOLD_ENV[engine_key]: str(override)})
 
     # Resolve source
     source = args.source
@@ -439,7 +562,8 @@ Examples:
     if not source.is_dir():
         parser.error(f"--source must be a directory: {source}")
 
-    scan(source, args.output, args.tolerance, args.jobs, args.copy)
+    scan(source, args.output, threshold, args.jobs, args.copy,
+         engine=args.engine, variant=args.arcface_model)
 
 
 if __name__ == "__main__":

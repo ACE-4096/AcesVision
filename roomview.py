@@ -33,6 +33,7 @@ import cv2
 import numpy as np
 
 import camera
+import matching
 from engine import build_detector
 
 DETECT_EVERY = int(os.environ.get("FACE_ID_DETECT_EVERY", "5"))
@@ -90,7 +91,12 @@ class Stream(threading.Thread):
     def _draw(self, frame, faces):
         for f in faces:
             color = GREEN if f.known else RED
-            label = f"{f.name} ({f.conf:.2f})" if f.known else "Unknown"
+            # f.conf is only meaningful alongside f.metric: for ArcFace it is
+            # a cosine similarity where higher is better, for the dlib engines
+            # a Euclidean distance where lower is better. The metric suffix is
+            # drawn so a 0.62 on screen is never read as the wrong 0.62.
+            label = (f"{f.name} ({matching.format_score(f.conf, f.metric)})"
+                     if f.known else "Unknown")
             cv2.rectangle(frame, (f.x, f.y), (f.x + f.w, f.y + f.h), color, 2)
             cv2.putText(frame, label, (f.x, max(f.y - 8, 16)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
