@@ -13,6 +13,12 @@ import os
 
 from .connectors import default_registry
 from .contracts import SourceSpec
+from .discovery import (
+    DEFAULT_PROBE_TIMEOUT_S,
+    DROIDCAM_PORT,
+    scan_droidcam,
+    scan_plan,
+)
 from .emitter import SCHEMA_GESTURE, EventBus, GestureEmitter, PublishFilter
 from .events import GestureEventOutput
 from .policy import RuleEngine, RuleStore
@@ -66,6 +72,24 @@ def build_parser():
     parser.add_argument("--print-token", action="store_true",
                         help="print the emitter token and the subscriber URL, "
                              "then exit")
+    parser.add_argument("--list-networks", action="store_true",
+                        help="print which interfaces DroidCam discovery would "
+                             "scan, and why every other one was skipped, then "
+                             "exit. Sends no packets.")
+    parser.add_argument("--scan-droidcam", action="store_true",
+                        help="print the scan plan, run the bounded DroidCam "
+                             "scan on it, list what answered, then exit")
+    parser.add_argument("--scan-timeout", type=float,
+                        default=DEFAULT_PROBE_TIMEOUT_S,
+                        help=f"seconds one probe waits for a host to answer "
+                             f"(default {DEFAULT_PROBE_TIMEOUT_S}). Raise it on "
+                             f"a slow or congested link: a phone whose Wi-Fi "
+                             f"radio is power-saving can take a few hundred "
+                             f"milliseconds to answer at all.")
+    parser.add_argument("--scan-port", type=int, default=DROIDCAM_PORT,
+                        help=f"TCP port DroidCam discovery probes (default "
+                             f"{DROIDCAM_PORT}; the DroidCam app can be told "
+                             f"to use another one)")
     parser.add_argument("--detect-every", type=int,
                         default=int(os.environ.get("FACE_ID_DETECT_EVERY", "1")))
     parser.add_argument("--model", default=str(default_model()))
@@ -136,6 +160,50 @@ def build_emitter(args, bus=None, publish_filter=None):
     return emitter, host
 
 
+def report_networks(scan=False, planner=None, scanner=None,
+                    write=print, timeout_s=DEFAULT_PROBE_TIMEOUT_S,
+                    port=DROIDCAM_PORT):
+    """Show what DroidCam discovery would scan, and optionally scan it.
+
+    The plan is printed either way. A program that opens sockets on somebody's
+    home network owes them a way to see which network, from a terminal, without
+    starting a GUI and without sending a packet first.
+
+    ``planner`` and ``scanner`` resolve at call time rather than as default
+    arguments. A default argument binds at import, which quietly freezes the
+    injection seam: the module attribute could be replaced and this function
+    would still call the original. That is not a hypothetical — it is how the
+    first attempt to test this path end to end failed.
+
+    Returns the process exit code.
+    """
+    planner = planner or scan_plan
+    scanner = scanner or scan_droidcam
+    try:
+        plan = planner()
+    except ValueError as exc:           # a refused or malformed override
+        write(f"[networks] {exc}")
+        return 2
+    write("[networks] " + plan.describe().replace("\n", "\n[networks] "))
+    if not plan.networks:
+        write("[networks] nothing to scan — no interface on this host "
+              "qualifies. Name one explicitly to override.")
+        return 1
+    if not scan:
+        return 0
+    devices = scanner(plan.networks, port=port, timeout_s=timeout_s)
+    for device in devices:
+        write(f"[droidcam] {device.label}  ->  {device.url}")
+    if not devices:
+        # Say what the probe was given, because the honest failure here is
+        # usually "answered too slowly", not "not there". A phone whose Wi-Fi
+        # radio is asleep can take a few hundred milliseconds to answer.
+        write(f"[droidcam] scan finished, nothing answered on port {port} "
+              f"within {timeout_s:g}s per host. If the phone is running "
+              f"DroidCam, try --scan-timeout {timeout_s * 2:g}")
+    return 0
+
+
 def _printing_callback(engine=None):
     """Print the event, then every decision it produced. Failures are loud."""
     def emit(event):
@@ -148,6 +216,12 @@ def _printing_callback(engine=None):
 
 def main():
     args = build_parser().parse_args()
+
+    if args.list_networks or args.scan_droidcam:
+        # Answered before anything else starts: no camera, no server, no token.
+        raise SystemExit(report_networks(scan=args.scan_droidcam,
+                                        timeout_s=args.scan_timeout,
+                                        port=args.scan_port))
 
     token, created = load_or_create_token()
     if args.print_token:

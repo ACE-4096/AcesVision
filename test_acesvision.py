@@ -3,8 +3,10 @@ import hashlib
 import hmac
 import http.client
 import inspect
+import ipaddress
 import json
 import os
+import socket
 import stat
 import struct
 import sys
@@ -61,12 +63,24 @@ from acesvision.server import (
     token_matches,
 )
 from acesvision.discovery import (
+    DEFAULT_PROBE_TIMEOUT_S,
+    DROIDCAM_PORT,
+    SCAN_INTERFACES_ENV,
+    SCAN_NETWORKS_ENV,
+    DroidCamDevice,
+    NetworkInterface,
+    NoScannableNetwork,
+    ScanPlan,
     WebcamDevice,
     _stable_v4l_path,
     discover_webcams,
+    interface_exclusion_reason,
     local_scan_networks,
+    parse_scan_networks,
     preferred_webcam,
+    read_interface_table,
     scan_droidcam,
+    scan_plan,
 )
 from acesvision.outputs import CallbackOutput
 from acesvision.overlay import CLEAN, OverlayProfile, render
@@ -96,7 +110,7 @@ from acesvision.policy import (
     validate_gesture,
 )
 from acesvision.processor import FaceGestureProcessor
-from acesvision.sources import open_source
+from acesvision.sources import LatestFrameReader, open_source
 
 Face = namedtuple("Face", "x y w h name conf known")
 Gesture = namedtuple("Gesture", "name score x y w h")
@@ -230,6 +244,486 @@ class DiscoveryTests(unittest.TestCase):
         connector = Mock()
         self.assertEqual(scan_droidcam(["192.168.0.0/16"], connector=connector), [])
         connector.assert_not_called()
+
+    def test_droidcam_scan_stops_at_its_deadline(self):
+        """A blocked probe must not hold the GUI's scan open forever."""
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def connector(address, timeout):
+            release.wait(30)
+            raise ConnectionRefusedError
+
+        started = time.monotonic()
+        found = scan_droidcam(["192.168.68.0/29"], connector=connector,
+                              max_workers=2, deadline_s=0.1)
+        self.assertEqual(found, [])
+        self.assertLess(time.monotonic() - started, 5.0)
+
+
+# The interface table of the development host, verbatim, as /sys/class/net and
+# SIOCGIFADDR report it: one real LAN, two VPNs, two libvirt guest networks and
+# two docker networks. Auto-discovery must pick exactly one of the seven.
+# Scanning any of the other six would mean port-scanning VPN peers, virtual
+# machines and containers that never asked to be probed.
+HOST_INTERFACES = (
+    # name, ARP type, flags, operstate, physical, wireless, address, netmask
+    ("br-1f526b924fe3", 1, 0x1003, "up", False, False,
+     "172.18.0.1", "255.255.0.0"),
+    ("docker0", 1, 0x1003, "down", False, False, "172.17.0.1", "255.255.0.0"),
+    ("enp8s0", 1, 0x1003, "up", True, False, "192.168.68.107", "255.255.255.0"),
+    ("tailscale0", 65534, 0x1091, "unknown", False, False,
+     "100.114.53.112", "255.255.255.255"),
+    ("tun0", 65534, 0x1091, "unknown", False, False, "10.8.0.1", "255.255.255.0"),
+    ("virbr-acesops", 1, 0x1003, "up", False, False,
+     "10.171.71.1", "255.255.255.0"),
+    ("virbr0", 1, 0x1003, "up", False, False, "192.168.122.1", "255.255.255.0"),
+)
+
+
+class InterfaceAcquisitionTests(unittest.TestCase):
+    """The half of discovery that talks to the OS, which had no coverage at all.
+
+    Every earlier test injected ``addresses=`` and so exercised the filtering
+    rules only. The acquisition path — the part that decides *which* addresses
+    those are — was ``getaddrinfo(gethostname())``, returned 127.0.1.1 on any
+    Debian or Ubuntu host, and therefore found nothing, ever. These tests run
+    that half against a fake interface table instead of a real kernel.
+    """
+
+    def fake_net(self, entries=HOST_INTERFACES):
+        """A /sys/class/net tree plus the matching address lookup."""
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        # The hardware target lives outside the tree: /sys/class/net holds
+        # interfaces and nothing else.
+        root = Path(directory.name) / "net"
+        root.mkdir()
+        hardware = Path(directory.name) / "pci0000:00"
+        hardware.mkdir()
+        addresses = {}
+        for (name, arp, flags, operstate, physical, wireless,
+             address, netmask) in entries:
+            node = root / name
+            node.mkdir()
+            (node / "type").write_text(f"{arp}\n")
+            (node / "flags").write_text(f"{flags:#x}\n")
+            (node / "operstate").write_text(f"{operstate}\n")
+            if physical:
+                # The kernel puts a symlink to the backing PCI/USB device here.
+                # Bridges, tunnels and veth pairs have none.
+                (node / "device").symlink_to(hardware)
+            if wireless:
+                (node / "wireless").mkdir()
+            addresses[name] = (address, netmask)
+        return root, (lambda name: addresses.get(name, (None, None)))
+
+    def plan(self, entries=HOST_INTERFACES, env=None):
+        root, lookup = self.fake_net(entries)
+        return scan_plan(sysfs=root, address_lookup=lookup,
+                         env={} if env is None else env)
+
+    def test_only_the_real_lan_is_selected_from_a_real_interface_table(self):
+        plan = self.plan()
+        self.assertEqual([interface.name for interface in plan.selected],
+                         ["enp8s0"])
+        self.assertEqual([str(network) for network in plan.networks],
+                         ["192.168.68.0/24"])
+
+    def test_every_vpn_container_and_hypervisor_network_is_skipped_with_a_reason(self):
+        plan = self.plan()
+        skipped = dict(plan.excluded)
+        self.assertEqual(sorted(skipped), [
+            "br-1f526b924fe3", "docker0", "tailscale0", "tun0",
+            "virbr-acesops", "virbr0",
+        ])
+        self.assertIn("container network", skipped["docker0"])
+        self.assertIn("container network", skipped["br-1f526b924fe3"])
+        self.assertIn("VPN overlay", skipped["tailscale0"])
+        self.assertIn("tunnel", skipped["tun0"])
+        self.assertIn("hypervisor guest network", skipped["virbr0"])
+        self.assertIn("hypervisor guest network", skipped["virbr-acesops"])
+
+    def test_local_scan_networks_asks_the_interfaces_not_the_hostname(self):
+        """The reproducer. /etc/hosts maps the hostname to 127.0.1.1 here."""
+        root, lookup = self.fake_net()
+        with patch("acesvision.discovery.socket.getaddrinfo",
+                   side_effect=AssertionError("hostname resolution consulted")), \
+                patch("acesvision.discovery.socket.gethostname",
+                      side_effect=AssertionError("hostname consulted")):
+            networks = local_scan_networks(sysfs=root, address_lookup=lookup,
+                                           env={})
+        self.assertEqual([str(network) for network in networks],
+                         ["192.168.68.0/24"])
+
+    def test_a_wireless_interface_is_selected(self):
+        wireless = (("wlp3s0", 1, 0x1003, "up", True, True,
+                     "192.168.1.50", "255.255.255.0"),)
+        plan = self.plan(HOST_INTERFACES + wireless)
+        self.assertEqual([interface.name for interface in plan.selected],
+                         ["enp8s0", "wlp3s0"])
+        self.assertEqual([interface.kind for interface in plan.selected],
+                         ["ethernet", "wireless"])
+        self.assertIn(ipaddress.ip_network("192.168.1.0/24"), plan.networks)
+
+    def test_a_wide_prefix_is_capped_to_a_24_never_swept(self):
+        wide = (("eno1", 1, 0x1003, "up", True, False,
+                 "172.20.5.9", "255.255.0.0"),)
+        plan = self.plan(wide)
+        self.assertEqual([str(network) for network in plan.networks],
+                         ["172.20.5.0/24"])
+        self.assertEqual(plan.networks[0].num_addresses, 256)
+
+    def test_a_prefix_narrower_than_a_24_is_honoured_as_it_stands(self):
+        narrow = (("eno1", 1, 0x1003, "up", True, False,
+                   "192.168.9.70", "255.255.255.192"),)
+        plan = self.plan(narrow)
+        self.assertEqual([str(network) for network in plan.networks],
+                         ["192.168.9.64/26"])
+
+    def test_a_public_address_on_a_physical_interface_is_never_returned(self):
+        public = (("eno1", 1, 0x1003, "up", True, False,
+                   "93.184.216.34", "255.255.255.0"),)
+        plan = self.plan(public)
+        self.assertEqual(plan.networks, ())
+        self.assertEqual(dict(plan.excluded)["eno1"], "public address")
+
+    def test_a_downed_interface_is_not_scanned(self):
+        unplugged = (("eno1", 1, 0x1003, "down", True, False,
+                      "192.168.4.4", "255.255.255.0"),)
+        plan = self.plan(unplugged)
+        self.assertEqual(plan.networks, ())
+        self.assertIn("down", dict(plan.excluded)["eno1"])
+
+    def test_finding_nothing_fails_loudly_instead_of_returning_empty(self):
+        """The original failure mode, now an exception with the reasons in it.
+
+        Silently returning [] made a host that cannot be scanned look exactly
+        like a network with no phone on it. They are different answers.
+        """
+        root, lookup = self.fake_net(
+            [entry for entry in HOST_INTERFACES if entry[0] != "enp8s0"])
+        with self.assertRaises(NoScannableNetwork) as caught:
+            local_scan_networks(sysfs=root, address_lookup=lookup, env={})
+        message = str(caught.exception)
+        self.assertIn("docker0", message)
+        self.assertIn("tailscale0", message)
+        self.assertIn(SCAN_INTERFACES_ENV, message)
+
+    def test_the_scan_plan_names_what_it_will_touch_and_what_it_skipped(self):
+        report = self.plan().describe()
+        self.assertIn("192.168.68.0/24", report)
+        for name, *_ in HOST_INTERFACES:
+            self.assertIn(name, report)
+        self.assertIn(SCAN_NETWORKS_ENV, report)
+
+    def test_discovery_does_not_depend_on_hostname_resolution_on_this_host(self):
+        """The original bug, reproduced against the real machine.
+
+        On Debian and Ubuntu /etc/hosts maps the hostname to 127.0.1.1. The old
+        acquisition path asked ``getaddrinfo(gethostname())``, got exactly that,
+        discarded it as loopback and answered [] — on every such host, forever.
+        Rig hostname resolution to give that same answer and discovery must
+        still find the LAN this machine is actually plugged into.
+        """
+        if not any(interface_exclusion_reason(interface) is None
+                   for interface in read_interface_table()):
+            self.skipTest("this machine has no scannable LAN interface")
+        loopback = [(2, 1, 6, "", ("127.0.1.1", 0))]
+        with patch("acesvision.discovery.socket.getaddrinfo",
+                   return_value=loopback), \
+                patch("acesvision.discovery.socket.gethostname",
+                      return_value="aced"):
+            networks = local_scan_networks(env={})
+        self.assertTrue(networks, "discovery found no network on a host that "
+                                  "has one")
+        self.assertTrue(all(network.is_private for network in networks))
+        self.assertTrue(all(network.prefixlen >= 24 for network in networks))
+
+    def test_the_real_interface_table_of_this_host_is_readable(self):
+        """One test that does touch the real kernel — read only, no packets."""
+        interfaces = {interface.name: interface
+                      for interface in read_interface_table()}
+        if not interfaces:                  # not Linux, or no /sys
+            self.skipTest("no /sys/class/net on this machine")
+        self.assertIn("lo", interfaces)
+        self.assertEqual(interfaces["lo"].kind, "loopback")
+        self.assertEqual(interface_exclusion_reason(interfaces["lo"]),
+                         "loopback (name matches lo)")
+
+
+class ScanOverrideTests(unittest.TestCase):
+    """The operator's override. Silent scanning of the wrong network is worse
+    than finding nothing, so the choice has to be theirs to take."""
+
+    def interfaces(self):
+        return [
+            NetworkInterface("enp8s0", "192.168.68.107", "255.255.255.0",
+                             kind="ethernet", is_up=True, is_physical=True),
+            NetworkInterface("tun0", "10.8.0.1", "255.255.255.0",
+                             kind="tunnel", is_up=True, is_point_to_point=True),
+        ]
+
+    def test_named_interfaces_win_over_auto_detection(self):
+        plan = scan_plan(interfaces=self.interfaces(),
+                         env={SCAN_INTERFACES_ENV: "tun0"})
+        self.assertEqual([interface.name for interface in plan.selected], ["tun0"])
+        self.assertEqual([str(network) for network in plan.networks],
+                         ["10.8.0.0/24"])
+        self.assertIn(SCAN_INTERFACES_ENV, dict(plan.excluded)["enp8s0"])
+
+    def test_named_networks_win_over_the_interfaces_entirely(self):
+        def explode(name):
+            raise AssertionError("interfaces enumerated despite an override")
+
+        plan = scan_plan(sysfs=Path("/nonexistent"), address_lookup=explode,
+                         env={SCAN_NETWORKS_ENV: "192.168.5.0/24, 10.3.4.0/24",
+                              SCAN_INTERFACES_ENV: "enp8s0"})
+        self.assertEqual([str(network) for network in plan.networks],
+                         ["10.3.4.0/24", "192.168.5.0/24"])
+        self.assertEqual(plan.origin, SCAN_NETWORKS_ENV)
+
+    def test_an_override_still_cannot_sweep_a_16(self):
+        with self.assertRaises(ValueError) as caught:
+            parse_scan_networks("192.168.0.0/16")
+        self.assertIn("/24", str(caught.exception))
+
+    def test_an_override_still_cannot_reach_a_public_network(self):
+        with self.assertRaises(ValueError) as caught:
+            parse_scan_networks("93.184.216.0/24")
+        self.assertIn("private", str(caught.exception))
+
+    def test_an_override_naming_no_such_interface_is_refused_not_ignored(self):
+        with self.assertRaises(ValueError) as caught:
+            scan_plan(interfaces=self.interfaces(),
+                      env={SCAN_INTERFACES_ENV: "wlan9"})
+        self.assertIn("wlan9", str(caught.exception))
+
+    def test_a_named_interface_with_a_public_address_is_still_refused(self):
+        public = [NetworkInterface("enp8s0", "93.184.216.34", "255.255.255.0",
+                                   kind="ethernet", is_up=True, is_physical=True)]
+        plan = scan_plan(interfaces=public, env={SCAN_INTERFACES_ENV: "enp8s0"})
+        self.assertEqual(plan.networks, ())
+        self.assertEqual(dict(plan.excluded)["enp8s0"], "public address")
+
+
+class NetworkReportCliTests(unittest.TestCase):
+    """`--list-networks` — the scan is inspectable from a terminal, no GUI."""
+
+    def plan(self):
+        return ScanPlan(
+            networks=(ipaddress.ip_network("192.168.68.0/24"),),
+            selected=(NetworkInterface("enp8s0", "192.168.68.107",
+                                       "255.255.255.0", kind="ethernet",
+                                       is_up=True, is_physical=True),),
+            excluded=(("docker0", "container network (name matches docker*)"),),
+        )
+
+    def report(self, **kwargs):
+        from acesvision.__main__ import report_networks
+
+        lines = []
+        kwargs.setdefault("planner", self.plan)
+        kwargs.setdefault("scanner", Mock(side_effect=AssertionError("scanned")))
+        code = report_networks(write=lines.append, **kwargs)
+        return code, "\n".join(lines)
+
+    def test_the_flags_are_accepted(self):
+        from acesvision.__main__ import build_parser
+
+        args = build_parser().parse_args(["--list-networks"])
+        self.assertTrue(args.list_networks)
+        self.assertFalse(build_parser().parse_args([]).scan_droidcam)
+
+    def test_listing_prints_the_plan_and_sends_nothing(self):
+        code, text = self.report()
+        self.assertEqual(code, 0)
+        self.assertIn("192.168.68.0/24", text)
+        self.assertIn("enp8s0", text)
+        self.assertIn("docker0", text)
+        self.assertIn(SCAN_INTERFACES_ENV, text)
+
+    def test_scanning_probes_only_the_planned_networks(self):
+        scanned = []
+
+        def scanner(networks, port=DROIDCAM_PORT,
+                    timeout_s=DEFAULT_PROBE_TIMEOUT_S):
+            scanned.append(list(networks))
+            return [DroidCamDevice("192.168.68.31", 4747,
+                                   "http://192.168.68.31:4747/video", "phone")]
+
+        code, text = self.report(scan=True, scanner=scanner)
+        self.assertEqual(code, 0)
+        self.assertEqual([str(network) for network in scanned[0]],
+                         ["192.168.68.0/24"])
+        self.assertIn("http://192.168.68.31:4747/video", text)
+
+    def test_the_probe_budget_reaches_the_scanner(self):
+        """--scan-timeout and --scan-port are settings, not decoration.
+
+        The scan that lost the phone was a scan whose probe budget nothing
+        could reach. A flag that parses but never arrives is the same bug.
+        """
+        seen = {}
+
+        def scanner(networks, port, timeout_s):
+            seen.update(port=port, timeout_s=timeout_s)
+            return []
+
+        code, text = self.report(scan=True, scanner=scanner, timeout_s=2.5,
+                                 port=4848)
+        self.assertEqual(code, 0)
+        self.assertEqual(seen, {"port": 4848, "timeout_s": 2.5})
+        # An empty result names the budget it was given, so "nothing answered"
+        # can be told apart from "nothing answered in time".
+        self.assertIn("within 2.5s per host", text)
+        self.assertIn("--scan-timeout 5", text)
+
+    def test_the_probe_budget_flags_default_to_the_measured_values(self):
+        from acesvision.__main__ import build_parser
+
+        args = build_parser().parse_args([])
+        self.assertEqual(args.scan_timeout, DEFAULT_PROBE_TIMEOUT_S)
+        self.assertEqual(args.scan_port, DROIDCAM_PORT)
+        args = build_parser().parse_args(["--scan-timeout", "3", "--scan-port",
+                                          "5000"])
+        self.assertEqual((args.scan_timeout, args.scan_port), (3.0, 5000))
+
+    def test_nothing_to_scan_exits_nonzero_and_says_so(self):
+        code, text = self.report(planner=ScanPlan)
+        self.assertEqual(code, 1)
+        self.assertIn("nothing to scan", text)
+
+    def test_a_refused_override_exits_nonzero_with_the_reason(self):
+        def planner():
+            raise ValueError("ACESVISION_SCAN_NETWORKS: '10.0.0.0/8' is wider")
+
+        code, text = self.report(planner=planner)
+        self.assertEqual(code, 2)
+        self.assertIn("wider", text)
+
+
+class DroidCamCliEndToEndTests(unittest.TestCase):
+    """`--scan-droidcam` from argv to stdout, over a real socket.
+
+    Every earlier DroidCam test called ``scan_droidcam`` directly with an
+    injected connector. That is the mockable half, and it has now hidden two
+    faults in a row: first an acquisition step no test ever ran, then a probe
+    timeout no test ever timed. Both were reported as "the Sources page finds
+    nothing", and both passed 491 tests on the way out.
+
+    So this drives the real entry point — ``main()``, real ``sys.argv``, real
+    ``socket.create_connection`` — against a listener that is really
+    listening. The only injected thing is *which* network to scan, because a
+    test may not scan somebody's LAN, and that choice is what the scan-plan
+    tests above already cover on their own.
+    """
+
+    def listener(self):
+        """A real TCP listener on loopback. Returns its port."""
+        server = socket.socket()
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", 0))
+        server.listen(8)
+        self.addCleanup(server.close)
+        stop = threading.Event()
+        self.addCleanup(stop.set)
+
+        def accept_loop():
+            server.settimeout(0.1)
+            while not stop.is_set():
+                try:
+                    server.accept()[0].close()
+                except (TimeoutError, OSError):
+                    continue
+
+        thread = threading.Thread(target=accept_loop, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 2.0)
+        return server.getsockname()[1]
+
+    def run_cli(self, *argv):
+        import contextlib
+        import io
+
+        from acesvision.__main__ import main
+
+        plan = ScanPlan(networks=(ipaddress.ip_network("127.0.0.1/32"),),
+                        selected=(NetworkInterface("test0", "127.0.0.1",
+                                                   "255.255.255.255"),))
+        out = io.StringIO()
+        with patch("acesvision.__main__.scan_plan", lambda: plan), \
+                patch.object(sys, "argv", ["acesvision", *argv]), \
+                contextlib.redirect_stdout(out):
+            with self.assertRaises(SystemExit) as exit_code:
+                main()
+        return exit_code.exception.code, out.getvalue()
+
+    def test_a_listening_host_survives_the_whole_cli_path(self):
+        port = self.listener()
+        code, text = self.run_cli("--scan-droidcam", "--scan-port", str(port),
+                                  "--scan-timeout", "2")
+        self.assertEqual(code, 0)
+        self.assertIn(f"http://127.0.0.1:{port}/video", text)
+        self.assertNotIn("nothing answered", text)
+
+    def test_a_silent_host_is_reported_as_silent_with_its_budget(self):
+        # Port 1 on loopback: nothing is there, and the kernel refuses at once.
+        code, text = self.run_cli("--scan-droidcam", "--scan-port", "1",
+                                  "--scan-timeout", "2")
+        self.assertEqual(code, 0)
+        self.assertIn("nothing answered on port 1", text)
+        self.assertIn("within 2s per host", text)
+
+    def test_listing_alone_opens_no_socket(self):
+        port = self.listener()
+        code, text = self.run_cli("--list-networks", "--scan-port", str(port))
+        self.assertEqual(code, 0)
+        self.assertIn("127.0.0.1/32", text)
+        self.assertNotIn("[droidcam]", text)
+
+
+class ProbeBudgetTests(unittest.TestCase):
+    """The probe timeout, sized against a real phone rather than a guess.
+
+    Measured on the development LAN, timing how long the phone took to give a
+    *definitive* TCP answer: ten single probes came back at a median of 211 ms
+    and a maximum of 335 ms, and six full /24 sweeps at 99-252 ms. One of those
+    sixteen measurements was inside the old 0.12 s budget. The delay is Wi-Fi
+    radio power-saving, not distance and not load, so it is a property of every
+    phone this program is meant to find.
+    """
+
+    def slow_connector(self, delay_s):
+        """A connector with a real socket's timeout semantics.
+
+        It answers after ``delay_s`` — unless that would overrun the timeout it
+        was handed, which is precisely what a socket does and precisely what
+        the old 0.12 s budget kept triggering.
+        """
+        def connector(address, timeout):
+            if delay_s > timeout:
+                raise TimeoutError("timed out")
+            time.sleep(delay_s)
+            return Mock(close=Mock())
+        return connector
+
+    def test_the_default_budget_tolerates_a_phone_that_is_waking_its_radio(self):
+        found = scan_droidcam(["192.168.68.0/30"],
+                              connector=self.slow_connector(0.335))
+        self.assertEqual([device.host for device in found],
+                         ["192.168.68.1", "192.168.68.2"])
+
+    def test_the_old_budget_is_what_lost_that_phone(self):
+        """The red half of the fix, kept as the reason the default moved."""
+        found = scan_droidcam(["192.168.68.0/30"], timeout_s=0.12,
+                              connector=self.slow_connector(0.335))
+        self.assertEqual(found, [])
+
+    def test_the_default_is_not_quietly_narrowed_again(self):
+        self.assertGreaterEqual(DEFAULT_PROBE_TIMEOUT_S, 0.5)
+        # Just under Linux's 1 s initial SYN retransmit: one SYN per probe.
+        self.assertLessEqual(DEFAULT_PROBE_TIMEOUT_S, 1.0)
 
 
 class OverlayTests(unittest.TestCase):
@@ -836,6 +1330,211 @@ class PipelineTests(unittest.TestCase):
 
         self.assertEqual(opened[:2], ["webcam", "phone"])
         self.assertTrue(webcam_capture.released)
+
+
+class ScriptedCapture:
+    """A capture that hands out a scripted list of frames, then parks.
+
+    Parking rather than returning ``(False, None)`` is what a live network
+    source does between frames, and it is the state the reader has to be
+    correct in: the producer is idle, not finished.
+    """
+
+    def __init__(self, frames, *, fail_at_end=False):
+        self._frames = list(frames)
+        self._fail_at_end = fail_at_end
+        self.reads = 0
+        self.released = False
+        self.exhausted = threading.Event()
+        self._resume = threading.Event()
+        self._lock = threading.Lock()
+
+    def resume(self, frames=()):
+        with self._lock:
+            self._frames.extend(frames)
+        self.exhausted.clear()
+        self._resume.set()
+
+    def isOpened(self):                     # noqa: N802 - cv2 spelling
+        return not self.released
+
+    def read(self):
+        while True:
+            with self._lock:
+                if self._frames:
+                    self.reads += 1
+                    return True, self._frames.pop(0)
+            if self._fail_at_end:
+                return False, None
+            self.exhausted.set()
+            self._resume.clear()
+            if self.released:
+                return False, None
+            self._resume.wait(2.0)
+            if self.released:
+                return False, None
+
+    def release(self):
+        self.released = True
+        self._resume.set()
+
+    def set(self, *_):
+        return True
+
+    def get(self, *_):
+        return 0.0
+
+
+class LatestFrameReaderTests(unittest.TestCase):
+    """Decode off the capture loop, keep the newest frame, drop the rest.
+
+    The fault this closes is not throughput, it is age. Read in order from the
+    capture loop, a network source hands the pipeline every frame it ever sent,
+    including the ones from several seconds ago, and face recognition on a
+    frame from several seconds ago is wrong rather than slow.
+    """
+
+    def reader(self, capture, **kwargs):
+        reader = LatestFrameReader(capture, **kwargs)
+        self.addCleanup(reader.release)
+        return reader
+
+    def test_the_producer_never_waits_for_the_consumer(self):
+        """Ten frames arrive while the consumer has not called read() once."""
+        capture = ScriptedCapture(range(10))
+        reader = self.reader(capture)
+        self.assertTrue(capture.exhausted.wait(2.0),
+                        "the reader thread stalled behind an idle consumer")
+        self.assertEqual(capture.reads, 10)
+
+    def test_the_consumer_gets_the_newest_frame_and_the_rest_are_counted(self):
+        capture = ScriptedCapture(range(10))
+        reader = self.reader(capture)
+        self.assertTrue(capture.exhausted.wait(2.0))
+
+        ok, frame = reader.read()
+        self.assertTrue(ok)
+        self.assertEqual(frame, 9)          # newest, not the nine before it
+        self.assertEqual(reader.dropped, 9)
+
+    def test_a_waiting_frame_is_handed_over_without_waiting(self):
+        capture = ScriptedCapture([1])
+        reader = self.reader(capture)
+        self.assertTrue(capture.exhausted.wait(2.0))
+
+        started = time.monotonic()
+        ok, frame = reader.read()
+        self.assertEqual((ok, frame), (True, 1))
+        self.assertLess(time.monotonic() - started, 0.05)
+
+    def test_a_frame_is_never_delivered_twice(self):
+        capture = ScriptedCapture([1])
+        reader = self.reader(capture, read_timeout_s=0.05)
+        self.assertEqual(reader.read(), (True, 1))
+        # Nothing new has arrived; the old frame must not be served again as
+        # if it were current.
+        self.assertEqual(reader.read(), (False, None))
+
+        capture.resume([2])
+        self.assertEqual(reader.read(), (True, 2))
+
+    def test_a_dead_source_is_reported_as_not_ok(self):
+        capture = ScriptedCapture([], fail_at_end=True)
+        reader = self.reader(capture)
+        self.assertEqual(reader.read(), (False, None))
+        self.assertFalse(reader.isOpened())
+
+    def test_a_source_that_goes_quiet_gives_up_at_its_timeout(self):
+        """The signal VisionPipeline already reads as 'reconnect'."""
+        capture = ScriptedCapture([])
+        reader = self.reader(capture, read_timeout_s=0.05)
+        started = time.monotonic()
+        self.assertEqual(reader.read(), (False, None))
+        self.assertLess(time.monotonic() - started, 2.0)
+
+    def test_release_stops_the_thread_and_releases_the_capture(self):
+        capture = ScriptedCapture([])
+        reader = LatestFrameReader(capture)
+        reader.release()
+        self.assertTrue(capture.released)
+        self.assertFalse(reader._thread.is_alive())
+        self.assertFalse(reader.isOpened())
+
+    def test_control_calls_reach_the_capture_underneath(self):
+        capture = ScriptedCapture([])
+        capture.set = Mock(return_value=True)
+        reader = self.reader(capture)
+        reader.set(cv2_prop := 38, 1)
+        capture.set.assert_called_once_with(cv2_prop, 1)
+
+
+class ThreadedSourceWiringTests(unittest.TestCase):
+    """open_source and VisionPipeline, with the reader actually in the path."""
+
+    def test_network_sources_are_wrapped_and_webcams_are_not(self):
+        capture = ScriptedCapture([])
+        phone = SourceSpec.from_mapping({
+            "type": "droidcam", "url": "http://phone:4747/video",
+        })
+        opened = open_source(phone, capture_factory=lambda *_: capture)
+        self.addCleanup(opened.release)
+        self.assertIsInstance(opened, LatestFrameReader)
+
+        webcam = SourceSpec.from_mapping({"type": "webcam", "index": 0})
+        # A webcam takes camera-control set() calls from the capture loop while
+        # it runs, and OpenCV is not safe to set() and read() at once. That is
+        # why the reader stops at the network boundary.
+        self.assertIs(open_source(webcam, webcam_opener=lambda _: capture),
+                      capture)
+
+    def test_a_failed_network_open_is_still_none_not_a_reader(self):
+        capture = FakeCapture([], opened=False)
+        phone = SourceSpec.from_mapping({
+            "type": "droidcam", "url": "http://phone:4747/video",
+        })
+        self.assertIsNone(open_source(phone, capture_factory=lambda *_: capture))
+        self.assertTrue(capture.released)
+
+    def test_switching_sources_through_the_reader_releases_the_old_one(self):
+        """The switch contract of test_switches_from_webcam_to_droidcam...,
+        re-run with real LatestFrameReaders in the capture slot."""
+        first = SourceSpec.from_mapping({
+            "id": "phone", "type": "droidcam", "url": "http://one:4747/video",
+        })
+        second = SourceSpec.from_mapping({
+            "id": "tablet", "type": "droidcam", "url": "http://two:4747/video",
+        })
+        captures = {"phone": ScriptedCapture(["one"] * 50),
+                    "tablet": ScriptedCapture(["two"] * 50)}
+        opened = []
+        delivered = threading.Event()
+
+        def opener(source):
+            opened.append(source.id)
+            return open_source(source,
+                               capture_factory=lambda *_: captures[source.id])
+
+        def processor(frame, source, sequence, captured_at):
+            if source.id == "phone":
+                pipeline.switch_source(second)
+            return SceneFrame(source, sequence, captured_at, frame)
+
+        def receive(scene):
+            if scene.source.id == "tablet":
+                delivered.set()
+
+        pipeline = VisionPipeline(first, processor, [CallbackOutput(receive)],
+                                  opener=opener, retry_min_s=0.001,
+                                  retry_max_s=0.002)
+        pipeline.start()
+        self.addCleanup(pipeline.join, 2.0)
+        self.addCleanup(pipeline.stop)
+        self.assertTrue(delivered.wait(5.0), "the switched source never arrived")
+        pipeline.stop()
+        pipeline.join(2.0)
+
+        self.assertEqual(opened[:2], ["phone", "tablet"])
+        self.assertTrue(captures["phone"].released)
 
 
 class PolicyTests(unittest.TestCase):
@@ -2933,6 +3632,139 @@ class GuiErrorChannelTests(unittest.TestCase):
         backend._refresh()
         backend._refresh()
         self.assertEqual(len(seen), 1)
+
+
+class GuiDroidCamScanTests(unittest.TestCase):
+    """The Sources page must say which network it is about to scan, and must
+    not report an unscannable host in the words it uses for an empty one."""
+
+    def plan(self):
+        return ScanPlan(
+            networks=(ipaddress.ip_network("192.168.68.0/24"),),
+            selected=(NetworkInterface("enp8s0", "192.168.68.107",
+                                       "255.255.255.0", kind="ethernet",
+                                       is_up=True, is_physical=True),),
+            excluded=(("tailscale0", "VPN overlay (name matches tailscale*)"),),
+        )
+
+    def test_the_page_names_the_network_before_anything_is_scanned(self):
+        backend = gui_backend()
+        with patch("acesvision.gui.scan_plan", return_value=self.plan()):
+            self.assertEqual(backend.scanPlanTarget, "192.168.68.0/24 (enp8s0)")
+
+    def test_an_unscannable_host_is_not_reported_as_no_device_found(self):
+        backend = gui_backend()
+        scanner = Mock()
+        with patch("acesvision.gui.scan_plan", return_value=ScanPlan()), \
+                patch("acesvision.gui.scan_droidcam", scanner):
+            backend.scanDroidCams()
+        scanner.assert_not_called()
+        self.assertFalse(backend.droidScanActive)
+        self.assertIn("No scannable network", backend.droidScanStatus)
+        self.assertIn(SCAN_INTERFACES_ENV, backend.droidScanStatus)
+
+    def test_a_refused_override_reaches_the_operator(self):
+        backend = gui_backend()
+        with patch("acesvision.gui.scan_plan",
+                   side_effect=ValueError("not a private local network")):
+            backend.scanDroidCams()
+        self.assertIn("Scan refused", backend.droidScanStatus)
+        self.assertIn("private local network", backend.lastError)
+
+    def test_the_scan_probes_exactly_the_planned_networks(self):
+        backend = gui_backend()
+        probed = []
+        finished = threading.Event()
+
+        def scanner(networks):
+            probed.append(list(networks))
+            finished.set()
+            return []
+
+        with patch("acesvision.gui.scan_plan", return_value=self.plan()), \
+                patch("acesvision.gui.scan_droidcam", scanner):
+            backend.scanDroidCams()
+            self.assertTrue(finished.wait(5))
+        self.assertEqual(probed, [["192.168.68.0/24"]])
+        self.assertIn("192.168.68.0/24", backend.droidScanStatus)
+
+    def test_a_finished_scan_says_which_network_it_covered(self):
+        backend = gui_backend()
+        backend._apply_droid_scan(json.dumps(
+            {"devices": [], "networks": ["192.168.68.0/24"]}))
+        self.assertIn("192.168.68.0/24", backend.droidScanStatus)
+        self.assertIn("nothing answered", backend.droidScanStatus)
+
+    def test_a_real_listener_reaches_the_sources_page(self):
+        """The Sources page button, over a real socket, with nothing mocked
+        but the choice of network.
+
+        This is the click the operator actually makes, and it is a second call
+        site: the CLI passes the plan's network objects, the GUI passes their
+        strings, and neither had ever been run against something that was
+        really listening. It shares one probe budget with the CLI, so it also
+        pins that the GUI does not quietly carry a narrower one.
+        """
+        server = socket.socket()
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            server.bind(("127.0.0.1", DROIDCAM_PORT))
+        except OSError:
+            server.close()
+            self.skipTest(f"port {DROIDCAM_PORT} is in use on this host")
+        server.listen(8)
+        self.addCleanup(server.close)
+        stop = threading.Event()
+        self.addCleanup(stop.set)
+
+        def accept_loop():
+            server.settimeout(0.1)
+            while not stop.is_set():
+                try:
+                    server.accept()[0].close()
+                except (TimeoutError, OSError):
+                    continue
+
+        thread = threading.Thread(target=accept_loop, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 2.0)
+
+        backend = gui_backend()
+        finished = threading.Event()
+        calls, results = [], []
+
+        def observed(*args, **kwargs):
+            # A passthrough, not a stub: the real scan runs, over the real
+            # socket, with exactly the arguments the GUI chose. Observing here
+            # rather than on droidScanFinished is how the sibling tests do it,
+            # because a cross-thread Qt signal needs an event loop to arrive.
+            calls.append((args, kwargs))
+            try:
+                results.extend(scan_droidcam(*args, **kwargs))
+            finally:
+                finished.set()
+            return list(results)
+
+        plan = ScanPlan(networks=(ipaddress.ip_network("127.0.0.1/32"),))
+        with patch("acesvision.gui.scan_plan", return_value=plan), \
+                patch("acesvision.gui.scan_droidcam", observed):
+            backend.scanDroidCams()
+            self.assertTrue(finished.wait(15), "the scan never came back")
+
+        self.assertEqual([device.url for device in results],
+                         [f"http://127.0.0.1:{DROIDCAM_PORT}/video"])
+        # No probe budget of its own: the GUI and the CLI share one default, so
+        # a fix to that default cannot reach one page and miss the other.
+        self.assertNotIn("timeout_s", calls[0][1])
+        self.assertEqual(len(calls[0][0]), 1)
+
+        backend._apply_droid_scan(json.dumps({
+            "devices": [device.as_dict() for device in results],
+            "networks": ["127.0.0.1/32"],
+        }))
+        self.assertEqual([device["url"] for device in backend.droidCams],
+                         [f"http://127.0.0.1:{DROIDCAM_PORT}/video"])
+        self.assertIn("Found 1", backend.droidScanStatus)
 
 
 class GuiPreviewFreshnessTests(unittest.TestCase):

@@ -178,6 +178,13 @@ frame. Each output renders scene geometry through its own overlay profile.
 - Valid for GUI, OBS, identification, and gesture control.
 - Not trusted for privileged authorization until transport and injection threats
   have a separately approved design.
+- Discovery scans only the operator's own physical LAN: one private `/24`,
+  derived from the real interface table, restricted to an ethernet or wireless
+  adapter that is up. VPN, container and hypervisor guest networks are excluded
+  by name and by interface flags, never scanned.
+- The scan target is visible before the scan runs and overridable by the
+  operator. No override may widen the scan past a `/24` or reach a public
+  network.
 
 Release 1 uses one active source with switching. The source contract must allow
 multiple cameras in a later release without redesign.
@@ -457,6 +464,7 @@ Rendered frames carry the overlay-profile ID and version for reproducibility.
 | --- | --- |
 | Webcam disconnected | reconnect without restart; security actions disabled |
 | DroidCam unavailable | bounded retry; credentials not logged |
+| No scannable network | reported as its own state, with the interfaces skipped and why; never reported in the words used for a scanned network that held no device |
 | Face model failed | no identity-restricted action |
 | PAD or IR unavailable | no privileged authorization unless policy allows fallback |
 | Gesture model failed | face, GUI, and OBS continue |

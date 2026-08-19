@@ -260,8 +260,132 @@ future camera that passes calibration; it is not exposed for this device.
 
 The camera selector shows the Linux camera number, hardware name, capture type,
 and `/dev/videoN` path. AcesVision starts with the first real colour camera;
-IR and virtual devices remain available for explicit selection. The DroidCam
-scan is manual and checks only the local private `/24` network on port 4747.
+IR and virtual devices remain available for explicit selection.
+
+### The network capture path: newest frame wins
+
+A network source is read on its own thread and only the newest frame is kept
+(`acesvision/sources.py`, `LatestFrameReader`). This is the same drop-old
+contract `_OutputWorker` and `EventBus` already use, applied at the other end
+of the pipeline.
+
+Read straight from the capture loop, `cv2.VideoCapture` delivers every frame,
+in order, and drops none. That sounds like a feature and is not. The consumer
+here is YOLO plus ArcFace, it is slower than the phone, and the frames it has
+not read do not evaporate — they queue in the socket buffer and the FFMPEG
+demuxer, so every frame it eventually draws a box on is further into the past
+than the one before it. Measured against a 1280x720 MJPEG source at 18.9 FPS
+with a 90 ms consumer, over a real socket:
+
+| | throughput | frame age at the end of a 25 s run | frames skipped |
+|---|---|---|---|
+| raw JPEG off the wire, no decode | 11.08 FPS | — | — |
+| `cv2.VideoCapture`, in order | 10.86 FPS | **10.56 s** | 0 |
+| threaded, newest frame only | 11.07 FPS | **0.06 s** | 193 |
+
+Throughput is not the story — all three are within 2% of each other, and the
+figure that matters is the middle column. Recognising a face on a ten-second-old
+frame is not slow, it is wrong. The reader trades 193 frames nobody needed for
+a live one.
+
+Decode cost is real but second order: a 1280x720 JPEG costs **3.45 ms** to
+decode on this host, a 290 FPS ceiling. Moving it off the capture loop is worth
+doing and the reader does it, but decode was never where an 18.9 FPS source
+became a 10 FPS pipeline. The consumer's own cost was.
+
+**Why MJPEG stays.** H.264 would cut bandwidth and is hardware-decodable, and
+it is still the wrong trade here. Every MJPEG frame is independently coded, so
+throwing a stale one away costs nothing and corrupts nothing — which is the
+single property the table above depends on. An H.264 stream carries decoder
+state between frames; a dropped frame is a reference a later frame needs, and
+drop-old stops being free. Lower bandwidth would be paid for in the one
+behaviour that matters.
+
+**Hardware decode: available, and slower.** The RX 6600's VCN block does decode
+4:2:0 MJPEG — `ffmpeg -hwaccel vaapi -vaapi_device /dev/dri/renderD128` runs a
+1280x720 MJPEG file at 16.9x realtime. Software decode of the same file runs at
+**49.9x**, three times faster, because at this resolution libjpeg-turbo beats
+the round trip through GPU memory. It is also unreachable from here regardless:
+this OpenCV build reports `FFMPEG: YES`, `GStreamer: NO`, `VA: NO`, so
+`cv2.VideoCapture` has no VAAPI path without rebuilding OpenCV. Not pursued, on
+both counts. (`vainfo` is not installed and was not installed to find this out;
+`ffmpeg -hwaccels` does list `vaapi` on this host.)
+
+**Source resolution: unresolved, and marked as such.** Asking the phone for a
+smaller frame would be the cheapest win available, and it is the one thing here
+that is not settled. `/mjpegfeed?640x480` is reported to 404 on this DroidCam
+build; that has not been re-checked, because the DroidCam endpoint was not
+reachable when this was written and a stale result is worse than an open
+question. What this build does honour is still to be determined, and if the
+answer is "resolution is set in the phone app only", that is the answer and it
+belongs here rather than in a wish.
+
+Worth knowing before that work is done: nothing in this pipeline downscales for
+inference. The detector JPEG-encodes the **full** frame for the YOLO worker
+(`acesvision/perception.py`), and `FACE_ID_W`/`FACE_ID_H` default to 1280x720.
+So a smaller source frame is a real saving end to end, not a pixel budget that
+gets thrown away later — but it is a saving in the detector's encode and the
+worker's inference, not in a decode step that was ever the bottleneck.
+
+### DroidCam discovery: what it scans, and what it will not
+
+The DroidCam scan is manual — it runs when you click Scan, never on startup —
+and it is bounded three ways: private IPv4 only, one `/24` at most (254 hosts,
+never a `/16` sweep), and a total deadline so a scan cannot hold the GUI open.
+
+Which network it scans is decided from the machine's real interface table
+(`/sys/class/net` plus `SIOCGIFADDR`), not from hostname resolution. A host
+whose `/etc/hosts` maps its name to `127.0.1.1` — the Debian and Ubuntu default
+— is exactly the case that used to make discovery find nothing at all.
+
+Only a physical ethernet or wireless adapter that is up, with a private IPv4
+address, is scanned. Loopback, `tun`/`tap`, `wg*`, `tailscale*`, `virbr*`,
+`vnet*`, `docker*`, `br-*` and `veth*` are excluded by name **and** by
+interface flags and hardware type. That exclusion is the point: a VPN peer, a
+libvirt guest or a container network is somebody else's machine, and this
+program has no business probing ports on it because you wanted to find your own
+phone.
+
+Each host gets **one second** to answer. That number is measured, not chosen.
+The probe budget used to be 0.12 s, and 0.12 s does not reliably find a phone:
+timing how long the development phone took to give a definitive TCP answer gave
+a median of 211 ms and a maximum of 335 ms over ten single probes, and 99-252 ms
+across six full `/24` sweeps. One of those sixteen measurements landed inside
+0.12 s. The phone was awake, on the same subnet, the whole time — the delay is
+Wi-Fi radio power saving, where the access point buffers a frame until the next
+beacon, so it is a property of every phone this is meant to find. At 0.12 s,
+whether the scan sees the phone is close to a coin toss, which reads from the
+outside as "it found it, then it lost it".
+
+One second is about three times the worst measurement and sits just under
+Linux's 1 s initial SYN retransmit, so a probe still costs exactly one SYN. The
+worker pool went from 32 to 128 to pay for it: a host that is not there burns
+the whole timeout, and a `/24` is almost entirely hosts that are not there. On
+this LAN a full `/24` sweep measures 0.97 s at the old 0.12 s / 32 workers,
+6.33 s at 1 s / 32 workers, and **2.02 s at the 1 s / 128 workers now shipped**
+— roughly one extra second of wall clock for an eight-fold wider answer window.
+
+The plan is inspectable before a single packet is sent, and overridable:
+
+```bash
+python -m acesvision --list-networks    # what would be scanned, and why not the rest
+python -m acesvision --scan-droidcam    # print the plan, then scan it
+
+python -m acesvision --scan-droidcam --scan-timeout 3   # slow or congested link
+python -m acesvision --scan-droidcam --scan-port 4848   # DroidCam moved in the app
+
+ACESVISION_SCAN_INTERFACES=wlp3s0 python -m acesvision --scan-droidcam
+ACESVISION_SCAN_NETWORKS=192.168.68.0/24 python -m acesvision --scan-droidcam
+```
+
+A scan that finds nothing now names the budget it was given, because "nothing
+answered" and "nothing answered *in time*" are different answers and the second
+one is fixable from the command line.
+
+The Sources page shows the same target above the Scan button. Neither override
+can widen the scan past a `/24` or reach a public network; both are refused with
+a message rather than quietly narrowed. If no interface qualifies, discovery
+says so — it does not return an empty list that reads like "no phone found".
 
 ## Setup (done already, for reference)
 
@@ -302,6 +426,8 @@ Green box = recognised (with confidence), red = Unknown.
 | `FACE_ID_W` / `FACE_ID_H` | camera | `1280x720` | Capture resolution; AcesVision defaults to the webcam's 30 FPS 720p MJPEG mode. |
 | `FACE_ID_FPS` | camera | `30` | Requested physical-camera frame rate. |
 | `ACESVISION_EXPOSURE` | AcesVision webcam | `166` | Starting value when manual exposure is selected; automatic exposure is the visible-image default. |
+| `ACESVISION_SCAN_INTERFACES` | DroidCam discovery | auto-detect | Comma-separated interface names to scan instead of the auto-detected LAN adapter, e.g. `wlp3s0`. A name this host does not have is refused, not ignored. |
+| `ACESVISION_SCAN_NETWORKS` | DroidCam discovery | from the interface | Comma-separated CIDRs to scan, e.g. `192.168.68.0/24`. Wins over everything. A public network or anything wider than a `/24` is refused. |
 | `FACE_ID_ENGINE` | both | `arcface` | `arcface`, `yunet`, `dlib` or `lbph`. An unrecognised name is refused, not silently ignored. |
 | `FACE_ID_ARCFACE_MODEL` | ArcFace | `w600k_r50` | `w600k_r50` (accurate) or `w600k_mbf` (2x faster, narrower margin) |
 | `FACE_ID_ARCFACE_THRESHOLD` | ArcFace | `0.503` | Minimum cosine similarity. **Higher = stricter** — the opposite direction to the dlib knob below. An override has no measured FAR. |
