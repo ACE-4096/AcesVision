@@ -6,13 +6,85 @@ and your child (or "Unknown").
 **AcesVision is the supported entry point.** The recognition engines live in
 `engine.py` and are selected with `FACE_ID_ENGINE`:
 
-| Engine | `FACE_ID_ENGINE` | What it is |
-|--------|------------------|-----------|
-| **YuNet** | `yunet` (default) | OpenCV DNN face detector. |
-| **dlib / face_recognition** | `dlib` | HOG detector + ResNet encoder. Most reliable, especially for telling a parent and child apart. |
-| **LBPH + Haar** | `lbph` | The **2015/2016 OpenCV** approach. Light, no GPU, trains instantly, but sensitive to lighting and pose. |
+| Engine | `FACE_ID_ENGINE` | What it is | Face stage | Score |
+|--------|------------------|-----------|-----------|-------|
+| **ArcFace** | `arcface` (default) | YuNet detector + ArcFace ONNX embedder, CPU. | **44 ms** | cosine similarity |
+| **YuNet** | `yunet` | YuNet detector + dlib ResNet encoder. The previous default. | 78 ms | Euclidean distance |
+| **dlib / face_recognition** | `dlib` | HOG/CNN detector + dlib ResNet encoder. | — | Euclidean distance |
+| **LBPH + Haar** | `lbph` | The **2015/2016 OpenCV** approach. Light, no GPU, trains instantly, but sensitive to lighting and pose. | — | chi-square |
 
-All three read the same enrolled photos from `known_faces/`.
+All four read the same enrolled photos from `known_faces/`. The dlib and LBPH
+engines are kept deliberately — they are the record of how this problem was
+solved before, they still work, and they are one environment variable away.
+
+### Why the recogniser changed, and not the detector
+
+The face stage cost **77.6 ms** at 640x480 and **65.9 ms of that — 85% — was
+the dlib encoder**. Detection was never the problem: YuNet finds a face in
+about 6 ms. So YuNet stays and only the embedder is replaced. Measured on this
+12-core host under normal working load (`load average ~8`), same frame, same
+process shape:
+
+| Engine | median | min | vs before |
+|--------|--------|-----|-----------|
+| `yunet` (dlib encoder) | 77.0 ms | 74.3 ms | baseline |
+| `arcface` w600k_r50 | 44.0 ms | 36.6 ms | **1.75x faster** |
+| `arcface` w600k_mbf | 21.6 ms | 15.7 ms | 3.6x faster |
+
+`w600k_r50` ships. `w600k_mbf` is faster still and also reaches FAR 0%, but
+with a 19% narrower separation gap (0.391 vs 0.480), and margin is what
+absorbs faces the calibration never saw.
+
+### The scores are not interchangeable
+
+This is the part worth reading twice. The old calibrated tolerance `0.50` is a
+dlib **Euclidean distance**, where *lower* is better and a threshold is a
+ceiling. ArcFace scores **cosine similarity**, where *higher* is better and a
+threshold is a floor. Reusing `0.50` across them would not be a slightly-wrong
+setting, it would accept essentially every stranger.
+
+So a threshold in `matching.py` is not a float — it is a value bound to a
+metric, carrying its measured false-accept rate. A score computed in one
+metric and compared against a threshold from another raises `MetricMismatch`
+rather than returning an answer. Each engine has its own entry and its own
+environment variable; there is no shared constant to reuse by accident.
+`engine.Face` carries a `metric` field for the same reason: `face.conf` cannot
+be read without it.
+
+| Engine | Threshold | Metric | Evidence |
+|--------|-----------|--------|----------|
+| `arcface` | `>= 0.503` | cosine similarity | LFW n=2500 impostors, FAR **0.00%**, clean gap [0.2634, 0.7435] |
+| `yunet` / `dlib` | `<= 0.50` | Euclidean distance | LFW n=2500, FAR 0%, clean gap [0.452, 0.500] (ticket a3c3c709) |
+| `lbph` | `<= 70` | chi-square | never calibrated, and says so |
+
+Re-derive any of these with `calibrate_threshold.py`, which downloads LFW
+itself:
+
+```bash
+python calibrate_threshold.py --engine arcface --arcface-model w600k_r50
+python calibrate_threshold.py --engine dlib
+```
+
+**What the ArcFace number does not establish.** The impostor side is well
+sampled (2500 LFW identities). The genuine side is 66 photos of one person
+under enrolment conditions, so "100% recall" describes that sample and is not
+a general accuracy claim. Live frames score lower than enrolment photos; if
+the enrolled person starts being missed, re-run the calibration against
+live-condition genuines rather than nudging the number down.
+
+### Everything runs on the CPU
+
+`onnxruntime-rocm` on this host reports `ROCMExecutionProvider` from
+`get_available_providers()` and then silently executes on the CPU, because
+`libhipblas.so.3` and `libamdhip64.so.7` are absent (host is ROCm 6.3.1, the
+wheel wants 7.x). That is the same "reports healthy, runs somewhere else"
+hazard `acesvision/yolo_worker.py` documents for GPU devices.
+
+`arcface.py` therefore never consults `get_available_providers()` — only
+`InferenceSession.get_providers()`, what the live session actually bound — and
+defaults to requesting the CPU and nothing else. Asking for a GPU provider is
+opt-in via `FACE_ID_ARCFACE_PROVIDERS` and raises if the session does not bind
+it.
 
 > **Retired 2026-08-15.** The standalone CLI demos `recognize.py`,
 > `lbph_recognize.py`, `obs_virtualcam.py` and `server.py` were removed. They
@@ -191,9 +263,9 @@ one clear face per image.)
 ## 2. Run recognition
 
 ```bash
-python -m acesvision.gui                       # YuNet (default)
-FACE_ID_ENGINE=dlib python -m acesvision.gui   # most accurate
-FACE_ID_ENGINE=lbph python -m acesvision.gui   # the 2016 approach
+python -m acesvision.gui                        # ArcFace (default)
+FACE_ID_ENGINE=yunet python -m acesvision.gui   # the previous dlib-encoder pipeline
+FACE_ID_ENGINE=lbph python -m acesvision.gui    # the 2016 approach
 ```
 
 Green box = recognised (with confidence), red = Unknown.
@@ -206,8 +278,13 @@ Green box = recognised (with confidence), red = Unknown.
 | `FACE_ID_W` / `FACE_ID_H` | camera | `1280x720` | Capture resolution; AcesVision defaults to the webcam's 30 FPS 720p MJPEG mode. |
 | `FACE_ID_FPS` | camera | `30` | Requested physical-camera frame rate. |
 | `ACESVISION_EXPOSURE` | AcesVision webcam | `166` | Starting value when manual exposure is selected; automatic exposure is the visible-image default. |
+| `FACE_ID_ENGINE` | both | `arcface` | `arcface`, `yunet`, `dlib` or `lbph`. An unrecognised name is refused, not silently ignored. |
+| `FACE_ID_ARCFACE_MODEL` | ArcFace | `w600k_r50` | `w600k_r50` (accurate) or `w600k_mbf` (2x faster, narrower margin) |
+| `FACE_ID_ARCFACE_THRESHOLD` | ArcFace | `0.503` | Minimum cosine similarity. **Higher = stricter** — the opposite direction to the dlib knob below. An override has no measured FAR. |
+| `FACE_ID_ARCFACE_THREADS` | ArcFace | half the cores, max 6 | ONNX intra-op threads. `0` hands the choice back to onnxruntime, which sizes it to every core and is measurably slower (48 ms vs 28 ms for r50 on 12 cores). |
+| `FACE_ID_ARCFACE_PROVIDERS` | ArcFace | `CPUExecutionProvider` | Comma-separated ONNX providers. Anything the session fails to bind raises. |
 | `FACE_ID_LBPH_THRESH` | LBPH | `70` | Max match distance. **Lower = stricter**, 0 = identical. (Your 2016 `10` almost never matched.) |
-| `FACE_ID_TOLERANCE` | dlib | `0.6` | Match strictness, **lower = stricter**. Try `0.5`. |
+| `FACE_ID_TOLERANCE` | dlib, yunet | `0.50` | Match strictness, **lower = stricter**. Does not reach ArcFace: `0.50` means opposite things to the two engines. |
 | `FACE_ID_MODEL` | dlib | `hog` | `hog` (CPU) or `cnn` (needs GPU, more robust) |
 | `FACE_ID_SCALE` | dlib | `0.25` | Detection downscale; smaller = faster |
 
@@ -248,9 +325,9 @@ printf 'options v4l2loopback video_nr=20 card_label="FaceID Cam" exclusive_caps=
 
 ```bash
 source .venv/bin/activate
-python -m acesvision --obs                     # YuNet (default)
-# or the more accurate engine:
-FACE_ID_ENGINE=dlib python -m acesvision --obs
+python -m acesvision --obs                      # ArcFace (default)
+# or the previous dlib-encoder pipeline:
+FACE_ID_ENGINE=yunet python -m acesvision --obs
 ```
 
 Enable the OBS output from the GUI's Outputs screen, or pass `--obs` to the
@@ -546,8 +623,31 @@ having it installed causes no harm.
 - `cv2.face` requires **opencv-contrib-python**, not plain `opencv-python`.
 - Biometric data (`known_faces/`) is gitignored — it never leaves this machine
   and is not committed to the repository.  If you lose it, re-run `enroll.py`.
-- Model binaries (`models/`) are also gitignored.  Re-download with:
+- Model binaries (`models/`) are also gitignored, and nothing here ever
+  downloads a model for you — the same rule `acesvision/perception.py` applies
+  to the YOLO weights. Fetch them once:
   ```bash
+  # YuNet detector — used by every engine except lbph
   curl -sL -o models/face_detection_yunet.onnx \
     https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx
+
+  # ArcFace recognisers, from the InsightFace release archives.
+  # buffalo_l carries w600k_r50 (the default); buffalo_s carries w600k_mbf.
+  curl -sL -o /tmp/buffalo_l.zip \
+    https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip
+  curl -sL -o /tmp/buffalo_s.zip \
+    https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_s.zip
+  unzip -jo /tmp/buffalo_l.zip w600k_r50.onnx -d models/
+  unzip -jo /tmp/buffalo_s.zip w600k_mbf.onnx -d models/
   ```
+  Verify what you got — these are the files this branch was calibrated against:
+  ```
+  8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4  models/face_detection_yunet.onnx
+  4c06341c33c2ca1f86781dab0e829f88ad5b64be9fba56e56bc9ebdefc619e43  models/w600k_r50.onnx
+  9cc6e4a75f0e2bf0b1aed94578f144d15175f357bdc05e815e5c4a02b319eb4f  models/w600k_mbf.onnx
+  ```
+- There is no cached encoding artifact — no `.npy`, `.pkl` or `.npz` anywhere.
+  The gallery is rebuilt from `known_faces/<Name>/*.jpg` at process start,
+  every time, and cached in memory under a key naming the embedding space it
+  came from. That is what makes switching engines free and what stops
+  embeddings from one model being compared against queries from another.
