@@ -146,6 +146,30 @@ shows capture FPS, inference FPS, latency, and the active model. See
 [`docs/ACESVISION_VALIDATION.md`](docs/ACESVISION_VALIDATION.md) for measured
 results and remaining security gates.
 
+### Perception stages
+
+The three stages — objects, faces, gestures — run in sequence on one inference
+cycle, so the cycle cost is their sum. **Models and Security** carries a panel
+that reports each stage's own measured cost and refresh rate, and lets you
+switch a stage off or retune its rate against the running loop. Nothing
+restarts: the setters mutate under the same lock the inference loop reads, and
+the loop picks the new configuration up on its next cycle. The same three knobs
+are available at start-up, on both entry points:
+
+```bash
+python -m acesvision.gui --detect-every 2 --face-hz 3 --gesture-hz 20
+python -m acesvision --detect-every 2
+```
+
+The panel warns, visibly, whenever the face stage is switched off, starved of
+refreshes, or starved indirectly by the object stage being switched off. That
+is not a politeness. Shush is only separable from `Pointing_Up` by a fingertip
+held near a *detected mouth*, so without a face box MediaPipe's own
+`Pointing_Up` label stands — and `automations.example.json` binds `Pointing_Up`
+to `ledctl next-theme`. Turning the face stage off does not drop a shush, it
+turns every shush into a lighting change. A control panel that put that one
+click away without saying so would be worse than no panel.
+
 The first YOLO/ROCm cold start takes roughly 9-10 seconds on this host. After
 warm-up the live RGB pipeline runs at **14.9 FPS**, and that ceiling is the
 camera, not the pipeline: the USB2.0 FHD UVC webcam advertises 30 FPS through
