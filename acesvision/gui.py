@@ -8,6 +8,7 @@ import threading
 import time
 from dataclasses import replace as dataclass_replace
 from pathlib import Path
+from urllib.parse import quote
 
 from PySide6.QtCore import Property, QObject, QTimer, Signal, Slot, QUrl
 from PySide6.QtGui import QGuiApplication
@@ -23,7 +24,7 @@ from .outputs import LatestFrameOutput, ObsVirtualCameraOutput
 from .overlay import MINIMAL, PROFILES, OverlayProfile
 from .pipeline import VisionPipeline
 from .policy import CONNECTORS, Rule, RuleEngine, RuleStore, known_actors
-from .preview import PreviewServer
+from .server import VisionServer, load_or_create_token
 from .processor import FaceGestureProcessor
 from .perception import file_sha256
 
@@ -189,8 +190,15 @@ class VisionBackend(QObject):
         )
         self.processor = processor
         self.pipeline = VisionPipeline(source, processor, [self.latest, self.gestures])
-        self.preview = PreviewServer(self.latest, self.pipeline, port=preview_port)
-        self.preview_url = f"http://127.0.0.1:{preview_port}/latest.jpg"
+        # The preview server carries a token now — /latest.jpg is live camera
+        # video and used to be readable by any process on the machine that could
+        # guess the port. The GUI is a local subscriber like any other and
+        # authenticates the same way.
+        token, _ = load_or_create_token()
+        self.preview = VisionServer(self.latest, self.pipeline,
+                                    port=preview_port, token=token)
+        self.preview_url = (f"http://127.0.0.1:{preview_port}/latest.jpg"
+                            f"?token={quote(token)}")
 
         self.gestureFromWorker.connect(self._set_gesture)
         self.droidScanFinished.connect(self._apply_droid_scan)
@@ -434,7 +442,9 @@ class VisionBackend(QObject):
 
     @Property(str, notify=previewChanged)
     def previewSource(self):
-        return f"{self.preview_url}?t={self._preview_tick}"
+        # preview_url already carries the token in its query string, so the
+        # cache-buster joins with '&'. Main.qml then appends "&retry=".
+        return f"{self.preview_url}&t={self._preview_tick}"
 
     @Property(bool, notify=previewStaleChanged)
     def previewStale(self):
