@@ -531,9 +531,46 @@ def local_scan_networks(addresses=None, **planning):
     return list(plan.networks)
 
 
-def scan_droidcam(networks=None, port=4747, timeout_s=0.12,
-                  connector=socket.create_connection, max_workers=32,
-                  deadline_s=30.0):
+# DroidCam's default listening port. Configurable in the phone app, so it is a
+# default here rather than a constant in a format string.
+DROIDCAM_PORT = 4747
+
+# How long one probe waits for a phone to say anything at all — accept or
+# refuse. This was 0.12 s, and 0.12 s does not find a phone on Wi-Fi.
+#
+# Measured against the development phone on this LAN, timing how long a
+# *definitive* TCP answer took to come back:
+#
+#     ten probes, one at a time      median 211 ms   max 335 ms   min 2.3 ms
+#     six full /24 sweeps            99, 113, 125, 145, 161, 252 ms
+#
+# One of those sixteen measurements came back inside 120 ms. The phone was
+# awake and on the same subnet the whole time; the delay is its Wi-Fi radio
+# power-saving, where the access point buffers the frame until the next beacon
+# and a first contact costs a beacon interval or several. The 2.3 ms readings
+# are the radio still being awake from the probe immediately before.
+#
+# That is the whole "finds the device, then loses it" symptom: at 0.12 s
+# whether discovery sees the phone is close to a coin toss, and which call site
+# ran is coincidence. One second is roughly three times the worst measurement,
+# and sits just under Linux's 1 s initial SYN retransmit timer, so a probe
+# still costs exactly one SYN. Going past 1 s buys a retransmit and doubles the
+# floor for dead hosts, and on a /24 nearly every host is a dead host.
+DEFAULT_PROBE_TIMEOUT_S = 1.0
+
+# Raised with the timeout, and for its sake. A sweep costs roughly
+# ceil(non-answering hosts / workers) x timeout, because a host that is not
+# there burns the full timeout and a /24 is almost entirely hosts that are not
+# there. At 32 workers a 1 s timeout would take a /24 from ~1 s to ~8 s. These
+# threads are blocked in connect(), not working, so widening the batch is cheap
+# and keeps the sweep near its single-probe cost.
+DEFAULT_SCAN_WORKERS = 128
+
+
+def scan_droidcam(networks=None, port=DROIDCAM_PORT,
+                  timeout_s=DEFAULT_PROBE_TIMEOUT_S,
+                  connector=socket.create_connection,
+                  max_workers=DEFAULT_SCAN_WORKERS, deadline_s=30.0):
     """Find hosts accepting DroidCam's default TCP port on private local /24s.
 
     Bounded three ways: only private IPv4 networks, never wider than a /24, and

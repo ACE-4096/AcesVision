@@ -6,6 +6,7 @@ import inspect
 import ipaddress
 import json
 import os
+import socket
 import stat
 import struct
 import sys
@@ -62,6 +63,8 @@ from acesvision.server import (
     token_matches,
 )
 from acesvision.discovery import (
+    DEFAULT_PROBE_TIMEOUT_S,
+    DROIDCAM_PORT,
     SCAN_INTERFACES_ENV,
     SCAN_NETWORKS_ENV,
     DroidCamDevice,
@@ -543,7 +546,8 @@ class NetworkReportCliTests(unittest.TestCase):
     def test_scanning_probes_only_the_planned_networks(self):
         scanned = []
 
-        def scanner(networks):
+        def scanner(networks, port=DROIDCAM_PORT,
+                    timeout_s=DEFAULT_PROBE_TIMEOUT_S):
             scanned.append(list(networks))
             return [DroidCamDevice("192.168.68.31", 4747,
                                    "http://192.168.68.31:4747/video", "phone")]
@@ -553,6 +557,37 @@ class NetworkReportCliTests(unittest.TestCase):
         self.assertEqual([str(network) for network in scanned[0]],
                          ["192.168.68.0/24"])
         self.assertIn("http://192.168.68.31:4747/video", text)
+
+    def test_the_probe_budget_reaches_the_scanner(self):
+        """--scan-timeout and --scan-port are settings, not decoration.
+
+        The scan that lost the phone was a scan whose probe budget nothing
+        could reach. A flag that parses but never arrives is the same bug.
+        """
+        seen = {}
+
+        def scanner(networks, port, timeout_s):
+            seen.update(port=port, timeout_s=timeout_s)
+            return []
+
+        code, text = self.report(scan=True, scanner=scanner, timeout_s=2.5,
+                                 port=4848)
+        self.assertEqual(code, 0)
+        self.assertEqual(seen, {"port": 4848, "timeout_s": 2.5})
+        # An empty result names the budget it was given, so "nothing answered"
+        # can be told apart from "nothing answered in time".
+        self.assertIn("within 2.5s per host", text)
+        self.assertIn("--scan-timeout 5", text)
+
+    def test_the_probe_budget_flags_default_to_the_measured_values(self):
+        from acesvision.__main__ import build_parser
+
+        args = build_parser().parse_args([])
+        self.assertEqual(args.scan_timeout, DEFAULT_PROBE_TIMEOUT_S)
+        self.assertEqual(args.scan_port, DROIDCAM_PORT)
+        args = build_parser().parse_args(["--scan-timeout", "3", "--scan-port",
+                                          "5000"])
+        self.assertEqual((args.scan_timeout, args.scan_port), (3.0, 5000))
 
     def test_nothing_to_scan_exits_nonzero_and_says_so(self):
         code, text = self.report(planner=ScanPlan)
@@ -566,6 +601,129 @@ class NetworkReportCliTests(unittest.TestCase):
         code, text = self.report(planner=planner)
         self.assertEqual(code, 2)
         self.assertIn("wider", text)
+
+
+class DroidCamCliEndToEndTests(unittest.TestCase):
+    """`--scan-droidcam` from argv to stdout, over a real socket.
+
+    Every earlier DroidCam test called ``scan_droidcam`` directly with an
+    injected connector. That is the mockable half, and it has now hidden two
+    faults in a row: first an acquisition step no test ever ran, then a probe
+    timeout no test ever timed. Both were reported as "the Sources page finds
+    nothing", and both passed 491 tests on the way out.
+
+    So this drives the real entry point — ``main()``, real ``sys.argv``, real
+    ``socket.create_connection`` — against a listener that is really
+    listening. The only injected thing is *which* network to scan, because a
+    test may not scan somebody's LAN, and that choice is what the scan-plan
+    tests above already cover on their own.
+    """
+
+    def listener(self):
+        """A real TCP listener on loopback. Returns its port."""
+        server = socket.socket()
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", 0))
+        server.listen(8)
+        self.addCleanup(server.close)
+        stop = threading.Event()
+        self.addCleanup(stop.set)
+
+        def accept_loop():
+            server.settimeout(0.1)
+            while not stop.is_set():
+                try:
+                    server.accept()[0].close()
+                except (TimeoutError, OSError):
+                    continue
+
+        thread = threading.Thread(target=accept_loop, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 2.0)
+        return server.getsockname()[1]
+
+    def run_cli(self, *argv):
+        import contextlib
+        import io
+
+        from acesvision.__main__ import main
+
+        plan = ScanPlan(networks=(ipaddress.ip_network("127.0.0.1/32"),),
+                        selected=(NetworkInterface("test0", "127.0.0.1",
+                                                   "255.255.255.255"),))
+        out = io.StringIO()
+        with patch("acesvision.__main__.scan_plan", lambda: plan), \
+                patch.object(sys, "argv", ["acesvision", *argv]), \
+                contextlib.redirect_stdout(out):
+            with self.assertRaises(SystemExit) as exit_code:
+                main()
+        return exit_code.exception.code, out.getvalue()
+
+    def test_a_listening_host_survives_the_whole_cli_path(self):
+        port = self.listener()
+        code, text = self.run_cli("--scan-droidcam", "--scan-port", str(port),
+                                  "--scan-timeout", "2")
+        self.assertEqual(code, 0)
+        self.assertIn(f"http://127.0.0.1:{port}/video", text)
+        self.assertNotIn("nothing answered", text)
+
+    def test_a_silent_host_is_reported_as_silent_with_its_budget(self):
+        # Port 1 on loopback: nothing is there, and the kernel refuses at once.
+        code, text = self.run_cli("--scan-droidcam", "--scan-port", "1",
+                                  "--scan-timeout", "2")
+        self.assertEqual(code, 0)
+        self.assertIn("nothing answered on port 1", text)
+        self.assertIn("within 2s per host", text)
+
+    def test_listing_alone_opens_no_socket(self):
+        port = self.listener()
+        code, text = self.run_cli("--list-networks", "--scan-port", str(port))
+        self.assertEqual(code, 0)
+        self.assertIn("127.0.0.1/32", text)
+        self.assertNotIn("[droidcam]", text)
+
+
+class ProbeBudgetTests(unittest.TestCase):
+    """The probe timeout, sized against a real phone rather than a guess.
+
+    Measured on the development LAN, timing how long the phone took to give a
+    *definitive* TCP answer: ten single probes came back at a median of 211 ms
+    and a maximum of 335 ms, and six full /24 sweeps at 99-252 ms. One of those
+    sixteen measurements was inside the old 0.12 s budget. The delay is Wi-Fi
+    radio power-saving, not distance and not load, so it is a property of every
+    phone this program is meant to find.
+    """
+
+    def slow_connector(self, delay_s):
+        """A connector with a real socket's timeout semantics.
+
+        It answers after ``delay_s`` — unless that would overrun the timeout it
+        was handed, which is precisely what a socket does and precisely what
+        the old 0.12 s budget kept triggering.
+        """
+        def connector(address, timeout):
+            if delay_s > timeout:
+                raise TimeoutError("timed out")
+            time.sleep(delay_s)
+            return Mock(close=Mock())
+        return connector
+
+    def test_the_default_budget_tolerates_a_phone_that_is_waking_its_radio(self):
+        found = scan_droidcam(["192.168.68.0/30"],
+                              connector=self.slow_connector(0.335))
+        self.assertEqual([device.host for device in found],
+                         ["192.168.68.1", "192.168.68.2"])
+
+    def test_the_old_budget_is_what_lost_that_phone(self):
+        """The red half of the fix, kept as the reason the default moved."""
+        found = scan_droidcam(["192.168.68.0/30"], timeout_s=0.12,
+                              connector=self.slow_connector(0.335))
+        self.assertEqual(found, [])
+
+    def test_the_default_is_not_quietly_narrowed_again(self):
+        self.assertGreaterEqual(DEFAULT_PROBE_TIMEOUT_S, 0.5)
+        # Just under Linux's 1 s initial SYN retransmit: one SYN per probe.
+        self.assertLessEqual(DEFAULT_PROBE_TIMEOUT_S, 1.0)
 
 
 class OverlayTests(unittest.TestCase):
@@ -3331,6 +3489,77 @@ class GuiDroidCamScanTests(unittest.TestCase):
             {"devices": [], "networks": ["192.168.68.0/24"]}))
         self.assertIn("192.168.68.0/24", backend.droidScanStatus)
         self.assertIn("nothing answered", backend.droidScanStatus)
+
+    def test_a_real_listener_reaches_the_sources_page(self):
+        """The Sources page button, over a real socket, with nothing mocked
+        but the choice of network.
+
+        This is the click the operator actually makes, and it is a second call
+        site: the CLI passes the plan's network objects, the GUI passes their
+        strings, and neither had ever been run against something that was
+        really listening. It shares one probe budget with the CLI, so it also
+        pins that the GUI does not quietly carry a narrower one.
+        """
+        server = socket.socket()
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            server.bind(("127.0.0.1", DROIDCAM_PORT))
+        except OSError:
+            server.close()
+            self.skipTest(f"port {DROIDCAM_PORT} is in use on this host")
+        server.listen(8)
+        self.addCleanup(server.close)
+        stop = threading.Event()
+        self.addCleanup(stop.set)
+
+        def accept_loop():
+            server.settimeout(0.1)
+            while not stop.is_set():
+                try:
+                    server.accept()[0].close()
+                except (TimeoutError, OSError):
+                    continue
+
+        thread = threading.Thread(target=accept_loop, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 2.0)
+
+        backend = gui_backend()
+        finished = threading.Event()
+        calls, results = [], []
+
+        def observed(*args, **kwargs):
+            # A passthrough, not a stub: the real scan runs, over the real
+            # socket, with exactly the arguments the GUI chose. Observing here
+            # rather than on droidScanFinished is how the sibling tests do it,
+            # because a cross-thread Qt signal needs an event loop to arrive.
+            calls.append((args, kwargs))
+            try:
+                results.extend(scan_droidcam(*args, **kwargs))
+            finally:
+                finished.set()
+            return list(results)
+
+        plan = ScanPlan(networks=(ipaddress.ip_network("127.0.0.1/32"),))
+        with patch("acesvision.gui.scan_plan", return_value=plan), \
+                patch("acesvision.gui.scan_droidcam", observed):
+            backend.scanDroidCams()
+            self.assertTrue(finished.wait(15), "the scan never came back")
+
+        self.assertEqual([device.url for device in results],
+                         [f"http://127.0.0.1:{DROIDCAM_PORT}/video"])
+        # No probe budget of its own: the GUI and the CLI share one default, so
+        # a fix to that default cannot reach one page and miss the other.
+        self.assertNotIn("timeout_s", calls[0][1])
+        self.assertEqual(len(calls[0][0]), 1)
+
+        backend._apply_droid_scan(json.dumps({
+            "devices": [device.as_dict() for device in results],
+            "networks": ["127.0.0.1/32"],
+        }))
+        self.assertEqual([device["url"] for device in backend.droidCams],
+                         [f"http://127.0.0.1:{DROIDCAM_PORT}/video"])
+        self.assertIn("Found 1", backend.droidScanStatus)
 
 
 class GuiPreviewFreshnessTests(unittest.TestCase):

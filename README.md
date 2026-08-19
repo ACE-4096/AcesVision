@@ -281,15 +281,41 @@ libvirt guest or a container network is somebody else's machine, and this
 program has no business probing ports on it because you wanted to find your own
 phone.
 
+Each host gets **one second** to answer. That number is measured, not chosen.
+The probe budget used to be 0.12 s, and 0.12 s does not reliably find a phone:
+timing how long the development phone took to give a definitive TCP answer gave
+a median of 211 ms and a maximum of 335 ms over ten single probes, and 99-252 ms
+across six full `/24` sweeps. One of those sixteen measurements landed inside
+0.12 s. The phone was awake, on the same subnet, the whole time — the delay is
+Wi-Fi radio power saving, where the access point buffers a frame until the next
+beacon, so it is a property of every phone this is meant to find. At 0.12 s,
+whether the scan sees the phone is close to a coin toss, which reads from the
+outside as "it found it, then it lost it".
+
+One second is about three times the worst measurement and sits just under
+Linux's 1 s initial SYN retransmit, so a probe still costs exactly one SYN. The
+worker pool went from 32 to 128 to pay for it: a host that is not there burns
+the whole timeout, and a `/24` is almost entirely hosts that are not there. On
+this LAN a full `/24` sweep measures 0.97 s at the old 0.12 s / 32 workers,
+6.33 s at 1 s / 32 workers, and **2.02 s at the 1 s / 128 workers now shipped**
+— roughly one extra second of wall clock for an eight-fold wider answer window.
+
 The plan is inspectable before a single packet is sent, and overridable:
 
 ```bash
 python -m acesvision --list-networks    # what would be scanned, and why not the rest
 python -m acesvision --scan-droidcam    # print the plan, then scan it
 
+python -m acesvision --scan-droidcam --scan-timeout 3   # slow or congested link
+python -m acesvision --scan-droidcam --scan-port 4848   # DroidCam moved in the app
+
 ACESVISION_SCAN_INTERFACES=wlp3s0 python -m acesvision --scan-droidcam
 ACESVISION_SCAN_NETWORKS=192.168.68.0/24 python -m acesvision --scan-droidcam
 ```
+
+A scan that finds nothing now names the budget it was given, because "nothing
+answered" and "nothing answered *in time*" are different answers and the second
+one is fixable from the command line.
 
 The Sources page shows the same target above the Scan button. Neither override
 can widen the scan past a `/24` or reach a public network; both are refused with
