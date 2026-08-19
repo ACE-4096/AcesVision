@@ -1,0 +1,14 @@
+{
+  "catalog_version": 1,
+  "gestures": [
+    {"id": "Closed_Fist", "label": "Closed fist", "builtin": true},
+    {"id": "Open_Palm", "label": "Open palm", "builtin": true},
+    {"id": "Pointing_Up", "label": "Pointing up", "builtin": true},
+    {"id": "Thumb_Up", "label": "Thumb up", "builtin": true},
+    {"id": "Thumb_Down", "label": "Thumb down", "builtin": true},
+    {"id": "Victory", "label": "Victory", "builtin": true},
+    {"id": "ILoveYou", "label": "I love you", "builtin": true},
+    {"id": "Middle_Finger", "label": "Middle finger", "builtin": false},
+    {"id": "Shush", "label": "Shush (finger to lips)", "builtin": false}
+  ]
+}

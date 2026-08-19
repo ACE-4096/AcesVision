@@ -1,4 +1,5 @@
 import errno
+import hashlib
 import json
 import os
 import struct
@@ -18,6 +19,14 @@ import camera
 import gesture_catalog
 import verify_gestures_live as verify
 from acesvision import connectors
+from acesvision.catalog import (
+    CATALOG,
+    CatalogError,
+    GestureCatalog,
+    canonical_json,
+    catalog_sha256,
+    load_catalog,
+)
 from acesvision.contracts import SceneFrame, SourceSpec
 from acesvision.discovery import (
     WebcamDevice,
@@ -3120,6 +3129,196 @@ class QmlTeardownTests(unittest.TestCase):
         self.assertNotIn("of null", completed.stderr)
         self.assertNotIn("TypeError", completed.stderr)
         self.assertEqual(completed.stderr.strip(), "")
+
+
+# ---------------------------------------------------------------------------
+# The gesture catalog as data — gestures.json, its version, and its content hash.
+# ---------------------------------------------------------------------------
+
+
+#: Every catalog version this repo has ever published, and the sha256 of its
+#: canonical serialisation. This is the canary: editing gestures.json changes the
+#: hash, and the only way to make this table agree again is to bump
+#: catalog_version and add a row. An edit that forgets the bump fails here,
+#: which is the whole point — a subscriber pinned to version 1 must never be
+#: handed a different version-1 vocabulary.
+CATALOG_HASHES = {
+    1: "e1243aea83118534ba92ae915bafb74101fbc446fab4d055737a731841709a13",
+}
+
+
+class GestureCatalogFileTests(unittest.TestCase):
+    def test_the_shipped_catalog_matches_its_pinned_hash(self):
+        self.assertIn(
+            CATALOG.version, CATALOG_HASHES,
+            "gestures.json declares catalog_version "
+            f"{CATALOG.version}, which has no pinned hash. Add it to "
+            "CATALOG_HASHES.")
+        self.assertEqual(
+            CATALOG.sha256, CATALOG_HASHES[CATALOG.version],
+            "gestures.json changed but catalog_version is still "
+            f"{CATALOG.version}. Bump the version and pin the new hash.")
+
+    def test_the_catalog_holds_exactly_the_nine_known_gestures(self):
+        self.assertEqual(
+            CATALOG.ids,
+            ("Closed_Fist", "Open_Palm", "Pointing_Up", "Thumb_Up",
+             "Thumb_Down", "Victory", "ILoveYou", "Middle_Finger", "Shush"))
+        builtins = [spec.id for spec in CATALOG.gestures if spec.builtin]
+        self.assertEqual(len(builtins), 7)            # the MediaPipe labels
+        self.assertEqual([spec.id for spec in CATALOG.gestures if not spec.builtin],
+                         ["Middle_Finger", "Shush"])  # the landmark poses
+
+    def test_the_hash_describes_content_not_formatting(self):
+        """Reformatting the file must not move the hash; a real edit must."""
+        document = CATALOG.as_document()
+        reordered = {
+            "gestures": [dict(reversed(list(entry.items())))
+                         for entry in document["gestures"]],
+            "catalog_version": document["catalog_version"],
+        }
+        self.assertEqual(catalog_sha256(reordered), CATALOG.sha256)
+
+        added = CATALOG.as_document()
+        added["gestures"].append({"id": "Wave", "label": "Wave", "builtin": True})
+        self.assertNotEqual(catalog_sha256(added), CATALOG.sha256)
+
+    def test_a_subscriber_can_recompute_the_hash_from_the_served_payload(self):
+        """The wire contract: strip 'sha256', canonicalise, hash, compare."""
+        payload = CATALOG.as_payload()
+        served_hash = payload.pop("sha256")
+        recomputed = hashlib.sha256(
+            canonical_json(payload).encode("utf-8")).hexdigest()
+        self.assertEqual(recomputed, served_hash)
+        self.assertEqual(recomputed, CATALOG.sha256)
+
+    def test_the_file_on_disk_is_what_the_module_loaded(self):
+        root = Path(__file__).resolve().parent
+        on_disk = json.loads((root / "gestures.json").read_text())
+        self.assertEqual(on_disk, CATALOG.as_document())
+
+
+class GestureCatalogValidationTests(unittest.TestCase):
+    """A vocabulary two processes could read differently is refused outright."""
+
+    def good(self, **overrides):
+        document = {
+            "catalog_version": 1,
+            "gestures": [{"id": "Open_Palm", "label": "Open palm",
+                          "builtin": True}],
+        }
+        document.update(overrides)
+        return document
+
+    def assert_rejected(self, document, fragment):
+        with self.assertRaises(CatalogError) as caught:
+            GestureCatalog(document, origin="probe.json")
+        self.assertIn(fragment, str(caught.exception))
+
+    def test_a_valid_catalog_loads(self):
+        catalog = GestureCatalog(self.good(), origin="probe.json")
+        self.assertEqual(catalog.ids, ("Open_Palm",))
+        self.assertEqual(catalog.version, 1)
+
+    def test_version_must_be_a_positive_integer(self):
+        for bad in (0, -1, "1", 1.0, None, True):
+            self.assert_rejected(self.good(catalog_version=bad),
+                                 "'catalog_version' must be an integer >= 1")
+
+    def test_gestures_must_be_a_non_empty_array(self):
+        self.assert_rejected(self.good(gestures=[]), "non-empty array")
+        self.assert_rejected(self.good(gestures={}), "non-empty array")
+
+    def test_every_field_is_required_and_typed(self):
+        self.assert_rejected(self.good(gestures=[{"id": "A", "label": "A"}]),
+                             "is missing builtin")
+        self.assert_rejected(
+            self.good(gestures=[{"id": "", "label": "A", "builtin": True}]),
+            "non-string or empty 'id'")
+        self.assert_rejected(
+            self.good(gestures=[{"id": "A", "label": "A", "builtin": "yes"}]),
+            "non-boolean 'builtin'")
+        self.assert_rejected(self.good(gestures=["Open_Palm"]),
+                             "must be an object")
+
+    def test_ids_that_fold_together_are_a_collision(self):
+        """'open_palm' and 'Open_Palm' are one gesture wearing two hats: names
+        are matched ignoring case and separators, so normalisation would pick
+        between them arbitrarily."""
+        self.assert_rejected(
+            self.good(gestures=[
+                {"id": "Open_Palm", "label": "Open palm", "builtin": True},
+                {"id": "open palm", "label": "Open palm again", "builtin": True},
+            ]),
+            "collides with 'Open_Palm'")
+
+    def test_a_missing_or_unparsable_file_names_itself(self):
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "nope.json"
+            with self.assertRaises(CatalogError) as caught:
+                load_catalog(missing)
+            self.assertIn("nope.json", str(caught.exception))
+
+            broken = Path(directory) / "broken.json"
+            broken.write_text("{not json")
+            with self.assertRaises(CatalogError) as caught:
+                load_catalog(broken)
+            self.assertIn("not valid JSON", str(caught.exception))
+
+    def test_catalog_error_is_a_value_error(self):
+        # Callers already catch ValueError around vocabulary loading.
+        self.assertTrue(issubclass(CatalogError, ValueError))
+
+
+class GestureCatalogReexportTests(unittest.TestCase):
+    """gesture_catalog kept its whole public surface when the data moved out."""
+
+    def test_the_vocabulary_functions_are_the_catalog_object(self):
+        # Bound methods of the one loaded catalog, not a second copy of the
+        # name-folding rule. (Bound methods compare equal, never identical.)
+        self.assertEqual(gesture_catalog.normalise_gesture, CATALOG.normalise)
+        self.assertEqual(gesture_catalog.require_gesture, CATALOG.require)
+        self.assertIs(gesture_catalog.GESTURES, CATALOG.gestures)
+        self.assertIs(gesture_catalog.GESTURE_IDS, CATALOG.ids)
+
+    def test_catalog_json_now_carries_the_version_and_hash(self):
+        payload = gesture_catalog.catalog_json()
+        self.assertEqual(payload["catalog_version"], CATALOG.version)
+        self.assertEqual(payload["catalog_sha256"], CATALOG.sha256)
+        self.assertEqual([entry["id"] for entry in payload["gestures"]],
+                         list(CATALOG.ids))
+        self.assertEqual(len(payload["actions"]), 16)
+
+    def test_the_landmark_geometry_stayed_behind(self):
+        # Real perception code, not vocabulary — it must not have moved.
+        for name in ("is_middle_finger", "is_shush", "fingertip_near_mouth",
+                     "MOUTH_CENTRE_Y", "MOUTH_RADIUS"):
+            self.assertTrue(hasattr(gesture_catalog, name), name)
+        self.assertTrue(gesture_catalog.is_middle_finger(hand_landmarks(["middle"])))
+
+    def test_importing_the_vocabulary_does_not_import_opencv(self):
+        """gesture_catalog promises no cv2. Loading the vocabulary through the
+        acesvision package must not quietly break that promise — which it would
+        if acesvision/__init__ imported the capture pipeline eagerly."""
+        import subprocess
+
+        probe = ("import sys, gesture_catalog, acesvision.catalog;"
+                 "print(sorted(m for m in ('cv2', 'mediapipe', 'PySide6')"
+                 " if m in sys.modules))")
+        completed = subprocess.run([sys.executable, "-c", probe],
+                                   cwd=str(Path(__file__).parent),
+                                   capture_output=True, text=True, timeout=120)
+        self.assertEqual(completed.returncode, 0, completed.stderr[-2000:])
+        self.assertEqual(completed.stdout.strip(), "[]")
+
+    def test_the_lazy_package_export_still_resolves(self):
+        import acesvision
+
+        from acesvision.pipeline import VisionPipeline as direct
+
+        self.assertIs(acesvision.VisionPipeline, direct)
+        with self.assertRaises(AttributeError):
+            acesvision.NoSuchThing
 
 
 if __name__ == "__main__":
