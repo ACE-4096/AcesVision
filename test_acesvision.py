@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import http.client
 import inspect
+import ipaddress
 import json
 import os
 import stat
@@ -61,12 +62,22 @@ from acesvision.server import (
     token_matches,
 )
 from acesvision.discovery import (
+    SCAN_INTERFACES_ENV,
+    SCAN_NETWORKS_ENV,
+    DroidCamDevice,
+    NetworkInterface,
+    NoScannableNetwork,
+    ScanPlan,
     WebcamDevice,
     _stable_v4l_path,
     discover_webcams,
+    interface_exclusion_reason,
     local_scan_networks,
+    parse_scan_networks,
     preferred_webcam,
+    read_interface_table,
     scan_droidcam,
+    scan_plan,
 )
 from acesvision.outputs import CallbackOutput
 from acesvision.overlay import CLEAN, OverlayProfile, render
@@ -230,6 +241,331 @@ class DiscoveryTests(unittest.TestCase):
         connector = Mock()
         self.assertEqual(scan_droidcam(["192.168.0.0/16"], connector=connector), [])
         connector.assert_not_called()
+
+    def test_droidcam_scan_stops_at_its_deadline(self):
+        """A blocked probe must not hold the GUI's scan open forever."""
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def connector(address, timeout):
+            release.wait(30)
+            raise ConnectionRefusedError
+
+        started = time.monotonic()
+        found = scan_droidcam(["192.168.68.0/29"], connector=connector,
+                              max_workers=2, deadline_s=0.1)
+        self.assertEqual(found, [])
+        self.assertLess(time.monotonic() - started, 5.0)
+
+
+# The interface table of the development host, verbatim, as /sys/class/net and
+# SIOCGIFADDR report it: one real LAN, two VPNs, two libvirt guest networks and
+# two docker networks. Auto-discovery must pick exactly one of the seven.
+# Scanning any of the other six would mean port-scanning VPN peers, virtual
+# machines and containers that never asked to be probed.
+HOST_INTERFACES = (
+    # name, ARP type, flags, operstate, physical, wireless, address, netmask
+    ("br-1f526b924fe3", 1, 0x1003, "up", False, False,
+     "172.18.0.1", "255.255.0.0"),
+    ("docker0", 1, 0x1003, "down", False, False, "172.17.0.1", "255.255.0.0"),
+    ("enp8s0", 1, 0x1003, "up", True, False, "192.168.68.107", "255.255.255.0"),
+    ("tailscale0", 65534, 0x1091, "unknown", False, False,
+     "100.114.53.112", "255.255.255.255"),
+    ("tun0", 65534, 0x1091, "unknown", False, False, "10.8.0.1", "255.255.255.0"),
+    ("virbr-acesops", 1, 0x1003, "up", False, False,
+     "10.171.71.1", "255.255.255.0"),
+    ("virbr0", 1, 0x1003, "up", False, False, "192.168.122.1", "255.255.255.0"),
+)
+
+
+class InterfaceAcquisitionTests(unittest.TestCase):
+    """The half of discovery that talks to the OS, which had no coverage at all.
+
+    Every earlier test injected ``addresses=`` and so exercised the filtering
+    rules only. The acquisition path — the part that decides *which* addresses
+    those are — was ``getaddrinfo(gethostname())``, returned 127.0.1.1 on any
+    Debian or Ubuntu host, and therefore found nothing, ever. These tests run
+    that half against a fake interface table instead of a real kernel.
+    """
+
+    def fake_net(self, entries=HOST_INTERFACES):
+        """A /sys/class/net tree plus the matching address lookup."""
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        # The hardware target lives outside the tree: /sys/class/net holds
+        # interfaces and nothing else.
+        root = Path(directory.name) / "net"
+        root.mkdir()
+        hardware = Path(directory.name) / "pci0000:00"
+        hardware.mkdir()
+        addresses = {}
+        for (name, arp, flags, operstate, physical, wireless,
+             address, netmask) in entries:
+            node = root / name
+            node.mkdir()
+            (node / "type").write_text(f"{arp}\n")
+            (node / "flags").write_text(f"{flags:#x}\n")
+            (node / "operstate").write_text(f"{operstate}\n")
+            if physical:
+                # The kernel puts a symlink to the backing PCI/USB device here.
+                # Bridges, tunnels and veth pairs have none.
+                (node / "device").symlink_to(hardware)
+            if wireless:
+                (node / "wireless").mkdir()
+            addresses[name] = (address, netmask)
+        return root, (lambda name: addresses.get(name, (None, None)))
+
+    def plan(self, entries=HOST_INTERFACES, env=None):
+        root, lookup = self.fake_net(entries)
+        return scan_plan(sysfs=root, address_lookup=lookup,
+                         env={} if env is None else env)
+
+    def test_only_the_real_lan_is_selected_from_a_real_interface_table(self):
+        plan = self.plan()
+        self.assertEqual([interface.name for interface in plan.selected],
+                         ["enp8s0"])
+        self.assertEqual([str(network) for network in plan.networks],
+                         ["192.168.68.0/24"])
+
+    def test_every_vpn_container_and_hypervisor_network_is_skipped_with_a_reason(self):
+        plan = self.plan()
+        skipped = dict(plan.excluded)
+        self.assertEqual(sorted(skipped), [
+            "br-1f526b924fe3", "docker0", "tailscale0", "tun0",
+            "virbr-acesops", "virbr0",
+        ])
+        self.assertIn("container network", skipped["docker0"])
+        self.assertIn("container network", skipped["br-1f526b924fe3"])
+        self.assertIn("VPN overlay", skipped["tailscale0"])
+        self.assertIn("tunnel", skipped["tun0"])
+        self.assertIn("hypervisor guest network", skipped["virbr0"])
+        self.assertIn("hypervisor guest network", skipped["virbr-acesops"])
+
+    def test_local_scan_networks_asks_the_interfaces_not_the_hostname(self):
+        """The reproducer. /etc/hosts maps the hostname to 127.0.1.1 here."""
+        root, lookup = self.fake_net()
+        with patch("acesvision.discovery.socket.getaddrinfo",
+                   side_effect=AssertionError("hostname resolution consulted")), \
+                patch("acesvision.discovery.socket.gethostname",
+                      side_effect=AssertionError("hostname consulted")):
+            networks = local_scan_networks(sysfs=root, address_lookup=lookup,
+                                           env={})
+        self.assertEqual([str(network) for network in networks],
+                         ["192.168.68.0/24"])
+
+    def test_a_wireless_interface_is_selected(self):
+        wireless = (("wlp3s0", 1, 0x1003, "up", True, True,
+                     "192.168.1.50", "255.255.255.0"),)
+        plan = self.plan(HOST_INTERFACES + wireless)
+        self.assertEqual([interface.name for interface in plan.selected],
+                         ["enp8s0", "wlp3s0"])
+        self.assertEqual([interface.kind for interface in plan.selected],
+                         ["ethernet", "wireless"])
+        self.assertIn(ipaddress.ip_network("192.168.1.0/24"), plan.networks)
+
+    def test_a_wide_prefix_is_capped_to_a_24_never_swept(self):
+        wide = (("eno1", 1, 0x1003, "up", True, False,
+                 "172.20.5.9", "255.255.0.0"),)
+        plan = self.plan(wide)
+        self.assertEqual([str(network) for network in plan.networks],
+                         ["172.20.5.0/24"])
+        self.assertEqual(plan.networks[0].num_addresses, 256)
+
+    def test_a_prefix_narrower_than_a_24_is_honoured_as_it_stands(self):
+        narrow = (("eno1", 1, 0x1003, "up", True, False,
+                   "192.168.9.70", "255.255.255.192"),)
+        plan = self.plan(narrow)
+        self.assertEqual([str(network) for network in plan.networks],
+                         ["192.168.9.64/26"])
+
+    def test_a_public_address_on_a_physical_interface_is_never_returned(self):
+        public = (("eno1", 1, 0x1003, "up", True, False,
+                   "93.184.216.34", "255.255.255.0"),)
+        plan = self.plan(public)
+        self.assertEqual(plan.networks, ())
+        self.assertEqual(dict(plan.excluded)["eno1"], "public address")
+
+    def test_a_downed_interface_is_not_scanned(self):
+        unplugged = (("eno1", 1, 0x1003, "down", True, False,
+                      "192.168.4.4", "255.255.255.0"),)
+        plan = self.plan(unplugged)
+        self.assertEqual(plan.networks, ())
+        self.assertIn("down", dict(plan.excluded)["eno1"])
+
+    def test_finding_nothing_fails_loudly_instead_of_returning_empty(self):
+        """The original failure mode, now an exception with the reasons in it.
+
+        Silently returning [] made a host that cannot be scanned look exactly
+        like a network with no phone on it. They are different answers.
+        """
+        root, lookup = self.fake_net(
+            [entry for entry in HOST_INTERFACES if entry[0] != "enp8s0"])
+        with self.assertRaises(NoScannableNetwork) as caught:
+            local_scan_networks(sysfs=root, address_lookup=lookup, env={})
+        message = str(caught.exception)
+        self.assertIn("docker0", message)
+        self.assertIn("tailscale0", message)
+        self.assertIn(SCAN_INTERFACES_ENV, message)
+
+    def test_the_scan_plan_names_what_it_will_touch_and_what_it_skipped(self):
+        report = self.plan().describe()
+        self.assertIn("192.168.68.0/24", report)
+        for name, *_ in HOST_INTERFACES:
+            self.assertIn(name, report)
+        self.assertIn(SCAN_NETWORKS_ENV, report)
+
+    def test_discovery_does_not_depend_on_hostname_resolution_on_this_host(self):
+        """The original bug, reproduced against the real machine.
+
+        On Debian and Ubuntu /etc/hosts maps the hostname to 127.0.1.1. The old
+        acquisition path asked ``getaddrinfo(gethostname())``, got exactly that,
+        discarded it as loopback and answered [] — on every such host, forever.
+        Rig hostname resolution to give that same answer and discovery must
+        still find the LAN this machine is actually plugged into.
+        """
+        if not any(interface_exclusion_reason(interface) is None
+                   for interface in read_interface_table()):
+            self.skipTest("this machine has no scannable LAN interface")
+        loopback = [(2, 1, 6, "", ("127.0.1.1", 0))]
+        with patch("acesvision.discovery.socket.getaddrinfo",
+                   return_value=loopback), \
+                patch("acesvision.discovery.socket.gethostname",
+                      return_value="aced"):
+            networks = local_scan_networks(env={})
+        self.assertTrue(networks, "discovery found no network on a host that "
+                                  "has one")
+        self.assertTrue(all(network.is_private for network in networks))
+        self.assertTrue(all(network.prefixlen >= 24 for network in networks))
+
+    def test_the_real_interface_table_of_this_host_is_readable(self):
+        """One test that does touch the real kernel — read only, no packets."""
+        interfaces = {interface.name: interface
+                      for interface in read_interface_table()}
+        if not interfaces:                  # not Linux, or no /sys
+            self.skipTest("no /sys/class/net on this machine")
+        self.assertIn("lo", interfaces)
+        self.assertEqual(interfaces["lo"].kind, "loopback")
+        self.assertEqual(interface_exclusion_reason(interfaces["lo"]),
+                         "loopback (name matches lo)")
+
+
+class ScanOverrideTests(unittest.TestCase):
+    """The operator's override. Silent scanning of the wrong network is worse
+    than finding nothing, so the choice has to be theirs to take."""
+
+    def interfaces(self):
+        return [
+            NetworkInterface("enp8s0", "192.168.68.107", "255.255.255.0",
+                             kind="ethernet", is_up=True, is_physical=True),
+            NetworkInterface("tun0", "10.8.0.1", "255.255.255.0",
+                             kind="tunnel", is_up=True, is_point_to_point=True),
+        ]
+
+    def test_named_interfaces_win_over_auto_detection(self):
+        plan = scan_plan(interfaces=self.interfaces(),
+                         env={SCAN_INTERFACES_ENV: "tun0"})
+        self.assertEqual([interface.name for interface in plan.selected], ["tun0"])
+        self.assertEqual([str(network) for network in plan.networks],
+                         ["10.8.0.0/24"])
+        self.assertIn(SCAN_INTERFACES_ENV, dict(plan.excluded)["enp8s0"])
+
+    def test_named_networks_win_over_the_interfaces_entirely(self):
+        def explode(name):
+            raise AssertionError("interfaces enumerated despite an override")
+
+        plan = scan_plan(sysfs=Path("/nonexistent"), address_lookup=explode,
+                         env={SCAN_NETWORKS_ENV: "192.168.5.0/24, 10.3.4.0/24",
+                              SCAN_INTERFACES_ENV: "enp8s0"})
+        self.assertEqual([str(network) for network in plan.networks],
+                         ["10.3.4.0/24", "192.168.5.0/24"])
+        self.assertEqual(plan.origin, SCAN_NETWORKS_ENV)
+
+    def test_an_override_still_cannot_sweep_a_16(self):
+        with self.assertRaises(ValueError) as caught:
+            parse_scan_networks("192.168.0.0/16")
+        self.assertIn("/24", str(caught.exception))
+
+    def test_an_override_still_cannot_reach_a_public_network(self):
+        with self.assertRaises(ValueError) as caught:
+            parse_scan_networks("93.184.216.0/24")
+        self.assertIn("private", str(caught.exception))
+
+    def test_an_override_naming_no_such_interface_is_refused_not_ignored(self):
+        with self.assertRaises(ValueError) as caught:
+            scan_plan(interfaces=self.interfaces(),
+                      env={SCAN_INTERFACES_ENV: "wlan9"})
+        self.assertIn("wlan9", str(caught.exception))
+
+    def test_a_named_interface_with_a_public_address_is_still_refused(self):
+        public = [NetworkInterface("enp8s0", "93.184.216.34", "255.255.255.0",
+                                   kind="ethernet", is_up=True, is_physical=True)]
+        plan = scan_plan(interfaces=public, env={SCAN_INTERFACES_ENV: "enp8s0"})
+        self.assertEqual(plan.networks, ())
+        self.assertEqual(dict(plan.excluded)["enp8s0"], "public address")
+
+
+class NetworkReportCliTests(unittest.TestCase):
+    """`--list-networks` — the scan is inspectable from a terminal, no GUI."""
+
+    def plan(self):
+        return ScanPlan(
+            networks=(ipaddress.ip_network("192.168.68.0/24"),),
+            selected=(NetworkInterface("enp8s0", "192.168.68.107",
+                                       "255.255.255.0", kind="ethernet",
+                                       is_up=True, is_physical=True),),
+            excluded=(("docker0", "container network (name matches docker*)"),),
+        )
+
+    def report(self, **kwargs):
+        from acesvision.__main__ import report_networks
+
+        lines = []
+        kwargs.setdefault("planner", self.plan)
+        kwargs.setdefault("scanner", Mock(side_effect=AssertionError("scanned")))
+        code = report_networks(write=lines.append, **kwargs)
+        return code, "\n".join(lines)
+
+    def test_the_flags_are_accepted(self):
+        from acesvision.__main__ import build_parser
+
+        args = build_parser().parse_args(["--list-networks"])
+        self.assertTrue(args.list_networks)
+        self.assertFalse(build_parser().parse_args([]).scan_droidcam)
+
+    def test_listing_prints_the_plan_and_sends_nothing(self):
+        code, text = self.report()
+        self.assertEqual(code, 0)
+        self.assertIn("192.168.68.0/24", text)
+        self.assertIn("enp8s0", text)
+        self.assertIn("docker0", text)
+        self.assertIn(SCAN_INTERFACES_ENV, text)
+
+    def test_scanning_probes_only_the_planned_networks(self):
+        scanned = []
+
+        def scanner(networks):
+            scanned.append(list(networks))
+            return [DroidCamDevice("192.168.68.31", 4747,
+                                   "http://192.168.68.31:4747/video", "phone")]
+
+        code, text = self.report(scan=True, scanner=scanner)
+        self.assertEqual(code, 0)
+        self.assertEqual([str(network) for network in scanned[0]],
+                         ["192.168.68.0/24"])
+        self.assertIn("http://192.168.68.31:4747/video", text)
+
+    def test_nothing_to_scan_exits_nonzero_and_says_so(self):
+        code, text = self.report(planner=ScanPlan)
+        self.assertEqual(code, 1)
+        self.assertIn("nothing to scan", text)
+
+    def test_a_refused_override_exits_nonzero_with_the_reason(self):
+        def planner():
+            raise ValueError("ACESVISION_SCAN_NETWORKS: '10.0.0.0/8' is wider")
+
+        code, text = self.report(planner=planner)
+        self.assertEqual(code, 2)
+        self.assertIn("wider", text)
 
 
 class OverlayTests(unittest.TestCase):
@@ -2933,6 +3269,68 @@ class GuiErrorChannelTests(unittest.TestCase):
         backend._refresh()
         backend._refresh()
         self.assertEqual(len(seen), 1)
+
+
+class GuiDroidCamScanTests(unittest.TestCase):
+    """The Sources page must say which network it is about to scan, and must
+    not report an unscannable host in the words it uses for an empty one."""
+
+    def plan(self):
+        return ScanPlan(
+            networks=(ipaddress.ip_network("192.168.68.0/24"),),
+            selected=(NetworkInterface("enp8s0", "192.168.68.107",
+                                       "255.255.255.0", kind="ethernet",
+                                       is_up=True, is_physical=True),),
+            excluded=(("tailscale0", "VPN overlay (name matches tailscale*)"),),
+        )
+
+    def test_the_page_names_the_network_before_anything_is_scanned(self):
+        backend = gui_backend()
+        with patch("acesvision.gui.scan_plan", return_value=self.plan()):
+            self.assertEqual(backend.scanPlanTarget, "192.168.68.0/24 (enp8s0)")
+
+    def test_an_unscannable_host_is_not_reported_as_no_device_found(self):
+        backend = gui_backend()
+        scanner = Mock()
+        with patch("acesvision.gui.scan_plan", return_value=ScanPlan()), \
+                patch("acesvision.gui.scan_droidcam", scanner):
+            backend.scanDroidCams()
+        scanner.assert_not_called()
+        self.assertFalse(backend.droidScanActive)
+        self.assertIn("No scannable network", backend.droidScanStatus)
+        self.assertIn(SCAN_INTERFACES_ENV, backend.droidScanStatus)
+
+    def test_a_refused_override_reaches_the_operator(self):
+        backend = gui_backend()
+        with patch("acesvision.gui.scan_plan",
+                   side_effect=ValueError("not a private local network")):
+            backend.scanDroidCams()
+        self.assertIn("Scan refused", backend.droidScanStatus)
+        self.assertIn("private local network", backend.lastError)
+
+    def test_the_scan_probes_exactly_the_planned_networks(self):
+        backend = gui_backend()
+        probed = []
+        finished = threading.Event()
+
+        def scanner(networks):
+            probed.append(list(networks))
+            finished.set()
+            return []
+
+        with patch("acesvision.gui.scan_plan", return_value=self.plan()), \
+                patch("acesvision.gui.scan_droidcam", scanner):
+            backend.scanDroidCams()
+            self.assertTrue(finished.wait(5))
+        self.assertEqual(probed, [["192.168.68.0/24"]])
+        self.assertIn("192.168.68.0/24", backend.droidScanStatus)
+
+    def test_a_finished_scan_says_which_network_it_covered(self):
+        backend = gui_backend()
+        backend._apply_droid_scan(json.dumps(
+            {"devices": [], "networks": ["192.168.68.0/24"]}))
+        self.assertIn("192.168.68.0/24", backend.droidScanStatus)
+        self.assertIn("nothing answered", backend.droidScanStatus)
 
 
 class GuiPreviewFreshnessTests(unittest.TestCase):

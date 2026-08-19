@@ -493,8 +493,15 @@ ApplicationWindow {
                             anchors.margins: 14
                             Text { text: "DroidCam"; color: window.textMain; font.bold: true }
                             Text {
-                                text: "Scan checks only private local /24 networks on DroidCam port 4747. It runs only when you click Scan."
+                                text: "Scan checks only your own wired or wireless LAN, one /24, on DroidCam port 4747. VPN, container and virtual-machine networks are never scanned. It runs only when you click Scan."
                                 color: window.textMuted
+                                wrapMode: Text.Wrap
+                                Layout.fillWidth: true
+                            }
+                            Text {
+                                text: "Will scan: " + vision.scanPlanTarget
+                                color: window.textMuted
+                                font.pixelSize: 11
                                 wrapMode: Text.Wrap
                                 Layout.fillWidth: true
                             }

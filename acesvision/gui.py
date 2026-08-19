@@ -19,7 +19,12 @@ from gesture_catalog import ANY_ACTOR, GESTURE_IDS
 from .connectors import default_registry
 from .contracts import SceneFrame, SourceSpec
 from .events import GestureEventOutput
-from .discovery import discover_webcams, preferred_webcam, scan_droidcam
+from .discovery import (
+    discover_webcams,
+    preferred_webcam,
+    scan_droidcam,
+    scan_plan,
+)
 from .outputs import LatestFrameOutput, ObsVirtualCameraOutput
 from .overlay import MINIMAL, PROFILES, OverlayProfile
 from .pipeline import VisionPipeline
@@ -948,20 +953,57 @@ class VisionBackend(QObject):
             "url": url.strip(),
         }))
 
+    @Property(str, notify=droidScanChanged)
+    def scanPlanTarget(self):
+        """The networks a scan would touch, readable before anyone clicks Scan.
+
+        Shown on the Sources page on purpose. This program opens sockets on the
+        operator's own home network; which network that is should never be
+        something they have to read the source to find out.
+        """
+        try:
+            plan = scan_plan()
+        except Exception as exc:            # noqa: BLE001 - never break the UI
+            return f"Scan unavailable: {exc}"
+        if not plan.networks:
+            return ("No scannable network found — set "
+                    "ACESVISION_SCAN_INTERFACES or ACESVISION_SCAN_NETWORKS")
+        return plan.summary()
+
     @Slot()
     def scanDroidCams(self):
         if self._droid_scan_active:
             return
+        try:
+            plan = scan_plan()
+        except Exception as exc:            # noqa: BLE001 - never break the UI
+            # A refused override lands here. Say so rather than scanning
+            # something else instead.
+            self._set_action_error(f"DroidCam scan refused: {exc}")
+            self._droid_scan_status = f"Scan refused: {exc}"
+            self.droidScanChanged.emit()
+            return
+        if not plan.networks:
+            # Distinct from "scanned and found nothing", which is what this used
+            # to say on every standard Linux host.
+            self._droid_scan_status = (
+                "No scannable network found on this machine. Set "
+                "ACESVISION_SCAN_INTERFACES or enter a URL below.")
+            self.droidScanChanged.emit()
+            return
+
+        networks = [str(network) for network in plan.networks]
         self._droid_scan_active = True
-        self._droid_scan_status = "Scanning private local networks on port 4747"
+        self._droid_scan_status = f"Scanning {plan.summary()} on port 4747"
         self.droidScanChanged.emit()
 
         def worker():
             try:
-                devices = [device.as_dict() for device in scan_droidcam()]
-                payload = json.dumps({"devices": devices})
+                devices = [device.as_dict() for device in scan_droidcam(networks)]
+                payload = json.dumps({"devices": devices, "networks": networks})
             except Exception as exc:
-                payload = json.dumps({"error": str(exc), "devices": []})
+                payload = json.dumps({"error": str(exc), "devices": [],
+                                      "networks": networks})
             self.droidScanFinished.emit(payload)
 
         threading.Thread(target=worker, daemon=True,
@@ -972,13 +1014,16 @@ class VisionBackend(QObject):
         result = json.loads(payload)
         self._droid_cams = result["devices"]
         self._droid_scan_active = False
+        scanned = ", ".join(result.get("networks") or []) or "the local network"
         if result.get("error"):
             self._droid_scan_status = "Scan failed: " + result["error"]
         elif self._droid_cams:
             count = len(self._droid_cams)
-            self._droid_scan_status = f"Found {count} possible DroidCam device(s)"
+            self._droid_scan_status = (f"Found {count} possible DroidCam "
+                                       f"device(s) on {scanned}")
         else:
-            self._droid_scan_status = "No DroidCam devices found. You can still enter a URL."
+            self._droid_scan_status = (f"Scanned {scanned} — nothing answered on "
+                                       f"port 4747. You can still enter a URL.")
         self.droidCamsChanged.emit()
         self.droidScanChanged.emit()
 

@@ -260,8 +260,41 @@ future camera that passes calibration; it is not exposed for this device.
 
 The camera selector shows the Linux camera number, hardware name, capture type,
 and `/dev/videoN` path. AcesVision starts with the first real colour camera;
-IR and virtual devices remain available for explicit selection. The DroidCam
-scan is manual and checks only the local private `/24` network on port 4747.
+IR and virtual devices remain available for explicit selection.
+
+### DroidCam discovery: what it scans, and what it will not
+
+The DroidCam scan is manual — it runs when you click Scan, never on startup —
+and it is bounded three ways: private IPv4 only, one `/24` at most (254 hosts,
+never a `/16` sweep), and a total deadline so a scan cannot hold the GUI open.
+
+Which network it scans is decided from the machine's real interface table
+(`/sys/class/net` plus `SIOCGIFADDR`), not from hostname resolution. A host
+whose `/etc/hosts` maps its name to `127.0.1.1` — the Debian and Ubuntu default
+— is exactly the case that used to make discovery find nothing at all.
+
+Only a physical ethernet or wireless adapter that is up, with a private IPv4
+address, is scanned. Loopback, `tun`/`tap`, `wg*`, `tailscale*`, `virbr*`,
+`vnet*`, `docker*`, `br-*` and `veth*` are excluded by name **and** by
+interface flags and hardware type. That exclusion is the point: a VPN peer, a
+libvirt guest or a container network is somebody else's machine, and this
+program has no business probing ports on it because you wanted to find your own
+phone.
+
+The plan is inspectable before a single packet is sent, and overridable:
+
+```bash
+python -m acesvision --list-networks    # what would be scanned, and why not the rest
+python -m acesvision --scan-droidcam    # print the plan, then scan it
+
+ACESVISION_SCAN_INTERFACES=wlp3s0 python -m acesvision --scan-droidcam
+ACESVISION_SCAN_NETWORKS=192.168.68.0/24 python -m acesvision --scan-droidcam
+```
+
+The Sources page shows the same target above the Scan button. Neither override
+can widen the scan past a `/24` or reach a public network; both are refused with
+a message rather than quietly narrowed. If no interface qualifies, discovery
+says so — it does not return an empty list that reads like "no phone found".
 
 ## Setup (done already, for reference)
 
@@ -302,6 +335,8 @@ Green box = recognised (with confidence), red = Unknown.
 | `FACE_ID_W` / `FACE_ID_H` | camera | `1280x720` | Capture resolution; AcesVision defaults to the webcam's 30 FPS 720p MJPEG mode. |
 | `FACE_ID_FPS` | camera | `30` | Requested physical-camera frame rate. |
 | `ACESVISION_EXPOSURE` | AcesVision webcam | `166` | Starting value when manual exposure is selected; automatic exposure is the visible-image default. |
+| `ACESVISION_SCAN_INTERFACES` | DroidCam discovery | auto-detect | Comma-separated interface names to scan instead of the auto-detected LAN adapter, e.g. `wlp3s0`. A name this host does not have is refused, not ignored. |
+| `ACESVISION_SCAN_NETWORKS` | DroidCam discovery | from the interface | Comma-separated CIDRs to scan, e.g. `192.168.68.0/24`. Wins over everything. A public network or anything wider than a `/24` is refused. |
 | `FACE_ID_ENGINE` | both | `arcface` | `arcface`, `yunet`, `dlib` or `lbph`. An unrecognised name is refused, not silently ignored. |
 | `FACE_ID_ARCFACE_MODEL` | ArcFace | `w600k_r50` | `w600k_r50` (accurate) or `w600k_mbf` (2x faster, narrower margin) |
 | `FACE_ID_ARCFACE_THRESHOLD` | ArcFace | `0.503` | Minimum cosine similarity. **Higher = stricter** — the opposite direction to the dlib knob below. An override has no measured FAR. |
