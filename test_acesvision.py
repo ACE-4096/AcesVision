@@ -6,6 +6,7 @@ import inspect
 import ipaddress
 import json
 import os
+import re
 import socket
 import stat
 import struct
@@ -4829,39 +4830,69 @@ class QmlSourceTests(unittest.TestCase):
         cls.qml = QML_PATH.read_text()
 
     @staticmethod
-    def page_root_properties(page):
-        """The page ColumnLayout's own property lines, comments stripped.
+    def own_property_lines(text):
+        """[(block header, its own property lines)] for every block in the file.
 
-        Stops at the first nested element so only the layout's own settings are
-        inspected, not its children's.
+        Own means declared at that block's own brace depth, so a parent is
+        never credited with a child's anchors and vice versa.
         """
-        body = page.split("ColumnLayout {", 1)[1]
-        lines = []
-        for line in body.split("\n"):
-            text = line.split("//", 1)[0].strip()
-            if not text:
+        blocks, stack = [], []
+        for raw in text.split("\n"):
+            line = raw.split("//", 1)[0].strip()
+            if not line:
                 continue
-            if text.endswith("{"):
-                break
-            lines.append(text)
-        return lines
+            opens, closes = line.count("{"), line.count("}")
+            if opens > closes:
+                if stack:
+                    stack[-1][1].append(line)
+                for _ in range(opens - closes):
+                    stack.append((line, []))
+            elif closes > opens:
+                for _ in range(closes - opens):
+                    if stack:
+                        blocks.append(stack.pop())
+            elif stack:
+                stack[-1][1].append(line)
+        while stack:
+            blocks.append(stack.pop())
+        return blocks
 
-    def test_no_page_relies_on_an_anchor_margin_it_never_set(self):
-        # Every page root was `ColumnLayout { width: parent.width;
-        # anchors.margins: 20 }` with no anchor at all, so the gutter was inert
-        # and titles and cards ran into the window edge.
-        pages = [block.split("ScrollView {")[0]
-                 for block in self.qml.split("ScrollView {")[1:]]
-        self.assertEqual(len(pages), 6)
-        for index, page in enumerate(pages):
-            properties = self.page_root_properties(page)
-            anchored = [line for line in properties if line.startswith("anchors.")]
-            self.assertEqual(anchored, [],
-                             f"page {index} sets anchor properties with no anchor")
-            self.assertIn("padding: window.pageMargin",
-                          [line.split("//")[0].strip()
-                           for line in page.split("\n")],
-                          f"page {index} has no gutter")
+    def test_no_element_sets_an_anchor_margin_it_has_no_anchor_for(self):
+        """The clipping bug, stated as a rule instead of as a page count.
+
+        Every page root was `ColumnLayout { width: parent.width;
+        anchors.margins: 20 }` with no anchor at all, so the gutter was inert
+        and titles and cards ran into the window edge. The page gutters now
+        come from ScrollView padding, and this holds the whole file — not just
+        the six pages that happened to have the bug — to never asking for a
+        margin on an edge it never attached.
+        """
+        offenders = []
+        for header, lines in self.own_property_lines(self.qml):
+            anchors = [line for line in lines if line.startswith("anchors.")]
+            margins = [line for line in anchors
+                       if "argin" in line.split(":", 1)[0]]
+            attachments = [line for line in anchors if line not in margins]
+            if margins and not attachments:
+                offenders.append((header, margins))
+        self.assertEqual(offenders, [])
+
+    def test_every_page_declares_its_gutter(self):
+        # The gutter lives on the ScrollView as padding. A page that forgets it
+        # runs its content into the nav rail.
+        pages = re.findall(r'objectName: "page(\d+)"', self.qml)
+        self.assertEqual(pages, ["0", "1", "2", "3"])
+        self.assertEqual(self.qml.count("padding: window.pageMargin"), 4)
+
+    def test_no_design_token_is_declared_and_never_used(self):
+        """A palette entry nothing reads is a decision nobody made."""
+        # The window's own palette, at its own indent — not the local colour
+        # properties the inline components take as parameters.
+        declared = re.findall(r"^    property color (\w+):", self.qml, re.M)
+        self.assertTrue(declared)
+        for name in declared:
+            self.assertGreater(self.qml.count("window.%s" % name), 0,
+                               f"the {name} colour is declared and never used")
 
     def test_no_specific_gpu_is_named_in_user_facing_copy(self):
         for banned in ("RX 6600", "ROCm on the", "RTX"):
@@ -4881,15 +4912,34 @@ class QmlSourceTests(unittest.TestCase):
         self.assertIn("Image.Error", self.qml)
         self.assertIn("vision.previewStale", self.qml)
 
-    def test_the_overlay_grid_can_render_a_custom_card(self):
+    def test_the_overlay_selector_can_render_a_custom_profile(self):
         self.assertIn("vision.customOverlayReady", self.qml)
 
-    def test_the_stage_panel_is_wired_to_the_backend(self):
+    def test_every_notifying_property_and_slot_still_has_a_reader(self):
+        """The layout rework moved controls; it must not have dropped any.
+
+        Each of these is a property or slot VisionBackend publishes. A control
+        that was consolidated away silently would show up here as a backend
+        surface nothing reads.
+        """
         for binding in ("vision.stageIds", "vision.stageStats",
                         "vision.setStageEnabled(", "vision.setStageRate(",
                         "vision.shushWarning", "vision.shushDegraded",
-                        "vision.latestInferenceMs"):
-            self.assertIn(binding, self.qml)
+                        "vision.latestInferenceMs", "vision.modelInferenceMs",
+                        "vision.captureFps", "vision.inferenceFps",
+                        "vision.inferenceMs", "vision.sourceLabel",
+                        "vision.setObjectModel(", "vision.setObsEnabled(",
+                        "vision.setEventsEnabled(", "vision.setOverlayProfile(",
+                        "vision.applyOverlayStyle(", "vision.setCameraTuning(",
+                        "vision.scanDroidCams()", "vision.useDroidCam(",
+                        "vision.refreshWebcams()", "vision.useWebcamIndex(",
+                        "vision.scanPlanTarget", "vision.refreshActors()",
+                        "vision.refreshModels()", "vision.addRule(",
+                        "vision.setRuleDryRun(", "vision.removeRule(",
+                        "vision.executableConnectors", "vision.lastDecision",
+                        "vision.exposureNotice", "vision.imageWarning",
+                        "vision.manualExposureSupported"):
+            self.assertIn(binding, self.qml, binding)
 
     def test_the_stage_repeater_is_not_driven_off_the_polled_measurements(self):
         # A Repeater rebuilds every delegate when its model changes, and
@@ -4898,12 +4948,28 @@ class QmlSourceTests(unittest.TestCase):
         self.assertIn("model: vision.stageIds", self.qml)
         self.assertNotIn("model: vision.stageStats", self.qml)
 
-    def test_the_page_count_is_unchanged_by_the_stage_panel(self):
-        # The panel belongs on Models and Security, beside the model picker it
-        # shares a subject with. A seventh nav page would have been a new
-        # information architecture smuggled in under a controls change.
-        self.assertEqual(self.qml.count("ScrollView {"), 6)
-        self.assertEqual(self.qml.count("NavButton {"), 6)
+    def test_the_shush_guard_is_not_filed_inside_a_tab(self):
+        """It has to be visible from wherever the operator already is.
+
+        The card sits in the Live page body, above the dock, so no tool tab
+        selection can hide it. Its own tests measure that on the rendered tree;
+        this one just refuses the shape that would allow it to be buried.
+        """
+        body = self.qml.split('objectName: "page0Body"', 1)[1]
+        card = body.split('objectName: "shushWarningCard"', 1)[0]
+        self.assertNotIn('objectName: "toolDock"', card,
+                         "the shush card was moved below the tooling dock")
+        self.assertNotIn("ToolPanel", card,
+                         "the shush card was moved inside a tool panel")
+
+    def test_the_scan_disclosure_travelled_with_the_scan_button(self):
+        # Which network this program opens sockets on must never be something
+        # the operator has to go looking for. It used to live on the Sources
+        # page; the Sources page is now a tool panel, and the disclosure moved
+        # with it rather than being dropped in the consolidation.
+        self.assertIn("VPN, container and virtual-machine networks are never scanned",
+                      self.qml)
+        self.assertIn("vision.scanPlanTarget", self.qml)
 
 
 def _require_qt():
@@ -4922,149 +4988,25 @@ def _run_qml_probe(script):
     environment.pop("WAYLAND_DISPLAY", None)
     return subprocess.run([sys.executable, "-c", script],
                           cwd=str(Path(__file__).parent), env=environment,
-                          capture_output=True, text=True, timeout=120)
+                          capture_output=True, text=True, timeout=300)
 
 
-QML_GEOMETRY_PROBE = '''
+#: The window shapes the layout is held to. The last one is the awkward case:
+#: tall and narrow, which is where a fixed-width word rail did the most damage —
+#: it took 35% of the width and left the video feed a 20 px sliver.
+PROBE_SIZES = [(800, 600), (1024, 768), (1280, 800), (1920, 1080), (620, 1000)]
+
+QML_LAYOUT_PROBE = '''
 import json, os, sys
-from PySide6.QtCore import QUrl, QTimer, QEventLoop, qInstallMessageHandler
-from PySide6.QtGui import QGuiApplication
-from PySide6.QtQml import QQmlApplicationEngine
-from PySide6.QtQuick import QQuickItem
-from acesvision.gui import VisionBackend, QML_PATH
-
-messages = []
-qInstallMessageHandler(lambda kind, ctx, text: messages.append(text))
-app = QGuiApplication(sys.argv[:1])
-backend = VisionBackend(initialize_models=False, load_saved_rules=False)
-engine = QQmlApplicationEngine()
-engine.rootContext().setContextProperty("vision", backend)
-engine.load(QUrl.fromLocalFile(str(QML_PATH)))
-window = engine.rootObjects()[0]
-
-def settle(ms=150):
-    loop = QEventLoop()
-    QTimer.singleShot(ms, loop.quit)
-    loop.exec()
-
-def find_type(item, prefix):
-    for child in item.childItems():
-        if child.metaObject().className().startswith(prefix):
-            return child
-        found = find_type(child, prefix)
-        if found is not None:
-            return found
-    return None
-
-# Located positionally, not by objectName, so the same probe can measure a tree
-# that predates the objectName markers.
-stack = find_type(window.property("contentItem"), "QQuickStackLayout")
-
-def collect():
-    settle(250)
-    report = {"sizes": {}}
-    for width, height in [(980, 640), (1280, 800), (1920, 1080)]:
-        window.setWidth(width)
-        window.setHeight(height)
-        settle()
-        pages = []
-        for index, view in enumerate(stack.childItems()):
-            window.setProperty("currentPage", index)
-            settle()
-            flickable = view.childItems()[0]
-            pages.append({
-                "gutterX": flickable.x(),
-                "gutterY": flickable.y(),
-                "viewportW": flickable.width(),
-                "viewportH": flickable.height(),
-                "contentW": flickable.property("contentWidth"),
-                "contentH": flickable.property("contentHeight"),
-            })
-        tuning = window.findChild(QQuickItem, "liveTuning")
-        report["sizes"]["%dx%d" % (width, height)] = {
-            "pages": pages,
-            "tuningHeight": tuning.height() if tuning else None,
-            "tuningImplicit": tuning.property("implicitHeight") if tuning else None,
-        }
-    report["messages"] = messages
-    sys.stdout.write("PROBE" + json.dumps(report) + "\\n")
-    sys.stdout.flush()
-
-def run():
-    try:
-        collect()
-    except BaseException:
-        import traceback
-        traceback.print_exc()
-        os._exit(3)
-    os._exit(0)
-
-# Never let a broken probe hang the suite; a stuck probe is a failure.
-QTimer.singleShot(60000, lambda: os._exit(4))
-QTimer.singleShot(50, run)
-app.exec()
-'''
-
-
-class QmlLayoutTests(unittest.TestCase):
-    """Measure the real QML scene graph rather than trusting the source."""
-
-    report = None
-
-    @classmethod
-    def setUpClass(cls):
-        # Skip ONLY when Qt itself is missing. A probe that starts and then
-        # fails to report is a defect in the UI, not an unavailable toolchain,
-        # and must not be allowed to pass as a skip.
-        _require_qt()
-        completed = _run_qml_probe(QML_GEOMETRY_PROBE)
-        marker = "PROBE"
-        if completed.returncode != 0 or marker not in completed.stdout:
-            raise AssertionError(
-                "the QML probe did not report:\n" + (completed.stderr or "")[-2000:])
-        cls.report = json.loads(completed.stdout.split(marker, 1)[1])
-
-    def test_every_page_has_a_real_gutter_on_every_size(self):
-        for size, data in self.report["sizes"].items():
-            self.assertEqual(len(data["pages"]), 6, size)
-            for index, page in enumerate(data["pages"]):
-                self.assertGreaterEqual(page["gutterX"], 20, f"{size} page{index}")
-                self.assertGreaterEqual(page["gutterY"], 20, f"{size} page{index}")
-                self.assertLessEqual(
-                    page["contentW"], page["viewportW"] + 0.5,
-                    f"{size} page{index} content is wider than the viewport")
-
-    def test_the_live_page_does_not_grow_taller_as_the_window_grows_wider(self):
-        # Measured before the fix: 600 / 756 / 1089. The 1089 overflowed the
-        # viewport and scrolled the OBS and gesture-event bar off screen.
-        heights = {size: data["pages"][0]["contentH"]
-                   for size, data in self.report["sizes"].items()}
-        for size, data in self.report["sizes"].items():
-            if size == "980x640":
-                continue     # the minimum window cannot hold the tuning panel
-            self.assertLessEqual(
-                data["pages"][0]["contentH"], data["pages"][0]["viewportH"],
-                f"live page scrolls at {size}: {heights}")
-
-    def test_the_image_tuning_panel_is_never_squeezed(self):
-        for size, data in self.report["sizes"].items():
-            self.assertIsNotNone(data["tuningHeight"],
-                                 f"no liveTuning panel found at {size}")
-            self.assertGreaterEqual(data["tuningHeight"],
-                                    data["tuningImplicit"] - 0.5, size)
-
-    def test_loading_and_resizing_the_ui_logs_no_qml_warnings(self):
-        self.assertEqual(self.report["messages"], [])
-
-
-QML_STAGE_PROBE = '''
-import json, os, sys
-from PySide6.QtCore import QUrl, QTimer, QEventLoop, qInstallMessageHandler
+from PySide6.QtCore import (QUrl, QTimer, QEventLoop, QPointF,
+                            qInstallMessageHandler)
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuick import QQuickItem
 from acesvision.contracts import SceneFrame
 from acesvision.gui import VisionBackend, QML_PATH
+
+SIZES = %(sizes)s
 
 messages = []
 qInstallMessageHandler(lambda kind, ctx, text: messages.append(text))
@@ -5099,54 +5041,155 @@ engine = QQmlApplicationEngine()
 engine.rootContext().setContextProperty("vision", backend)
 engine.load(QUrl.fromLocalFile(str(QML_PATH)))
 window = engine.rootObjects()[0]
+root = window.property("contentItem")
 
 def settle(ms=150):
     loop = QEventLoop()
     QTimer.singleShot(ms, loop.quit)
     loop.exec()
 
-def find_type(item, prefix):
-    for child in item.childItems():
-        if child.metaObject().className().startswith(prefix):
-            return child
-        found = find_type(child, prefix)
-        if found is not None:
-            return found
-    return None
+def find(name):
+    return window.findChild(QQuickItem, name)
+
+def box(item):
+    """Position and size in window coordinates, or None when absent."""
+    if item is None:
+        return None
+    point = item.mapToItem(root, QPointF(0, 0))
+    return {"x": point.x(), "y": point.y(),
+            "w": item.width(), "h": item.height(),
+            "visible": bool(item.isVisible())}
+
+def descends_from(item, name):
+    node = item
+    while node is not None:
+        if node.objectName() == name:
+            return True
+        node = node.parentItem()
+    return False
 
 def find_all(item, prefix, found=None):
     found = [] if found is None else found
+    if item is None:
+        return found
     for child in item.childItems():
         if child.metaObject().className().startswith(prefix):
             found.append(child)
         find_all(child, prefix, found)
     return found
 
-def collect():
-    window.setProperty("currentPage", 5)
-    settle(300)
-    # By objectName, not by child index: a StackLayout does not promise that
-    # childItems() comes back in page order.
-    page = window.findChild(QQuickItem, "page5")
-    card = window.findChild(QQuickItem, "shushWarningCard")
-    text = window.findChild(QQuickItem, "shushWarningText")
-    # Controls styled by the Material theme are QML-defined, so they report as
-    # "Switch_QMLTYPE_n" rather than QQuickSwitch. The trailing underscore
-    # keeps SwitchIndicator and SliderHandle out of the counts.
-    report = {
-        "switches": [item.property("text") for item in find_all(page, "Switch_")],
-        "sliders": len(find_all(page, "Slider_")),
-        "warningVisibleBefore": bool(card.isVisible()),
+def measure(width, height):
+    window.setWidth(width)
+    window.setHeight(height)
+    settle(250)
+    stack = find("pageStack")
+    data = {
+        "actual": [window.width(), window.height()],
+        "stack": box(stack),
+        "rail": box(find("navRail")),
+        "statusBar": box(find("statusBar")),
+        "nav": [box(find("nav%%d" %% index)) for index in range(4)],
+        "pages": [],
+        "tools": [],
+        "panels": [],
     }
+    for index in range(4):
+        window.setProperty("currentPage", index)
+        settle(170)
+        page = find("page%%d" %% index)
+        entry = {"page": box(page), "body": box(find("page%%dBody" %% index))}
+        children = page.childItems() if page is not None else []
+        if children:
+            flick = children[0]
+            entry["viewport"] = [flick.width(), flick.height()]
+            entry["content"] = [flick.property("contentWidth"),
+                                flick.property("contentHeight")]
+        data["pages"].append(entry)
+
+    window.setProperty("currentPage", 0)
+    settle(200)
+    data["feed"] = box(find("feedCard"))
+    data["metrics"] = box(find("metricStrip"))
+    data["dock"] = box(find("toolDock"))
+    data["tools"] = [box(find("tool%%d" %% slot)) for slot in range(5)]
+    for slot in range(5):
+        window.setProperty("currentTool", slot)
+        settle(170)
+        panel = find("toolPanel%%d" %% slot)
+        entry = box(panel)
+        if entry is not None:
+            children = panel.childItems()
+            if children:
+                entry["content"] = [children[0].property("contentWidth"),
+                                    children[0].property("contentHeight")]
+                entry["viewport"] = [children[0].width(), children[0].height()]
+        data["panels"].append(entry)
+
+    window.setProperty("currentTool", 0)
+    settle(200)
+    tuning = find("liveTuning")
+    data["tuning"] = None if tuning is None else {
+        "h": tuning.height(), "implicit": tuning.property("implicitHeight")}
+
+    # The guard, measured on the page the operator is already on.
+    card = find("shushWarningCard")
+    text = find("shushWarningText")
+    data["shushOnLivePage"] = descends_from(card, "page0")
+    data["shushBefore"] = None if card is None else bool(card.isVisible())
     backend.setStageEnabled("face", False)
-    settle(200)
-    report["warningVisibleAfter"] = bool(card.isVisible())
-    report["warningHeight"] = card.height()
-    report["warningText"] = text.property("text")
+    settle(220)
+    data["shushAfter"] = box(card)
+    data["shushText"] = "" if text is None else text.property("text")
     backend.setStageEnabled("face", True)
-    settle(200)
-    report["warningVisibleRestored"] = bool(card.isVisible())
-    report["lastError"] = backend.lastError
+    settle(220)
+    data["shushRestored"] = None if card is None else bool(card.isVisible())
+    return data
+
+def measure_stage_controls():
+    """The stageIds binding trap, measured on the objects themselves."""
+    window.setWidth(1280)
+    window.setHeight(800)
+    window.setProperty("currentPage", 0)
+    window.setProperty("currentTool", 1)
+    settle(350)
+    panel = find("stagePanel")
+    # Controls styled by the Material theme are QML-defined, so they report as
+    # "Switch_QMLTYPE_n" rather than QQuickSwitch. The trailing underscore keeps
+    # SwitchIndicator and SliderHandle out of the counts.
+    sliders = find_all(panel, "Slider_")
+    switches = find_all(panel, "Switch_")
+    # A tag the QML never sets. It rides the C++ object, so it survives a
+    # rebind and does NOT survive a delegate being destroyed and recreated.
+    for index, item in enumerate(sliders):
+        item.setProperty("probeTag", index)
+    before = [item.property("value") for item in sliders]
+    # Exactly what the 100 ms poll does: republish the measurements.
+    for _ in range(20):
+        backend.stagesChanged.emit()
+        settle(15)
+    after = find_all(panel, "Slider_")
+    return {
+        "count": len(sliders),
+        "switches": [item.property("text") for item in switches],
+        "names": [item.objectName() for item in after],
+        "tagsAfter": [item.property("probeTag") for item in after],
+        "enabledAfter": [bool(item.property("enabled")) for item in after],
+        "valuesBefore": before,
+        "valuesAfter": [item.property("value") for item in after],
+    }
+
+def collect():
+    settle(400)
+    report = {
+        "minimumWidth": window.property("minimumWidth"),
+        "minimumHeight": window.property("minimumHeight"),
+        "pageCount": window.property("pageCount"),
+        "toolCount": window.property("toolCount"),
+        "sizes": {},
+    }
+    for width, height in SIZES:
+        report["sizes"]["%%dx%%d" %% (width, height)] = measure(width, height)
+    report["stageControls"] = measure_stage_controls()
     report["messages"] = messages
     sys.stdout.write("PROBE" + json.dumps(report) + "\\n")
     sys.stdout.flush()
@@ -5160,45 +5203,272 @@ def run():
         os._exit(3)
     os._exit(0)
 
-QTimer.singleShot(60000, lambda: os._exit(4))
+# Never let a broken probe hang the suite; a stuck probe is a failure.
+QTimer.singleShot(240000, lambda: os._exit(4))
 QTimer.singleShot(50, run)
 app.exec()
-'''
+''' % {"sizes": repr(PROBE_SIZES)}
 
 
-class QmlStagePanelTests(unittest.TestCase):
-    """Measure the rendered panel, not the QML text that was meant to build it."""
+class QmlRenderedLayoutTestCase(unittest.TestCase):
+    """One offscreen render of the real scene graph, measured at five sizes."""
 
     report = None
 
     @classmethod
     def setUpClass(cls):
+        # Skip ONLY when Qt itself is missing. A probe that starts and then
+        # fails to report is a defect in the UI, not an unavailable toolchain,
+        # and must not be allowed to pass as a skip.
         _require_qt()
-        completed = _run_qml_probe(QML_STAGE_PROBE)
-        marker = "PROBE"
-        if completed.returncode != 0 or marker not in completed.stdout:
-            raise AssertionError(
-                "the stage-panel probe did not report:\n"
-                + (completed.stderr or "")[-2000:])
-        cls.report = json.loads(completed.stdout.split(marker, 1)[1])
+        if QmlRenderedLayoutTestCase.report is None:
+            completed = _run_qml_probe(QML_LAYOUT_PROBE)
+            marker = "PROBE"
+            if completed.returncode != 0 or marker not in completed.stdout:
+                raise AssertionError(
+                    "the QML layout probe did not report:\n"
+                    + (completed.stderr or "")[-3000:])
+            QmlRenderedLayoutTestCase.report = json.loads(
+                completed.stdout.split(marker, 1)[1])
+        cls.report = QmlRenderedLayoutTestCase.report
+
+    def sizes(self):
+        return sorted(self.report["sizes"].items())
+
+    @staticmethod
+    def right(rect):
+        return rect["x"] + rect["w"]
+
+    @staticmethod
+    def bottom(rect):
+        return rect["y"] + rect["h"]
+
+
+class QmlWindowShapeTests(QmlRenderedLayoutTestCase):
+    """The app has to be able to take the shapes it is judged in."""
+
+    def test_the_window_may_be_made_as_small_as_the_layout_is_tested_at(self):
+        # It refused to go below 980x640, which made two of the five sizes
+        # unreachable on any real window manager — the layout could not be put
+        # into the shape it was breaking in.
+        narrowest = min(width for width, _ in PROBE_SIZES)
+        shortest = min(height for _, height in PROBE_SIZES)
+        self.assertLessEqual(self.report["minimumWidth"], narrowest)
+        self.assertLessEqual(self.report["minimumHeight"], shortest)
+
+    def test_every_requested_size_is_the_size_that_got_measured(self):
+        for size, data in self.sizes():
+            self.assertEqual("%dx%d" % tuple(data["actual"]), size)
+
+    def test_loading_and_resizing_the_ui_logs_no_qml_warnings(self):
+        self.assertEqual(self.report["messages"], [])
+
+
+class QmlPageGutterTests(QmlRenderedLayoutTestCase):
+    def test_every_page_has_a_real_gutter_on_every_size(self):
+        for size, data in self.sizes():
+            stack = data["stack"]
+            self.assertEqual(len(data["pages"]), self.report["pageCount"], size)
+            for index, page in enumerate(data["pages"]):
+                where = f"{size} page{index}"
+                body = page["body"]
+                self.assertIsNotNone(body, where)
+                self.assertGreaterEqual(body["x"] - stack["x"], 16, where)
+                self.assertGreaterEqual(body["y"] - stack["y"], 16, where)
+                self.assertLessEqual(
+                    self.right(body), self.right(stack) - 16 + 0.5, where)
+
+    def test_no_page_is_wider_than_the_window_it_is_in(self):
+        # Sideways scrolling is clipping with extra steps.
+        for size, data in self.sizes():
+            for index, page in enumerate(data["pages"]):
+                self.assertLessEqual(page["content"][0],
+                                     page["viewport"][0] + 0.5,
+                                     f"{size} page{index}")
+
+
+class QmlNavRailTests(QmlRenderedLayoutTestCase):
+    """The specific complaint: the sidebar in odd window sizes."""
+
+    def test_every_destination_stays_reachable_at_every_size(self):
+        for size, data in self.sizes():
+            rail = data["rail"]
+            self.assertTrue(rail["visible"], size)
+            previous_bottom = rail["y"]
+            for index, button in enumerate(data["nav"]):
+                where = f"{size} nav{index}"
+                self.assertIsNotNone(button, where)
+                self.assertTrue(button["visible"], where)
+                self.assertGreater(button["w"], 0, where)
+                self.assertGreater(button["h"], 0, where)
+                # Inside the rail, and inside the window.
+                self.assertGreaterEqual(button["x"], rail["x"] - 0.5, where)
+                self.assertLessEqual(self.right(button),
+                                     self.right(rail) + 0.5, where)
+                self.assertLessEqual(self.bottom(button),
+                                     data["actual"][1] + 0.5, where)
+                # Stacked, never on top of each other.
+                self.assertGreaterEqual(button["y"], previous_bottom - 0.5, where)
+                previous_bottom = self.bottom(button)
+
+    def test_the_rail_never_overlaps_the_page_beside_it(self):
+        for size, data in self.sizes():
+            self.assertLessEqual(self.right(data["rail"]),
+                                 data["stack"]["x"] + 0.5, size)
+
+    def test_the_rail_gives_the_width_back_when_the_window_is_narrow(self):
+        # A 220 px word rail is 35% of a 620 px window. Under the breakpoint the
+        # rail keeps the icons and hands the rest to the video.
+        narrow = self.report["sizes"]["620x1000"]
+        wide = self.report["sizes"]["1920x1080"]
+        self.assertLess(narrow["rail"]["w"], 80)
+        self.assertLess(narrow["rail"]["w"] / narrow["actual"][0], 0.14)
+        self.assertGreater(wide["rail"]["w"], narrow["rail"]["w"])
+
+    def test_the_status_the_rail_used_to_carry_is_on_screen_everywhere(self):
+        # It was a fixed-height card pinned to the bottom of the rail column,
+        # so a short window squeezed it. It is a wrapping bar at the top now.
+        for size, data in self.sizes():
+            bar = data["statusBar"]
+            self.assertTrue(bar["visible"], size)
+            self.assertGreater(bar["h"], 20, size)
+            self.assertLessEqual(self.bottom(bar), data["actual"][1] + 0.5, size)
+            self.assertAlmostEqual(bar["w"], data["actual"][0], delta=1.0)
+
+
+class QmlToolingDockTests(QmlRenderedLayoutTestCase):
+    """The main ask: a suite of tooling below the camera feed."""
+
+    def test_the_feed_the_metrics_and_the_dock_stack_without_overlapping(self):
+        for size, data in self.sizes():
+            feed, metrics, dock = data["feed"], data["metrics"], data["dock"]
+            for name, rect in (("feed", feed), ("metrics", metrics),
+                               ("dock", dock)):
+                self.assertIsNotNone(rect, f"{size} has no {name}")
+                self.assertTrue(rect["visible"], f"{size} {name}")
+            self.assertLessEqual(self.bottom(feed), metrics["y"] + 0.5, size)
+            self.assertLessEqual(self.bottom(metrics), dock["y"] + 0.5, size)
+
+    def test_the_feed_dominates_instead_of_being_squeezed_by_the_chrome(self):
+        for size, data in self.sizes():
+            feed, stack = data["feed"], data["stack"]
+            # At 620x1000 the old fixed rail plus the beside-feed tuning panel
+            # left the video 20 px wide. Nothing may do that again.
+            self.assertGreater(feed["w"] / stack["w"], 0.85, size)
+            self.assertGreaterEqual(feed["h"], 160, size)
+        for size in ("800x600", "1024x768", "1280x800", "1920x1080"):
+            data = self.report["sizes"][size]
+            self.assertGreaterEqual(data["feed"]["h"], data["dock"]["h"], size)
+
+    def test_every_tool_is_one_click_away_at_every_size(self):
+        for size, data in self.sizes():
+            dock = data["dock"]
+            self.assertEqual(len(data["tools"]), self.report["toolCount"], size)
+            for slot, tab in enumerate(data["tools"]):
+                where = f"{size} tool{slot}"
+                self.assertIsNotNone(tab, where)
+                self.assertTrue(tab["visible"], where)
+                self.assertGreater(tab["w"], 20, where)
+                self.assertGreater(tab["h"], 20, where)
+                # Inside the dock, so no tab is off the edge of the strip.
+                self.assertGreaterEqual(tab["x"], dock["x"] - 0.5, where)
+                self.assertLessEqual(self.right(tab), self.right(dock) + 0.5,
+                                     where)
+                self.assertLessEqual(self.bottom(tab),
+                                     self.bottom(dock) + 0.5, where)
+
+    def test_selecting_a_tool_shows_a_panel_that_fits_the_dock(self):
+        for size, data in self.sizes():
+            dock = data["dock"]
+            for slot, panel in enumerate(data["panels"]):
+                where = f"{size} panel{slot}"
+                self.assertIsNotNone(panel, where)
+                self.assertTrue(panel["visible"], where)
+                self.assertGreater(panel["w"], 0, where)
+                self.assertGreater(panel["h"], 0, where)
+                self.assertGreaterEqual(panel["x"], dock["x"] - 0.5, where)
+                self.assertLessEqual(self.right(panel),
+                                     self.right(dock) + 0.5, where)
+                # A panel scrolls inside the dock; it never runs sideways.
+                self.assertLessEqual(panel["content"][0],
+                                     panel["viewport"][0] + 0.5, where)
+
+    def test_the_live_page_itself_does_not_scroll(self):
+        # The controls under the feed are only "below the feed" if they are on
+        # the same screen. The dock scrolls internally instead.
+        for size, data in self.sizes():
+            page = data["pages"][0]
+            self.assertLessEqual(page["content"][1], page["viewport"][1] + 0.5,
+                                 f"the live page scrolls at {size}")
+
+    def test_the_image_tuning_panel_is_never_squeezed(self):
+        for size, data in self.sizes():
+            tuning = data["tuning"]
+            self.assertIsNotNone(tuning, f"no liveTuning panel at {size}")
+            self.assertGreaterEqual(tuning["h"], tuning["implicit"] - 0.5, size)
+
+
+class QmlShushGuardTests(QmlRenderedLayoutTestCase):
+    """Disabling the face stage rebinds shushing onto the lights. Say so.
+
+    Without a face box MediaPipe labels the same hand Pointing_Up, which
+    automations.example.json binds to `ledctl next-theme`. The warning used to
+    live on the Models and Security page, which is the one page the operator
+    is not on while they are watching the feed.
+    """
+
+    def test_the_guard_lives_on_the_live_page_not_in_a_tab(self):
+        for size, data in self.sizes():
+            self.assertTrue(data["shushOnLivePage"],
+                            f"the shush warning is not on the Live page ({size})")
+
+    def test_the_guard_appears_when_the_face_stage_goes_off_at_every_size(self):
+        for size, data in self.sizes():
+            self.assertFalse(data["shushBefore"], size)
+            after = data["shushAfter"]
+            self.assertTrue(after["visible"], size)
+            # Visible and actually occupying the page, not a zero-height stub.
+            self.assertGreater(after["h"], 20, size)
+            self.assertIn("ledctl next-theme", data["shushText"], size)
+            self.assertFalse(data["shushRestored"], size)
+
+    def test_the_guard_is_inside_the_window_at_every_size(self):
+        for size, data in self.sizes():
+            after, stack = data["shushAfter"], data["stack"]
+            self.assertGreaterEqual(after["x"], stack["x"] - 0.5, size)
+            self.assertLessEqual(self.right(after), self.right(stack) + 0.5, size)
+            self.assertLessEqual(self.bottom(after), data["actual"][1] + 0.5, size)
+
+
+class QmlStagePanelTests(QmlRenderedLayoutTestCase):
+    """Measure the rendered panel, not the QML text that was meant to build it."""
+
+    def controls(self):
+        return self.report["stageControls"]
 
     def test_every_stage_gets_a_switch_and_a_rate_control(self):
-        self.assertEqual(len(self.report["switches"]), 3, self.report["switches"])
-        self.assertEqual(self.report["sliders"], 3)
-        for label in self.report["switches"]:
+        controls = self.controls()
+        self.assertEqual(len(controls["switches"]), 3, controls["switches"])
+        self.assertEqual(controls["count"], 3)
+        for label in controls["switches"]:
             self.assertTrue(label, "a stage switch rendered with no label")
 
-    def test_the_shush_warning_is_hidden_until_the_face_stage_goes_off(self):
-        self.assertFalse(self.report["warningVisibleBefore"])
-        self.assertTrue(self.report["warningVisibleAfter"])
-        # Visible and actually occupying the page, not a zero-height stub.
-        self.assertGreater(self.report["warningHeight"], 20)
-        self.assertIn("ledctl next-theme", self.report["warningText"])
-        self.assertFalse(self.report["warningVisibleRestored"])
+    def test_the_measurement_poll_does_not_rebuild_the_rate_sliders(self):
+        """The stageIds binding trap, checked on the objects themselves.
 
-    def test_driving_the_panel_logs_no_qml_warnings(self):
-        self.assertEqual(self.report["messages"], [])
-        self.assertEqual(self.report["lastError"], "")
+        A Repeater rebuilds every delegate when its model changes. stageStats
+        changes on the 100 ms poll, so a repeater bound to it would destroy and
+        recreate these sliders ten times a second and leave them undraggable.
+        The probe tags each slider before republishing the measurements twenty
+        times; a tag that did not survive means a new object is on screen.
+        """
+        controls = self.controls()
+        self.assertEqual(controls["names"],
+                         ["stageRate0", "stageRate1", "stageRate2"])
+        self.assertEqual(controls["tagsAfter"], [0, 1, 2],
+                         "the rate sliders were rebuilt by the poll")
+        self.assertEqual(controls["enabledAfter"], [True, True, True])
+        self.assertEqual(controls["valuesAfter"], controls["valuesBefore"])
 
 
 class QmlTeardownTests(unittest.TestCase):
