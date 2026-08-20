@@ -1,5 +1,6 @@
 import errno
 import hashlib
+import io
 import hmac
 import http.client
 import inspect
@@ -7,7 +8,9 @@ import ipaddress
 import json
 import os
 import re
+import shutil
 import socket
+import subprocess
 import stat
 import struct
 import sys
@@ -97,7 +100,13 @@ from acesvision.smoothing import (
     ease_factor,
     fade_out_s,
 )
-from acesvision.pipeline import PipelineState, VisionPipeline
+from acesvision.pipeline import (
+    DROP_OLD_JOIN_S,
+    LOSSLESS_QUEUE_FRAMES,
+    PipelineState,
+    VisionPipeline,
+    _OutputWorker,
+)
 from acesvision import perception
 from acesvision.events import (
     GestureEventOutput,
@@ -7656,6 +7665,267 @@ class ArcFaceSessionTests(unittest.TestCase):
         self.assertIn("never downloads models automatically",
                       str(caught.exception))
 
+
+# ---------------------------------------------------------------------------
+# Backpressure — the fan-out mode a recorder needs and a preview must not get.
+# ---------------------------------------------------------------------------
+
+
+class BlockingOutput:
+    """An encoder that has fallen behind: publish + close, and nothing else.
+
+    That is the entire ``FrameOutput`` protocol, deliberately — an output that
+    does not care about loss must not have to grow a method to say so, so the
+    worker looks ``note_dropped`` up rather than requiring it.
+
+    ``release`` lets exactly ``count`` frames through, so a test can put the
+    queue in a known state instead of racing it.
+    """
+
+    def __init__(self):
+        self.published = []
+        self.closed = 0
+        self._gate = threading.Semaphore(0)
+
+    def release(self, count=1):
+        for _ in range(count):
+            self._gate.release()
+
+    def publish(self, scene):
+        self._gate.acquire()
+        self.published.append(scene.sequence)
+
+    def close(self):
+        self.closed += 1
+        self._gate.release()          # never leave the worker parked on stop
+
+
+class LossAwareOutput(BlockingOutput):
+    """The same, plus the optional hook a recorder implements."""
+
+    def __init__(self):
+        super().__init__()
+        self.dropped_notices = 0
+
+    def note_dropped(self, count=1):
+        self.dropped_notices += count
+
+
+class OutputWorkerModeTests(unittest.TestCase):
+    """``_OutputWorker`` has two mailboxes and one contract."""
+
+    def worker(self, output, **kwargs):
+        worker = _OutputWorker(output, **kwargs)
+        self.addCleanup(worker.join, 5.0)
+        self.addCleanup(worker.stop)
+        return worker
+
+    def scene(self, sequence):
+        source = SourceSpec.from_mapping({"type": "webcam"})
+        return SceneFrame(source, sequence, float(sequence), None)
+
+    def test_the_default_mailbox_still_drops_old_frames(self):
+        """The preview's contract, unchanged: newest wins, the rest counted."""
+        output = BlockingOutput()
+        worker = self.worker(output)
+        worker.start()
+        for sequence in range(10):
+            worker.submit(self.scene(sequence))
+        self.assertFalse(worker.lossless)
+        self.assertGreaterEqual(worker.dropped, 8)
+        # And the producer never waited: ten submits against a blocked
+        # consumer returned without a single frame being taken.
+        self.assertEqual(output.published, [])
+
+    def test_a_lossless_worker_keeps_every_frame_it_is_given(self):
+        output = BlockingOutput()
+        worker = self.worker(output, lossless=True)
+        worker.start()
+        for sequence in range(10):
+            worker.submit(self.scene(sequence))
+        output.release(10)
+        deadline = time.monotonic() + 5.0
+        while len(output.published) < 10 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(output.published, list(range(10)))
+        self.assertEqual(worker.dropped, 0)
+
+    def test_a_full_queue_makes_the_producer_wait(self):
+        """Backpressure, measured: the submit that fills the queue blocks.
+
+        This is the whole point of the mode. Capture fps dips here, visibly,
+        instead of the recording losing time invisibly.
+        """
+        output = BlockingOutput()
+        worker = self.worker(output, lossless=True, maxsize=2,
+                             put_timeout_s=0.2)
+        worker.start()
+        worker.submit(self.scene(0))      # taken by the consumer, or queued
+        worker.submit(self.scene(1))
+        worker.submit(self.scene(2))
+        started = time.monotonic()
+        worker.submit(self.scene(3))      # queue full: this one has to wait
+        waited = time.monotonic() - started
+        self.assertGreaterEqual(waited, 0.15)
+        self.assertEqual(worker.dropped, 1)
+
+    def test_an_overflow_is_counted_and_the_output_is_told(self):
+        output = LossAwareOutput()
+        worker = self.worker(output, lossless=True, maxsize=1,
+                             put_timeout_s=0.01)
+        worker.start()
+        for sequence in range(6):
+            worker.submit(self.scene(sequence))
+        self.assertGreater(worker.dropped, 0)
+        # Counted in the worker *and* handed to the output, because only the
+        # output writes the file that has the gap in it.
+        self.assertEqual(output.dropped_notices, worker.dropped)
+
+    def test_note_dropped_is_optional(self):
+        """``FrameOutput`` is publish + close. The loss hook is extra."""
+        output = BlockingOutput()
+        self.assertFalse(hasattr(output, "note_dropped"))
+        worker = self.worker(output, lossless=True, maxsize=1,
+                             put_timeout_s=0.01)
+        worker.start()
+        for sequence in range(6):
+            worker.submit(self.scene(sequence))
+        self.assertGreater(worker.dropped, 0)
+        self.assertEqual(worker.last_error, "")
+
+    def test_a_lossless_worker_drains_what_is_queued_before_it_closes(self):
+        """Stop must not put the gap at the end of the file instead."""
+        output = BlockingOutput()
+        worker = self.worker(output, lossless=True)
+        worker.start()
+        for sequence in range(5):
+            worker.submit(self.scene(sequence))
+        worker.stop()
+        output.release(5)
+        worker.join(5.0)
+        self.assertEqual(output.published, list(range(5)))
+        self.assertEqual(output.closed, 1)
+
+    def test_close_runs_on_the_lossless_path_too(self):
+        """The finalisation seam. Without it the MP4 has no moov atom."""
+        for lossless in (False, True):
+            with self.subTest(lossless=lossless):
+                output = BlockingOutput()
+                worker = _OutputWorker(output, lossless=lossless)
+                worker.start()
+                worker.stop()
+                worker.join(5.0)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(output.closed, 1)
+
+    def test_a_worker_out_of_drain_time_counts_what_it_abandons(self):
+        """Even the give-up path is accounted for. The tail of the recording
+        is then short by a number somebody can read."""
+        output = LossAwareOutput()
+        worker = self.worker(output, lossless=True, drain_timeout_s=0.0)
+        worker.start()
+        for sequence in range(5):
+            worker.submit(self.scene(sequence))
+        worker.stop()
+        worker.join(5.0)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(worker.dropped + len(output.published), 5)
+        self.assertEqual(output.dropped_notices, worker.dropped)
+        self.assertEqual(output.closed, 1)
+
+    def test_a_frame_submitted_after_the_loop_exits_is_not_lost_silently(self):
+        """``remove_output`` stops a worker while the capture loop is still
+        submitting, so a frame can land after the consumer has given up."""
+        output = LossAwareOutput()
+        # Never started: the point is the state of the queue *after* the
+        # consumer loop has stopped reading it.
+        worker = _OutputWorker(output, lossless=True)
+        worker._queue.put(self.scene(0))
+        worker._queue.put(self.scene(1))
+        worker._drain_abandoned()
+        self.assertEqual(worker.dropped, 2)
+        self.assertEqual(output.dropped_notices, 2)
+        self.assertTrue(worker._queue.empty())
+
+    def test_a_lossless_worker_is_given_longer_to_shut_down(self):
+        drop_old = _OutputWorker(BlockingOutput())
+        lossless = _OutputWorker(BlockingOutput(), lossless=True)
+        self.assertGreater(lossless.join_timeout_s, drop_old.join_timeout_s)
+
+
+class PipelineDropMetricTests(unittest.TestCase):
+    """The drop count reaches pipeline metrics, where the GUI can read it."""
+
+    def workers(self, *specs):
+        made = []
+        for lossless, dropped in specs:
+            worker = _OutputWorker(BlockingOutput(), lossless=lossless)
+            worker.dropped = dropped
+            made.append(worker)
+        return tuple(made)
+
+    def test_only_lossless_drops_are_reported(self):
+        """A preview behind a 60 fps camera drops most frames and is fine.
+
+        Summing the two would report a healthy system as lossy and bury the
+        number that means something.
+        """
+        metrics = VisionPipeline._output_drop_metrics(
+            self.workers((False, 5000), (True, 3)))
+        self.assertEqual(metrics["dropped_output_frames"], 3)
+        self.assertEqual(list(metrics["output_drops"]), ["BlockingOutput"])
+
+    def test_a_healthy_recorder_publishes_a_zero_not_an_absence(self):
+        metrics = VisionPipeline._output_drop_metrics(self.workers((True, 0)))
+        self.assertEqual(metrics["dropped_output_frames"], 0)
+        self.assertEqual(metrics["output_drops"], {"BlockingOutput": 0})
+
+    def test_two_recorders_do_not_collide_on_one_key(self):
+        """A dict merge here would silently delete one of the two counts."""
+        metrics = VisionPipeline._output_drop_metrics(
+            self.workers((True, 1), (True, 2)))
+        self.assertEqual(metrics["dropped_output_frames"], 3)
+        self.assertEqual(sorted(metrics["output_drops"].values()), [1, 2])
+        self.assertEqual(len(metrics["output_drops"]), 2)
+
+    def test_the_metric_is_json_safe_for_the_event_api(self):
+        json.dumps(VisionPipeline._output_drop_metrics(self.workers((True, 4))))
+
+    def test_the_live_pipeline_publishes_the_count(self):
+        """End to end through the real capture loop, not the helper."""
+        source = SourceSpec.from_mapping({"type": "webcam", "index": 0})
+        # Real arrays: the capture loop runs a quality probe over the frame
+        # every 30 frames, and it is cv2 all the way down.
+        frame = np.zeros((8, 8, 3), dtype=np.uint8)
+        capture = ScriptedCapture([frame] * 400)
+        seen = threading.Event()
+
+        def processor(frame, src, sequence, captured_at):
+            return SceneFrame(src, sequence, captured_at, frame)
+
+        pipeline = VisionPipeline(source, processor, [],
+                                  opener=lambda _: capture,
+                                  retry_min_s=0.001, retry_max_s=0.002)
+        wedged = LossAwareOutput()
+        pipeline.add_output(wedged, lossless=True)
+        pipeline.add_output(CallbackOutput(lambda scene: seen.set()))
+        pipeline.start()
+        self.addCleanup(pipeline.join, 20.0)
+        self.addCleanup(pipeline.stop)
+        self.assertTrue(seen.wait(5.0))
+
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline:
+            metrics = pipeline.state().metrics
+            if metrics.get("dropped_output_frames", 0) > 0:
+                break
+            time.sleep(0.02)
+        self.assertGreater(metrics.get("dropped_output_frames", 0), 0)
+        self.assertEqual(sum(metrics["output_drops"].values()),
+                         metrics["dropped_output_frames"])
+        self.assertEqual(wedged.dropped_notices,
+                         metrics["dropped_output_frames"])
+        wedged.release(200)
 
 if __name__ == "__main__":
     unittest.main()
