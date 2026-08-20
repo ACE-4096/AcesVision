@@ -67,8 +67,31 @@ def render(scene: SceneFrame, profile: OverlayProfile = MINIMAL):
 
 
 def _box(frame, item, label, colour, profile):
+    """Draw one box, composited if the item asks to be drawn part-way in.
+
+    ``alpha`` is the *only* concession this renderer makes to time, and it is
+    not one it makes on its own: the number arrives on the item, from
+    ``smoothing.SceneSmoother``, which is the single place that knows anything
+    about previous frames. ``render`` stays a pure function of the scene it is
+    handed — an item without an alpha (every ``Detection``, ``Face`` and
+    ``Gesture`` as the detectors emit them) draws exactly as it always did.
+    """
+    alpha = float(getattr(item, "alpha", 1.0))
+    if alpha <= 0.0:
+        return
     x, y = int(item.x), int(item.y)
     w, h = int(item.w), int(item.h)
+    if alpha >= 1.0:
+        _draw(frame, x, y, w, h, label, colour, profile)
+        return
+    # Draw onto a copy and composite it back, so overlapping fading boxes
+    # blend with the image rather than accumulating on each other.
+    layer = frame.copy()
+    _draw(layer, x, y, w, h, label, colour, profile)
+    cv2.addWeighted(layer, alpha, frame, 1.0 - alpha, 0.0, dst=frame)
+
+
+def _draw(frame, x, y, w, h, label, colour, profile):
     cv2.rectangle(frame, (x, y), (x + w, y + h), colour, profile.line_width)
     cv2.putText(frame, label, (x, max(18, y - 8)),
                 cv2.FONT_HERSHEY_SIMPLEX, profile.font_scale, colour,

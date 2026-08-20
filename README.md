@@ -262,6 +262,56 @@ The camera selector shows the Linux camera number, hardware name, capture type,
 and `/dev/videoN` path. AcesVision starts with the first real colour camera;
 IR and virtual devices remain available for explicit selection.
 
+### Smoothing: easing the frames inference does not refresh
+
+Wherever capture outruns inference, several consecutive frames carry the same
+detections — `FaceGestureProcessor` hands out the last *completed* result, by
+design, so that capture never waits. Drawn as-is, boxes hold still and then
+jump. `acesvision/smoothing.py` sits between the scene and the renderer and
+eases them.
+
+It is a critically damped ease — a first-order lag, the zero-overshoot case —
+with a time constant of `max(0, inference_interval - dt)`: the part of the gap
+between inference results the capture loop has to fill with repeats. The box
+glides across the stale window and arrives about as the next real detection
+lands. It is **not** interpolation (no frame is buffered, so no latency is
+added) and **not** extrapolation (a box never goes anywhere the detector has
+not already been, so it cannot overshoot and snap back). On a recording there
+is no on-screen reference truth: a box a fraction of a frame behind reads as
+tracking, one that overshoots and corrects reads as broken.
+
+When inference already keeps up with capture the time constant is zero, the
+ease factor is exactly 1.0 and the filter is the identity. That falls out of
+the arithmetic rather than out of a special case, and it is what happens on the
+camera-limited USB path above.
+
+Per stage, because the stages are not alike:
+
+| Stage | Rate | Treatment |
+|---|---|---|
+| Objects | inference rate | Matched on `track_id`, eased in x/y/w/h. New tracks fade in at their **true** position, never eased in from nowhere; lost tracks are held and faded, capped at two inference intervals. |
+| Faces | 2 Hz | Fade only. `Face` has no `track_id`, and easing a box over a 500 ms interval walks it off the face it is naming. Matched on name plus overlap. |
+| Gestures | 15 Hz | Fade only, and deliberately no label debouncing: `GestureEventOutput` already owns hold and cooldown, and a second definition of "the gesture is on" would eventually disagree with the one that fires the automations. |
+
+Two things it must not do, both of which are pinned by tests:
+
+- **A disabled stage clears instantly.** `set_stage_enabled` clears results
+  rather than freezing them, on purpose. A fade-out applied to that clear would
+  put boxes the operator has just switched off back on screen for a quarter of
+  a second, which looks exactly like the stage controls not working. The enable
+  flags in `scene.metadata` are read first.
+- **`render` stays stateless.** Its only change is reading an `alpha` off the
+  item and compositing when it is below 1. Everything that knows about previous
+  frames lives in the smoother, so the renderer remains a pure function of the
+  scene it is handed.
+
+Each rendering output constructs its **own** smoother and never shares one.
+`_OutputWorker` is a one-slot drop-old mailbox on its own thread, so every
+output sees a different subset of frames; a shared smoother would be raced
+across those threads and would advance its clock against frames a given output
+never received. Note that the GUI preview and `/latest.jpg` both poll at 100 ms,
+so this lands in the OBS feed and in recordings, not in the preview.
+
 ### The network capture path: newest frame wins
 
 A network source is read on its own thread and only the newest frame is kept
