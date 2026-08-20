@@ -82,8 +82,20 @@ from acesvision.discovery import (
     scan_droidcam,
     scan_plan,
 )
-from acesvision.outputs import CallbackOutput
-from acesvision.overlay import CLEAN, OverlayProfile, render
+from acesvision.outputs import (
+    CallbackOutput,
+    LatestFrameOutput,
+    ObsVirtualCameraOutput,
+)
+from acesvision.overlay import CLEAN, MINIMAL, OverlayProfile, render
+from acesvision.smoothing import (
+    FADE_IN_S,
+    FADE_OUT_S,
+    SceneSmoother,
+    SmoothedItem,
+    ease_factor,
+    fade_out_s,
+)
 from acesvision.pipeline import PipelineState, VisionPipeline
 from acesvision import perception
 from acesvision.events import (
@@ -748,6 +760,436 @@ class OverlayTests(unittest.TestCase):
         green_frame = render(self.scene, green)
         self.assertFalse(np.array_equal(red_frame, green_frame))
         self.assertTrue(np.array_equal(self.raw, np.zeros_like(self.raw)))
+
+
+class FakeClock:
+    """The injectable clock the smoother is written against, driven by hand.
+
+    Same idiom as ``GestureEventOutput``'s ``clock``: nothing in the smoother
+    reads a real clock, so every test below is exact rather than approximate.
+    """
+
+    def __init__(self, start=1000.0):
+        self.now = float(start)
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += float(seconds)
+        return self.now
+
+
+class SceneSmootherTests(unittest.TestCase):
+    """The temporal filter that sits between the detectors and the renderer."""
+
+    # The operating point this filter was specified against: 60 fps capture
+    # against 40 fps inference, so roughly every third captured frame carries
+    # a fresh detection and the two either side repeat it verbatim. That
+    # repeat is the flicker. (Not a claim about any particular camera — the
+    # USB webcam in the README is camera-limited well below this, which is the
+    # identity case and is tested as such.)
+    CAPTURE_DT = 1.0 / 60.0
+    INFERENCE_FPS = 40.0
+
+    def setUp(self):
+        self.clock = FakeClock()
+        self.smoother = SceneSmoother(clock=self.clock)
+        self.source = SourceSpec.from_mapping({"type": "webcam"})
+        self.raw = np.zeros((100, 200, 3), dtype=np.uint8)
+        self.sequence = 0
+
+    def scene(self, objects=(), faces=(), gestures=(), fps=None, **flags):
+        metadata = {"inference_fps": self.INFERENCE_FPS if fps is None else fps}
+        metadata.update(flags)
+        self.sequence += 1
+        return SceneFrame(self.source, self.sequence, float(self.sequence),
+                          self.raw, objects=list(objects), faces=list(faces),
+                          gestures=list(gestures), metadata=metadata)
+
+    def step(self, objects=(), faces=(), gestures=(), dt=None, **kwargs):
+        """One captured frame later, through this smoother."""
+        self.clock.advance(self.CAPTURE_DT if dt is None else dt)
+        return self.smoother.apply(self.scene(objects, faces, gestures, **kwargs))
+
+    # ---- the ease ---------------------------------------------------------
+
+    def test_the_ease_converges_on_the_new_box_and_never_passes_it(self):
+        """Critically damped, so lag — never overshoot.
+
+        On a recording there is no on-screen reference truth: a box a fraction
+        of a frame behind reads as tracking, one that overshoots and snaps
+        back reads as broken.
+        """
+        detection = Detection(10, 10, 20, 20, "person", 0.9, 1)
+        self.step([detection])
+        moved = detection._replace(x=110)
+        travel = [self.step([moved]).objects[0].x for _ in range(12)]
+
+        self.assertGreater(travel[0], 10.0)   # it moved,
+        self.assertLess(travel[0], 110.0)     # but not the whole way at once.
+        for previous, current in zip(travel, travel[1:]):
+            self.assertGreaterEqual(current, previous)
+            self.assertLessEqual(current, 110.0)
+        self.assertAlmostEqual(travel[-1], 110.0, places=3)
+
+    def test_inference_at_or_above_the_capture_rate_is_the_identity(self):
+        """No repeated frames, nothing to smooth. Falls out of the arithmetic
+        rather than out of a special case."""
+        detection = Detection(10, 10, 20, 20, "person", 0.9, 1)
+        for fps in (60.0, 90.0):
+            with self.subTest(inference_fps=fps):
+                smoother = SceneSmoother(clock=self.clock)
+                smoother.apply(self.scene([detection], fps=fps))
+                self.clock.advance(self.CAPTURE_DT)
+                moved = detection._replace(x=110, y=55, w=44)
+                item = smoother.apply(self.scene([moved], fps=fps)).objects[0]
+                self.assertEqual((item.x, item.y, item.w, item.h),
+                                 (110.0, 55.0, 44.0, 20.0))
+                self.assertEqual(item.alpha, 1.0)
+
+    def test_the_ease_factor_is_bounded_and_degenerates_to_identity(self):
+        self.assertEqual(ease_factor(self.CAPTURE_DT, self.CAPTURE_DT), 1.0)
+        self.assertEqual(ease_factor(self.CAPTURE_DT, 1.0 / 120.0), 1.0)
+        # No measured inference rate yet: smooth nothing, invent nothing.
+        self.assertEqual(ease_factor(self.CAPTURE_DT, 0.0), 1.0)
+        # No time passed: nothing moves.
+        self.assertEqual(ease_factor(0.0, 0.025), 0.0)
+        for interval in (0.02, 0.025, 0.05, 0.1, 0.5):
+            with self.subTest(interval=interval):
+                factor = ease_factor(self.CAPTURE_DT, interval)
+                self.assertGreater(factor, 0.0)
+                self.assertLessEqual(factor, 1.0)
+        # Slower inference, longer stale window, gentler ease.
+        self.assertLess(ease_factor(self.CAPTURE_DT, 0.1),
+                        ease_factor(self.CAPTURE_DT, 0.05))
+
+    def test_the_first_frame_a_smoother_sees_is_drawn_in_full(self):
+        """A still — /latest.jpg, a snapshot — must not come out half
+        transparent because the stream had only just started. There is no
+        mid-stream for a box to have appeared out of on frame one."""
+        detection = Detection(10, 10, 20, 20, "person", 0.9, 1)
+        item = self.smoother.apply(self.scene([detection])).objects[0]
+        self.assertEqual(item.alpha, 1.0)
+        self.assertEqual((item.x, item.y), (10.0, 10.0))
+
+    # ---- fades ------------------------------------------------------------
+
+    def test_a_new_track_fades_in_at_its_true_position(self):
+        """Never eased in from nowhere: a box sliding in from the origin is a
+        claim the detector never made."""
+        self.step([])
+        detection = Detection(10, 10, 20, 20, "person", 0.9, 7)
+        born = self.step([detection]).objects[0]
+        self.assertEqual((born.x, born.y, born.w, born.h), (10.0, 10.0, 20.0, 20.0))
+        self.assertAlmostEqual(born.alpha, self.CAPTURE_DT / FADE_IN_S, places=6)
+        self.assertLess(born.alpha, 1.0)
+
+        alphas = [born.alpha]
+        for _ in range(9):   # 9 more frames at 60 fps is 150 ms
+            alphas.append(self.step([detection]).objects[0].alpha)
+        for previous, current in zip(alphas, alphas[1:]):
+            self.assertGreaterEqual(current, previous)
+        self.assertEqual(alphas[-1], 1.0)
+
+    def test_a_lost_track_is_held_and_faded_capped_at_two_inference_intervals(self):
+        """A ghost must not outlive the evidence for it by more than two
+        chances to be re-detected. At 10 fps that cap (0.2 s) binds before the
+        0.25 s default does."""
+        self.assertAlmostEqual(fade_out_s(0.1), 0.2)      # cap binds
+        self.assertEqual(fade_out_s(0.5), FADE_OUT_S)     # default binds
+        self.assertEqual(fade_out_s(0.0), 0.0)            # no rate, no ghost
+
+        detection = Detection(10, 10, 20, 20, "person", 0.9, 3)
+        self.step([detection], fps=10.0)
+        self.assertEqual(self.step([detection], fps=10.0).objects[0].alpha, 1.0)
+
+        scene = self.step([], fps=10.0)
+        held = scene.objects[0]
+        self.assertEqual((held.x, held.y), (10.0, 10.0))   # held, not moved
+        self.assertLess(held.alpha, 1.0)
+
+        elapsed = self.CAPTURE_DT
+        for _ in range(200):
+            if not scene.objects:
+                break
+            scene = self.step([], fps=10.0)
+            elapsed += self.CAPTURE_DT
+        self.assertEqual(scene.objects, [])
+        self.assertLessEqual(elapsed, 0.2 + self.CAPTURE_DT)
+        self.assertGreater(elapsed, 0.2 - 2 * self.CAPTURE_DT)
+
+    def test_a_slow_inference_rate_does_not_stretch_the_ghost_past_the_default(self):
+        detection = Detection(10, 10, 20, 20, "person", 0.9, 4)
+        self.step([detection], fps=2.0)
+        self.step([detection], fps=2.0)
+        scene, elapsed = self.step([], fps=2.0), self.CAPTURE_DT
+        for _ in range(200):
+            if not scene.objects:
+                break
+            scene = self.step([], fps=2.0)
+            elapsed += self.CAPTURE_DT
+        self.assertEqual(scene.objects, [])
+        self.assertLessEqual(elapsed, FADE_OUT_S + self.CAPTURE_DT)
+
+    # ---- the stage switches ----------------------------------------------
+
+    def test_switching_a_stage_off_clears_it_instantly_instead_of_fading(self):
+        """The trap this filter had to avoid.
+
+        ``FaceGestureProcessor.set_stage_enabled`` clears a disabled stage's
+        results rather than freezing them, deliberately, and
+        ``test_disabling_the_face_stage_skips_it_and_clears_the_boxes`` pins
+        that. A fade-out applied to that clear would put the boxes the
+        operator has just switched off back on screen for up to a quarter of a
+        second — which looks exactly like the stage controls not working.
+        """
+        detection = Detection(10, 10, 20, 20, "person", 0.9, 1)
+        face = Face(10, 20, 30, 40, "Toby", 0.2, True)
+        gesture = Gesture("Victory", 0.9, 60, 20, 20, 30)
+        self.step([detection], [face], [gesture])
+        scene = self.step([detection], [face], [gesture])
+        self.assertEqual((len(scene.objects), len(scene.faces),
+                          len(scene.gestures)), (1, 1, 1))
+
+        off = dict(object_enabled=False, face_enabled=False,
+                   gesture_enabled=False)
+        scene = self.step(**off)
+        self.assertEqual((scene.objects, scene.faces, scene.gestures),
+                         ([], [], []))
+        # Still gone on the next frame: no state was kept to come back from.
+        scene = self.step(**off)
+        self.assertEqual((scene.objects, scene.faces, scene.gestures),
+                         ([], [], []))
+
+        # One stage going off does not disturb one that is still on.
+        scene = self.step([detection], face_enabled=False)
+        self.assertEqual(len(scene.objects), 1)
+        self.assertEqual(scene.faces, [])
+
+    def test_boxes_that_merely_vanish_do_still_fade(self):
+        """The contrast that makes the instant clear a decision rather than an
+        accident: identical empty lists, opposite behaviour, and the only
+        difference is the enable flag the processor publishes."""
+        detection = Detection(10, 10, 20, 20, "person", 0.9, 1)
+        self.step([detection])
+        self.step([detection])
+        faded = self.step([]).objects
+        self.assertEqual(len(faded), 1)
+        self.assertLess(faded[0].alpha, 1.0)
+        self.assertGreater(faded[0].alpha, 0.0)
+
+    # ---- per-stage treatment ---------------------------------------------
+
+    def test_faces_move_the_moment_the_detector_does_but_objects_ease(self):
+        """``Face`` has no track_id and refreshes at 2 Hz. Easing a face box
+        over a 500 ms interval walks it off the face it is naming, which is
+        worse than a still box — so faces fade, and only fade."""
+        face = Face(10, 20, 30, 40, "Toby", 0.2, True)
+        detection = Detection(10, 20, 30, 40, "person", 0.9, 1)
+        self.step([detection], [face])
+        scene = self.step([detection._replace(x=20)], [face._replace(x=20)])
+        self.assertEqual(scene.faces[0].x, 20.0)
+        self.assertEqual(scene.faces[0].name, "Toby")
+        self.assertGreater(scene.objects[0].x, 10.0)
+        self.assertLess(scene.objects[0].x, 20.0)
+
+    def test_a_face_that_leaves_fades_rather_than_disappearing(self):
+        face = Face(10, 20, 30, 40, "Toby", 0.2, True)
+        self.step(faces=[face])
+        self.step(faces=[face])
+        scene = self.step(faces=[])
+        self.assertEqual(len(scene.faces), 1)
+        self.assertEqual((scene.faces[0].x, scene.faces[0].y), (10.0, 20.0))
+        self.assertLess(scene.faces[0].alpha, 1.0)
+
+    def test_gestures_fade_but_are_never_debounced(self):
+        """``GestureEventOutput`` already owns hold and cooldown. A second
+        definition of 'the gesture is on' living here would eventually
+        disagree with the one that fires the automations, so a gesture is
+        drawn the frame it arrives and named the frame it changes."""
+        gesture = Gesture("Victory", 0.9, 60, 20, 20, 30)
+        self.step(gestures=[gesture])
+        scene = self.step(gestures=[gesture._replace(x=65)])
+        self.assertEqual(scene.gestures[0].x, 65.0)
+
+        changed = self.step(gestures=[Gesture("Thumb_Up", 0.9, 60, 20, 20, 30)])
+        self.assertIn("Thumb_Up", [item.name for item in changed.gestures])
+        self.assertGreater(
+            [item.alpha for item in changed.gestures
+             if item.name == "Thumb_Up"][0], 0.0)
+
+    def test_an_object_with_no_track_id_is_passed_through_untouched(self):
+        """Two untracked boxes cannot be told apart between frames, and
+        guessing which is which is the one thing this module refuses to do."""
+        untracked = Detection(10, 10, 20, 20, "cup", 0.5, None)
+        self.step([untracked])
+        scene = self.step([untracked._replace(x=90)])
+        self.assertEqual(scene.objects[0].x, 90.0)
+        self.assertEqual(scene.objects[0].alpha, 1.0)
+        self.assertEqual(self.step([]).objects, [])   # and leaves no ghost
+
+    # ---- ownership and purity --------------------------------------------
+
+    def test_two_smoothers_fed_different_frames_do_not_interfere(self):
+        """``pipeline._OutputWorker`` is a one-slot drop-old mailbox, so every
+        output sees a *different subset* of frames. A shared smoother would be
+        raced across those threads and would advance its clock against frames
+        a given output never received."""
+        fast = SceneSmoother(clock=self.clock)
+        slow = SceneSmoother(clock=self.clock)
+        start = Detection(10, 10, 20, 20, "person", 0.9, 1)
+        moved = start._replace(x=110)
+        first = self.scene([start])
+        fast.apply(first)
+        slow.apply(first)
+
+        for _ in range(3):        # the fast output receives all three...
+            self.clock.advance(self.CAPTURE_DT)
+            fast_scene = fast.apply(self.scene([moved]))
+        slow_scene = slow.apply(self.scene([moved]))   # ...the slow one, one.
+
+        # The slow output had one long gap, longer than an inference interval,
+        # so there was nothing stale to smooth and it snapped. The fast one is
+        # still easing across the frames it actually received.
+        self.assertEqual(slow_scene.objects[0].x, 110.0)
+        self.assertLess(fast_scene.objects[0].x, 110.0)
+
+        # And no track crosses between them.
+        self.clock.advance(self.CAPTURE_DT)
+        slow.apply(self.scene([moved, Detection(0, 0, 5, 5, "cup", 0.5, 99)]))
+        fast_scene = fast.apply(self.scene([moved]))
+        self.assertEqual([item.track_id for item in fast_scene.objects], [1])
+
+    def test_switching_camera_forgets_the_previous_camera_s_boxes(self):
+        detection = Detection(10, 10, 20, 20, "person", 0.9, 1)
+        self.step([detection])
+        self.step([detection])
+        other = SourceSpec.from_mapping({"id": "other", "type": "webcam"})
+        self.clock.advance(self.CAPTURE_DT)
+        scene = self.smoother.apply(
+            SceneFrame(other, 9, 9.0, self.raw, metadata={"inference_fps": 40.0}))
+        self.assertEqual(scene.objects, [])
+
+    def test_apply_returns_a_new_frame_and_leaves_the_scene_alone(self):
+        detection = Detection(10, 10, 20, 20, "person", 0.9, 1)
+        scene = self.scene([detection])
+        out = self.smoother.apply(scene)
+        self.assertIsNot(out, scene)
+        self.assertIsNot(out.objects, scene.objects)
+        self.assertEqual(scene.objects, [detection])
+        self.assertIs(out.raw, scene.raw)
+        self.assertIs(out.metadata, scene.metadata)
+        self.assertEqual(out.sequence, scene.sequence)
+        self.assertEqual(out.contract_version, scene.contract_version)
+
+    def test_the_proxy_carries_everything_the_renderer_reads(self):
+        detection = Detection(10, 10, 20, 20, "person", 0.87, 42)
+        item = self.smoother.apply(self.scene([detection])).objects[0]
+        self.assertEqual(item.label, "person")
+        self.assertEqual(item.track_id, 42)
+        self.assertEqual(item.score, 0.87)
+        self.assertEqual(item.alpha, 1.0)
+        face = self.smoother.apply(
+            self.scene(faces=[Face(1, 2, 3, 4, "Toby", 0.2, True)])).faces[0]
+        self.assertEqual((face.name, face.conf, face.known), ("Toby", 0.2, True))
+
+
+class OverlayAlphaTests(unittest.TestCase):
+    """The overlay's only concession to time — and it stays a pure function.
+
+    ``render`` holds no cross-frame state: the alpha arrives *on the item*,
+    from ``smoothing.SceneSmoother``, which is the single place that knows
+    anything about previous frames.
+    """
+
+    def setUp(self):
+        self.raw = np.zeros((100, 200, 3), dtype=np.uint8)
+        self.source = SourceSpec.from_mapping({"type": "webcam"})
+        self.profile = OverlayProfile(show_faces=False, show_gestures=False)
+        self.detection = Detection(20, 40, 60, 30, "person", 0.9, 1)
+
+    def scene(self, item):
+        return SceneFrame(self.source, 1, 1.0, self.raw, objects=[item],
+                          metadata={})
+
+    def faded(self, alpha):
+        return SmoothedItem(self.detection, 20.0, 40.0, 60.0, 30.0, alpha)
+
+    def test_an_item_without_an_alpha_draws_exactly_as_it_always_did(self):
+        """The ~100 existing render tests pass namedtuples with no alpha at
+        all. Their path must be byte-identical to the alpha == 1 path."""
+        plain = render(self.scene(self.detection), self.profile)
+        wrapped = render(self.scene(self.faded(1.0)), self.profile)
+        self.assertTrue(np.array_equal(plain, wrapped))
+
+    def test_a_half_faded_box_is_composited_not_drawn_flat(self):
+        full = render(self.scene(self.faded(1.0)), self.profile).astype(float)
+        half = render(self.scene(self.faded(0.5)), self.profile).astype(float)
+        self.assertGreater(full.sum(), 0.0)
+        self.assertFalse(np.array_equal(full, half))
+        self.assertAlmostEqual(half.sum() / full.sum(), 0.5, places=2)
+        # Never brighter than the opaque draw anywhere: a fade only removes.
+        self.assertTrue(np.all(half <= full + 1.0))
+
+    def test_a_fully_faded_box_draws_nothing_at_all(self):
+        output = render(self.scene(self.faded(0.0)), self.profile)
+        self.assertTrue(np.array_equal(output, self.raw))
+        self.assertIsNot(output, self.raw)
+
+    def test_render_holds_no_state_between_calls(self):
+        opaque, half = self.detection, self.faded(0.4)
+        frames = [render(self.scene(item), self.profile).tobytes()
+                  for item in (opaque, half, opaque, half)]
+        self.assertEqual(frames[0], frames[2])
+        self.assertEqual(frames[1], frames[3])
+        self.assertNotEqual(frames[0], frames[1])
+        # And the scene's own frame is never written to.
+        self.assertTrue(np.array_equal(self.raw, np.zeros_like(self.raw)))
+
+
+class OutputSmootherOwnershipTests(unittest.TestCase):
+    """Every rendering output owns its own smoother. None of them share one."""
+
+    def setUp(self):
+        self.source = SourceSpec.from_mapping({"type": "webcam"})
+        self.raw = np.zeros((60, 200, 3), dtype=np.uint8)
+
+    def scene(self, sequence, objects):
+        return SceneFrame(self.source, sequence, float(sequence), self.raw,
+                          objects=list(objects),
+                          metadata={"inference_fps": 40.0})
+
+    def test_each_rendering_output_owns_its_own_smoother(self):
+        first, second = LatestFrameOutput(), LatestFrameOutput()
+        self.assertIsNot(first._smoother, second._smoother)
+        self.assertIsNot(first._smoother, ObsVirtualCameraOutput()._smoother)
+
+    def test_the_preview_feed_is_eased_while_the_kept_scene_is_not(self):
+        """The JPEG is the picture and is eased. The scene kept for callers is
+        the record of what was actually detected, and is handed back as it
+        arrived."""
+        import cv2
+
+        output = LatestFrameOutput(MINIMAL)
+        # Substitute the clock, not the ownership: the output still holds one
+        # smoother of its own, this one just does not read wall time.
+        clock = FakeClock()
+        output._smoother = SceneSmoother(clock=clock)
+        start = Detection(5, 5, 20, 20, "person", 0.9, 1)
+        moved = start._replace(x=150)
+        output.publish(self.scene(0, [start]))
+        clock.advance(1.0 / 60.0)
+        second = self.scene(1, [moved])
+        output.publish(second)
+
+        kept, eased = output.snapshot()
+        self.assertIs(kept, second)
+        self.assertTrue(eased)
+        unsmoothed = cv2.imencode(
+            ".jpg", render(second, MINIMAL),
+            [cv2.IMWRITE_JPEG_QUALITY, output.jpeg_quality])[1].tobytes()
+        self.assertNotEqual(eased, unsmoothed)
 
 
 class GestureEventTests(unittest.TestCase):
