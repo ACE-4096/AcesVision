@@ -49,3 +49,10 @@ esp32cam/CameraWebServer/build/
 # local secrets for watch_person.py (Telegram creds)
 .env
 watch_cameras.json
+
+# Recordings — RecordingOutput refuses to write anywhere under this checkout
+# (acesvision/recording.py:refuse_repo_path), and this is the second lock on
+# the same door. A recording is a video of a room and the people in it; this
+# repository is published.
+*.mp4
+*.mp4.json
