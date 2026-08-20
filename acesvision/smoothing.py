@@ -73,6 +73,11 @@ one-slot drop-old mailbox, so every output sees a *different subset* of frames.
 A shared smoother would be raced across worker threads and would advance its
 clock against frames a given output never received.
 
+The lossless workers added for recording (``add_output(..., lossless=True)``)
+make this stricter rather than looser: a recorder sees *every* frame while the
+preview beside it sees a fraction of them, so the two are further apart than
+two drop-old outputs ever were.
+
 The stage switches
 ------------------
 ``processor.set_stage_enabled`` clears a disabled stage's results rather than

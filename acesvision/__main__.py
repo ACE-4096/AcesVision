@@ -25,6 +25,7 @@ from .policy import RuleEngine, RuleStore
 from .outputs import LatestFrameOutput, ObsVirtualCameraOutput
 from .overlay import BROADCAST, MINIMAL
 from .pipeline import VisionPipeline
+from .recording import DEFAULT_FPS, RecordingOutput, recordings_dir, resolve_path
 from .server import (
     BindRefused,
     VisionServer,
@@ -101,6 +102,24 @@ def build_parser():
     parser.add_argument("--obs-device", default=os.environ.get("FACE_ID_VCAM"))
     parser.add_argument("--no-events", action="store_true",
                         help="suppress gesture events (they are on by default)")
+    parser.add_argument("--record", nargs="?", const="", default=None,
+                        metavar="PATH",
+                        help=f"record the overlaid feed to a constant-rate MP4 "
+                             f"with a JSON sidecar beside it. PATH may be a "
+                             f"file or a directory; with no PATH it lands in "
+                             f"$ACESVISION_RECORDINGS or ~/Videos/AcesVision. "
+                             f"Never inside this repository.")
+    parser.add_argument("--record-fps", type=int, default=DEFAULT_FPS,
+                        help=f"constant frame rate of the recording (default "
+                             f"{DEFAULT_FPS}). Capture is fitted to it by "
+                             f"duplicating or dropping frames; the sidecar "
+                             f"keeps every frame's true capture time either "
+                             f"way.")
+    parser.add_argument("--record-hw", action="store_true",
+                        help="encode with VAAPI (h264_vaapi) instead of "
+                             "libx264. Measure it before you trust it: the "
+                             "same GPU is running YOLO, so the reason to want "
+                             "this is giving CPU back to inference, not speed.")
     parser.add_argument("--hold-frames", type=int, default=6,
                         help="frames a gesture must persist before it fires")
     parser.add_argument("--cooldown-s", type=float, default=1.5,
@@ -122,6 +141,21 @@ def build_rule_engine(args, store=None, executor=None):
     rules = store.load(strict=False)
     executor = default_registry() if executor is None else executor
     return RuleEngine(rules, executor=executor), list(store.rejected)
+
+
+def build_recorder(args, source, now=None, environ=None):
+    """The RecordingOutput for --record, or None.
+
+    Path resolution happens here rather than inside the output so that a
+    refused path (inside the repo, or an unwritable directory) fails at
+    startup with a message, rather than several seconds into a recording
+    nobody is going to get back.
+    """
+    if args.record is None:
+        return None
+    path = resolve_path(args.record, source.id, now=now, environ=environ)
+    return RecordingOutput(path, fps=args.record_fps, profile=BROADCAST,
+                           hardware=args.record_hw)
 
 
 def build_gesture_output(args, callback=None, engine=None, emitter=None):
@@ -244,6 +278,11 @@ def main():
     if args.obs:
         outputs.append(ObsVirtualCameraOutput(BROADCAST, device=args.obs_device))
 
+    try:
+        recorder = build_recorder(args, source)
+    except ValueError as exc:
+        raise SystemExit(f"[record] {exc}")
+
     pipeline = VisionPipeline(
         source, FaceGestureProcessor(
             detect_every=args.detect_every,
@@ -251,6 +290,12 @@ def main():
                                                    device=args.device),
         ), outputs
     )
+    if recorder is not None:
+        # lossless=True is not optional here. On the default drop-old mailbox a
+        # busy encoder removes time from the middle of the file and says
+        # nothing; with backpressure the capture fps dips instead and the
+        # recording stays continuous.
+        pipeline.add_output(recorder, lossless=True)
     server = VisionServer(latest, pipeline, host=host, port=args.port,
                           bus=emitter.bus, emitter=emitter, token=token)
 
@@ -260,6 +305,11 @@ def main():
           f"run with --print-token)")
     print(f"[yolo] model {args.model} on device {args.device!r}")
     print(f"[obs] {'enabled' if args.obs else 'disabled'}")
+    if recorder is None:
+        print(f"[record] disabled (--record writes to {recordings_dir()})")
+    else:
+        print(f"[record] {recorder.path} at {recorder.fps} fps, "
+              f"{'h264_vaapi' if recorder.hardware else 'libx264'}")
     print(f"[events] {'enabled' if gestures.enabled else 'disabled'} "
           f"(hold {gestures.hold_frames} frames, cooldown {gestures.cooldown_s:g}s)")
     print(f"[emitter] {'publishing' if emitter.publishing else 'not publishing'} "
@@ -287,9 +337,15 @@ def main():
     except KeyboardInterrupt:
         print("\n[stop]")
     finally:
+        # pipeline.stop() -> the capture loop's finally -> every worker's
+        # finally -> RecordingOutput.close(), which closes ffmpeg's stdin and
+        # waits for the moov atom. That chain is what makes Ctrl-C produce a
+        # playable file, so the join has to outlast a lossless worker's drain.
         pipeline.stop()
-        pipeline.join(timeout=5.0)
+        pipeline.join(timeout=30.0)
         server.stop()
+        if recorder is not None:
+            print(f"[record] {recorder.describe()}")
 
 
 if __name__ == "__main__":

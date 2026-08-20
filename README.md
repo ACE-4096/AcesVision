@@ -493,6 +493,72 @@ Example:
 FACE_ID_CAM=1 FACE_ID_ENGINE=lbph FACE_ID_LBPH_THRESH=60 python -m acesvision.gui
 ```
 
+## Recording
+
+```bash
+python -m acesvision --record                       # ~/Videos/AcesVision
+python -m acesvision --record /tmp/clips            # a directory
+python -m acesvision --record /tmp/clips/demo.mp4   # an exact file
+python -m acesvision --record --record-fps 60
+python -m acesvision --record --record-hw           # VAAPI instead of libx264
+```
+
+Files land in `$ACESVISION_RECORDINGS`, or `~/Videos/AcesVision`, named
+`acesvision-YYYYmmdd-HHMMSS-<source-id>.mp4`. Writing anywhere inside this
+checkout is **refused** — a recording is a video of a room and the people in
+it, and this repository is published.
+
+Every recording gets a JSON sidecar beside it (`<name>.mp4.json`) holding each
+frame's true `captured_at`, its sequence, its inference results and the run's
+counters. It supersedes `track_video.py --output-json`.
+
+Four things make the file usable rather than merely written:
+
+- **Piped to `ffmpeg`, not `cv2.VideoWriter`.** The pip OpenCV wheel bundles a
+  GPL-stripped FFmpeg: it reports `FFMPEG: YES` but `VA: NO`, and asking it for
+  `avc1` here falls through to `h264_v4l2m2m`, finds no device, and hands back
+  a writer whose `isOpened()` is `False` — a recorder that silently produces
+  nothing. It also exposes no CRF, no preset and no `+faststart`.
+- **`yuv420p` and `+faststart`.** Not tuning knobs. Browsers reject 4:4:4
+  H.264, and without `+faststart` the moov atom lands at the end of the file so
+  playback cannot begin until the whole thing has been fetched.
+- **Constant frame rate.** Capture is variable; VFR MP4 confuses editors and
+  social encoders. The recorder holds its own clock at `--record-fps` and
+  duplicates or drops from `scene.captured_at` to fit. The sidecar still
+  carries every frame's real capture time, so nothing is lost by that drop.
+- **Backpressure, not drop-old.** The recorder is added to the pipeline with
+  `lossless=True`, which swaps `_OutputWorker`'s one-slot mailbox for a bounded
+  queue and a blocking `submit`. A busy encoder then makes capture fps dip
+  where you can see it, instead of silently removing time from the middle of
+  the file. If the queue overflows anyway the loss is counted, published in
+  pipeline metrics as `dropped_output_frames`, and written into the sidecar.
+
+Ctrl-C finalises the file: stopping the pipeline stops the workers, and each
+worker's `finally` calls `close()`, which shuts ffmpeg's stdin and waits for
+the moov atom. `ffmpeg` is deliberately started in its own session so the
+terminal's SIGINT does not reach it and race that shutdown.
+
+### `--record-hw`, measured
+
+Measured on a Ryzen 5 5600X + Radeon RX 6600, 1280x720, real webcam frames,
+against a 30 fps budget of 33.3 ms/frame, with YOLO (`yolo26n`, ROCm) running:
+
+| encoder | ms/frame wall | ms/frame CPU | file size |
+|---------|---------------|--------------|-----------|
+| `libx264 -preset veryfast -crf 20` | 4.8 | 35.4 | 18.0 MB / 900 frames |
+| `h264_vaapi -qp 22` | 2.2 | 5.8 | 9.3 MB / 900 frames |
+
+Both are far inside the frame budget, so **neither is a throughput problem**.
+The difference that matters is the CPU column: x264 costs about one full
+core-equivalent of the twelve, VAAPI about a sixth of one. That is the reason
+to want `--record-hw` — handing CPU back to inference — and not speed.
+
+Two caveats before you take it. VAAPI encodes on the VCN block, which is
+separate silicon from the compute units YOLO uses, and this was measured with
+the GPU lightly loaded; a saturated GPU may not behave the same. And `-qp 22`
+is not `-crf 20`: the VAAPI file is about half the size at visibly lower
+quality. Measure your own operating point.
+
 ## OBS integration (overlay boxes on your OBS webcam feed)
 
 AcesVision's `ObsVirtualCameraOutput` (`acesvision/outputs.py`) republishes the

@@ -1,6 +1,31 @@
-"""Single-owner capture loop and drop-old frame fan-out."""
+"""Single-owner capture loop and per-output frame fan-out.
+
+Two fan-out modes, one worker class
+-----------------------------------
+``_OutputWorker`` is a one-slot **drop-old** mailbox by default, and that is
+right for everything that draws a picture: a preview or a virtual camera wants
+the *newest* frame, and a frame it could not keep up with is worth less than
+the one behind it. Producers never wait for those consumers.
+
+A recorder is the opposite. Drop-old on a recorder writes a file with silent
+time gaps in it — the encoder falls behind for 200 ms, the frames from that
+window are simply never written, and nothing anywhere says so. So
+``add_output(output, lossless=True)`` swaps the one slot for a bounded
+``queue.Queue`` and a blocking ``put``. A slow encoder then applies
+backpressure to the capture loop: capture fps visibly dips, the recording stays
+continuous, and every recorded frame is a real one.
+
+The queue is bounded rather than infinite on purpose. Unbounded, an encoder
+that has genuinely wedged would grow the queue until the machine died, and the
+frames in it would be minutes stale by the time they were written. Bounded, a
+wedged encoder eventually forces a decision, and the decision this module makes
+is: drop the frame, **count it**, publish the count in pipeline metrics, and
+tell the output itself so it can put the number in its own records. Silent loss
+is the one outcome that is not allowed.
+"""
 from __future__ import annotations
 
+import queue
 import threading
 import time
 from dataclasses import dataclass
@@ -10,6 +35,34 @@ import cv2
 
 from .contracts import SceneFrame, SourceSpec
 from .sources import open_source
+
+#: Frames a lossless worker will hold for a slow output before it has to
+#: choose between blocking the capture loop and admitting a loss. ~2 s at
+#: 60 fps, which is long enough to ride out an encoder hiccup and short enough
+#: that a wedged one is noticed rather than buffered into next week.
+LOSSLESS_QUEUE_FRAMES = 120
+
+#: How long ``submit`` blocks the capture loop when that queue is full. This
+#: *is* the backpressure: the capture loop waits here, so capture fps dips and
+#: the operator sees it. Past this, the encoder is not busy, it is wedged.
+LOSSLESS_PUT_TIMEOUT_S = 0.05
+
+#: How long a stopping lossless worker gets to drain what is already queued
+#: before the rest is counted as dropped. A recorder's queued frames are real
+#: footage; throwing them away at stop would put the gap at the end of the file
+#: instead of the middle, which is no better.
+LOSSLESS_DRAIN_TIMEOUT_S = 5.0
+
+#: How often a lossless worker wakes to notice ``stop()``. A ``queue.Queue``
+#: has no "wait for an item or a flag" primitive, and a sentinel ``put`` would
+#: itself block on the full queue this exists to survive.
+LOSSLESS_POLL_S = 0.05
+
+#: Seconds ``VisionPipeline`` waits for a worker to finish at shutdown. A
+#: drop-old worker has at most one frame left and is done immediately; a
+#: lossless one may have a queue to drain and an encoder to finalise.
+DROP_OLD_JOIN_S = 2.0
+LOSSLESS_JOIN_S = LOSSLESS_DRAIN_TIMEOUT_S + 2.0
 
 
 class FrameOutput(Protocol):
@@ -27,49 +80,164 @@ class PipelineState:
 
 
 class _OutputWorker(threading.Thread):
-    """One-slot output mailbox. Producers never wait for slow frame consumers."""
+    """One output's mailbox and delivery thread.
 
-    def __init__(self, output: FrameOutput):
+    Default (``lossless=False``): a one-slot drop-old mailbox. Producers never
+    wait for slow frame consumers, and a frame that arrives while the previous
+    one is still unread replaces it and is counted in ``dropped``.
+
+    ``lossless=True``: a bounded queue and a blocking ``submit``, so the
+    capture loop waits for the output instead of overwriting its work. See the
+    module docstring for why a recorder needs the second mode and a preview
+    does not.
+
+    ``dropped`` means the same thing in both modes — frames this output was
+    never given — but it means something very different about the system. On a
+    drop-old worker it is the normal operating state. On a lossless worker it
+    is a fault, and it is published as one.
+    """
+
+    def __init__(self, output: FrameOutput, *, lossless: bool = False,
+                 maxsize: int = LOSSLESS_QUEUE_FRAMES,
+                 put_timeout_s: float = LOSSLESS_PUT_TIMEOUT_S,
+                 drain_timeout_s: float = LOSSLESS_DRAIN_TIMEOUT_S):
         super().__init__(daemon=True, name=f"vision-output-{type(output).__name__}")
         self.output = output
+        self.lossless = bool(lossless)
         self.last_error = ""
         self.dropped = 0
+        self._put_timeout_s = put_timeout_s
+        self._drain_timeout_s = drain_timeout_s
+        self._drain_deadline = 0.0
+        # Exactly one of these two is live, decided at construction. A worker
+        # never changes mode: an output that swapped mailboxes mid-run would
+        # have frames in the old one with nothing left to read them.
+        self._queue: queue.Queue | None = (
+            queue.Queue(maxsize=max(1, int(maxsize))) if self.lossless else None
+        )
         self._condition = threading.Condition()
         self._latest: SceneFrame | None = None
         self._stopping = False
+        # The drop counter is the one number two threads both write: the
+        # capture thread on a full queue, the worker thread when it runs out
+        # of drain time. Losing an increment to a lost-update race would
+        # under-report loss, which is the failure this whole mode exists to
+        # prevent, so it is not left to the GIL.
+        self._drop_lock = threading.Lock()
+
+    @property
+    def output_name(self) -> str:
+        return type(self.output).__name__
+
+    @property
+    def join_timeout_s(self) -> float:
+        return LOSSLESS_JOIN_S if self.lossless else DROP_OLD_JOIN_S
 
     def submit(self, scene: SceneFrame) -> None:
-        with self._condition:
-            if self._latest is not None:
-                self.dropped += 1
-            self._latest = scene
-            self._condition.notify()
+        if self._queue is None:
+            with self._condition:
+                if self._latest is not None:
+                    self.dropped += 1
+                self._latest = scene
+                self._condition.notify()
+            return
+        try:
+            self._queue.put(scene, timeout=self._put_timeout_s)
+        except queue.Full:
+            # Waited out the whole backpressure budget and the consumer has not
+            # taken one frame. That is not "busy", that is wedged.
+            self._count_drop()
 
     def stop(self) -> None:
+        # Set the deadline before the flag, so the draining consumer can never
+        # observe "stopping" with a deadline of zero already in the past.
+        self._drain_deadline = time.monotonic() + self._drain_timeout_s
         with self._condition:
             self._stopping = True
             self._condition.notify()
 
+    def _count_drop(self) -> None:
+        """Count a frame this output never saw, and tell the output about it.
+
+        The count lives here because only the worker knows a frame was refused;
+        the output is offered it because only the output writes the file that
+        has the gap in it. ``note_dropped`` is optional — it is not part of the
+        ``FrameOutput`` protocol, and an output that does not care about loss
+        (a preview) does not have to grow a method to say so.
+        """
+        with self._drop_lock:
+            self.dropped += 1
+        note = getattr(self.output, "note_dropped", None)
+        if note is None:
+            return
+        try:
+            note(1)
+        except Exception as exc:
+            self.last_error = str(exc)
+
+    def _deliver(self, scene: SceneFrame) -> None:
+        try:
+            self.output.publish(scene)
+            self.last_error = ""
+        except Exception as exc:
+            self.last_error = str(exc)
+
     def run(self) -> None:
         try:
-            while True:
-                with self._condition:
-                    while self._latest is None and not self._stopping:
-                        self._condition.wait()
-                    if self._stopping:
-                        break
-                    scene = self._latest
-                    self._latest = None
-                try:
-                    self.output.publish(scene)
-                    self.last_error = ""
-                except Exception as exc:
-                    self.last_error = str(exc)
+            if self._queue is None:
+                self._run_drop_old()
+            else:
+                self._run_lossless()
         finally:
+            # Both modes land here, and a recorder depends on it: this is where
+            # ffmpeg's stdin is closed and the moov atom gets written. A
+            # lossless worker that skipped this would leave an unplayable file.
             try:
                 self.output.close()
             except Exception as exc:
                 self.last_error = str(exc)
+
+    def _run_drop_old(self) -> None:
+        while True:
+            with self._condition:
+                while self._latest is None and not self._stopping:
+                    self._condition.wait()
+                if self._stopping:
+                    break
+                scene = self._latest
+                self._latest = None
+            self._deliver(scene)
+
+    def _drain_abandoned(self) -> None:
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                return
+            self._count_drop()
+
+    def _run_lossless(self) -> None:
+        while True:
+            try:
+                scene = self._queue.get(timeout=LOSSLESS_POLL_S)
+            except queue.Empty:
+                if self._stopping:
+                    # A producer can still be inside a blocking submit() as
+                    # this returns — remove_output stops a worker while the
+                    # capture loop is running. Anything that lands after this
+                    # point is abandoned, so account for it rather than let it
+                    # disappear.
+                    self._drain_abandoned()
+                    return
+                continue
+            if self._stopping and time.monotonic() > self._drain_deadline:
+                # Out of drain time, but the queue still has to be emptied
+                # rather than abandoned: every frame in it is accounted for as
+                # a drop, so the tail of the recording is short by a number
+                # somebody can read rather than by an amount nobody can.
+                self._count_drop()
+                continue
+            self._deliver(scene)
 
 
 class VisionPipeline(threading.Thread):
@@ -118,8 +286,14 @@ class VisionPipeline(threading.Thread):
     def _note_open_error(self, reason):
         self._open_error = str(reason)
 
-    def add_output(self, output: FrameOutput) -> None:
-        worker = _OutputWorker(output)
+    def add_output(self, output: FrameOutput, lossless: bool = False) -> None:
+        """Fan this pipeline's scenes out to ``output`` on its own thread.
+
+        ``lossless=True`` gives the output a bounded queue and backpressure
+        instead of the one-slot drop-old mailbox. Use it for anything that
+        writes a file; leave it off for anything that draws a picture.
+        """
+        worker = _OutputWorker(output, lossless=lossless)
         with self._workers_lock:
             self._workers.append(worker)
             should_start = self._started_workers
@@ -134,7 +308,7 @@ class VisionPipeline(threading.Thread):
             self._workers.remove(worker)
         worker.stop()
         if worker.is_alive():
-            worker.join(timeout=2.0)
+            worker.join(timeout=worker.join_timeout_s)
         return True
 
     def switch_source(self, source: SourceSpec) -> None:
@@ -267,6 +441,7 @@ class VisionPipeline(threading.Thread):
                         if key in self._metrics
                     }
                 metrics.update(quality_metrics)
+                metrics.update(self._output_drop_metrics(workers))
                 metrics["camera_controls"] = camera_controls
                 processor_metrics = getattr(self.processor, "metrics", None)
                 if processor_metrics is not None:
@@ -282,11 +457,38 @@ class VisionPipeline(threading.Thread):
             for worker in workers:
                 worker.stop()
             for worker in workers:
-                worker.join(timeout=2.0)
+                worker.join(timeout=worker.join_timeout_s)
             close_processor = getattr(self.processor, "close", None)
             if close_processor is not None:
                 close_processor()
             self._set_state(status="stopped")
+
+    @staticmethod
+    def _output_drop_metrics(workers):
+        """Frames a lossless output was refused, published for the GUI.
+
+        Only lossless workers are counted. A drop-old worker sheds frames as
+        its entire design — a preview behind a 60 fps camera drops most of them
+        and is working perfectly — so folding those into one total would report
+        a healthy system as lossy and bury the number that actually means
+        something.
+        """
+        drops: dict[str, int] = {}
+        seen: dict[str, int] = {}
+        for worker in workers:
+            if not worker.lossless:
+                continue
+            base = worker.output_name
+            seen[base] = seen.get(base, 0) + 1
+            # Two recorders would otherwise collide on one key and one of the
+            # two counts would vanish, which is the exact failure this is here
+            # to prevent.
+            name = base if seen[base] == 1 else f"{base}-{seen[base]}"
+            drops[name] = worker.dropped
+        return {
+            "dropped_output_frames": sum(drops.values()),
+            "output_drops": drops,
+        }
 
     @staticmethod
     def _apply_camera_controls(cap, controls):

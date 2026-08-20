@@ -1,5 +1,6 @@
 import errno
 import hashlib
+import io
 import hmac
 import http.client
 import inspect
@@ -7,7 +8,9 @@ import ipaddress
 import json
 import os
 import re
+import shutil
 import socket
+import subprocess
 import stat
 import struct
 import sys
@@ -97,7 +100,27 @@ from acesvision.smoothing import (
     ease_factor,
     fade_out_s,
 )
-from acesvision.pipeline import PipelineState, VisionPipeline
+from acesvision.pipeline import (
+    DROP_OLD_JOIN_S,
+    LOSSLESS_QUEUE_FRAMES,
+    PipelineState,
+    VisionPipeline,
+    _OutputWorker,
+)
+from acesvision.recording import (
+    DEFAULT_FPS,
+    RECORDINGS_ENV,
+    REPO_ROOT,
+    SIDECAR_SCHEMA,
+    RecordingError,
+    RecordingOutput,
+    hardware_command,
+    recording_name,
+    recordings_dir,
+    refuse_repo_path,
+    resolve_path,
+    software_command,
+)
 from acesvision import perception
 from acesvision.events import (
     GestureEventOutput,
@@ -7655,6 +7678,783 @@ class ArcFaceSessionTests(unittest.TestCase):
                                          models_dir="/nonexistent")
         self.assertIn("never downloads models automatically",
                       str(caught.exception))
+
+
+# ---------------------------------------------------------------------------
+# Backpressure — the fan-out mode a recorder needs and a preview must not get.
+# ---------------------------------------------------------------------------
+
+
+class BlockingOutput:
+    """An encoder that has fallen behind: publish + close, and nothing else.
+
+    That is the entire ``FrameOutput`` protocol, deliberately — an output that
+    does not care about loss must not have to grow a method to say so, so the
+    worker looks ``note_dropped`` up rather than requiring it.
+
+    ``release`` lets exactly ``count`` frames through, so a test can put the
+    queue in a known state instead of racing it.
+    """
+
+    def __init__(self):
+        self.published = []
+        self.closed = 0
+        self._gate = threading.Semaphore(0)
+
+    def release(self, count=1):
+        for _ in range(count):
+            self._gate.release()
+
+    def publish(self, scene):
+        self._gate.acquire()
+        self.published.append(scene.sequence)
+
+    def close(self):
+        self.closed += 1
+        self._gate.release()          # never leave the worker parked on stop
+
+
+class LossAwareOutput(BlockingOutput):
+    """The same, plus the optional hook a recorder implements."""
+
+    def __init__(self):
+        super().__init__()
+        self.dropped_notices = 0
+
+    def note_dropped(self, count=1):
+        self.dropped_notices += count
+
+
+class OutputWorkerModeTests(unittest.TestCase):
+    """``_OutputWorker`` has two mailboxes and one contract."""
+
+    def worker(self, output, **kwargs):
+        worker = _OutputWorker(output, **kwargs)
+        self.addCleanup(worker.join, 5.0)
+        self.addCleanup(worker.stop)
+        return worker
+
+    def scene(self, sequence):
+        source = SourceSpec.from_mapping({"type": "webcam"})
+        return SceneFrame(source, sequence, float(sequence), None)
+
+    def test_the_default_mailbox_still_drops_old_frames(self):
+        """The preview's contract, unchanged: newest wins, the rest counted."""
+        output = BlockingOutput()
+        worker = self.worker(output)
+        worker.start()
+        for sequence in range(10):
+            worker.submit(self.scene(sequence))
+        self.assertFalse(worker.lossless)
+        self.assertGreaterEqual(worker.dropped, 8)
+        # And the producer never waited: ten submits against a blocked
+        # consumer returned without a single frame being taken.
+        self.assertEqual(output.published, [])
+
+    def test_a_lossless_worker_keeps_every_frame_it_is_given(self):
+        output = BlockingOutput()
+        worker = self.worker(output, lossless=True)
+        worker.start()
+        for sequence in range(10):
+            worker.submit(self.scene(sequence))
+        output.release(10)
+        deadline = time.monotonic() + 5.0
+        while len(output.published) < 10 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(output.published, list(range(10)))
+        self.assertEqual(worker.dropped, 0)
+
+    def test_a_full_queue_makes_the_producer_wait(self):
+        """Backpressure, measured: the submit that fills the queue blocks.
+
+        This is the whole point of the mode. Capture fps dips here, visibly,
+        instead of the recording losing time invisibly.
+        """
+        output = BlockingOutput()
+        worker = self.worker(output, lossless=True, maxsize=2,
+                             put_timeout_s=0.2)
+        worker.start()
+        worker.submit(self.scene(0))      # taken by the consumer, or queued
+        worker.submit(self.scene(1))
+        worker.submit(self.scene(2))
+        started = time.monotonic()
+        worker.submit(self.scene(3))      # queue full: this one has to wait
+        waited = time.monotonic() - started
+        self.assertGreaterEqual(waited, 0.15)
+        self.assertEqual(worker.dropped, 1)
+
+    def test_an_overflow_is_counted_and_the_output_is_told(self):
+        output = LossAwareOutput()
+        worker = self.worker(output, lossless=True, maxsize=1,
+                             put_timeout_s=0.01)
+        worker.start()
+        for sequence in range(6):
+            worker.submit(self.scene(sequence))
+        self.assertGreater(worker.dropped, 0)
+        # Counted in the worker *and* handed to the output, because only the
+        # output writes the file that has the gap in it.
+        self.assertEqual(output.dropped_notices, worker.dropped)
+
+    def test_note_dropped_is_optional(self):
+        """``FrameOutput`` is publish + close. The loss hook is extra."""
+        output = BlockingOutput()
+        self.assertFalse(hasattr(output, "note_dropped"))
+        worker = self.worker(output, lossless=True, maxsize=1,
+                             put_timeout_s=0.01)
+        worker.start()
+        for sequence in range(6):
+            worker.submit(self.scene(sequence))
+        self.assertGreater(worker.dropped, 0)
+        self.assertEqual(worker.last_error, "")
+
+    def test_a_lossless_worker_drains_what_is_queued_before_it_closes(self):
+        """Stop must not put the gap at the end of the file instead."""
+        output = BlockingOutput()
+        worker = self.worker(output, lossless=True)
+        worker.start()
+        for sequence in range(5):
+            worker.submit(self.scene(sequence))
+        worker.stop()
+        output.release(5)
+        worker.join(5.0)
+        self.assertEqual(output.published, list(range(5)))
+        self.assertEqual(output.closed, 1)
+
+    def test_close_runs_on_the_lossless_path_too(self):
+        """The finalisation seam. Without it the MP4 has no moov atom."""
+        for lossless in (False, True):
+            with self.subTest(lossless=lossless):
+                output = BlockingOutput()
+                worker = _OutputWorker(output, lossless=lossless)
+                worker.start()
+                worker.stop()
+                worker.join(5.0)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(output.closed, 1)
+
+    def test_a_worker_out_of_drain_time_counts_what_it_abandons(self):
+        """Even the give-up path is accounted for. The tail of the recording
+        is then short by a number somebody can read."""
+        output = LossAwareOutput()
+        worker = self.worker(output, lossless=True, drain_timeout_s=0.0)
+        worker.start()
+        for sequence in range(5):
+            worker.submit(self.scene(sequence))
+        worker.stop()
+        worker.join(5.0)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(worker.dropped + len(output.published), 5)
+        self.assertEqual(output.dropped_notices, worker.dropped)
+        self.assertEqual(output.closed, 1)
+
+    def test_a_frame_submitted_after_the_loop_exits_is_not_lost_silently(self):
+        """``remove_output`` stops a worker while the capture loop is still
+        submitting, so a frame can land after the consumer has given up."""
+        output = LossAwareOutput()
+        # Never started: the point is the state of the queue *after* the
+        # consumer loop has stopped reading it.
+        worker = _OutputWorker(output, lossless=True)
+        worker._queue.put(self.scene(0))
+        worker._queue.put(self.scene(1))
+        worker._drain_abandoned()
+        self.assertEqual(worker.dropped, 2)
+        self.assertEqual(output.dropped_notices, 2)
+        self.assertTrue(worker._queue.empty())
+
+    def test_a_lossless_worker_is_given_longer_to_shut_down(self):
+        drop_old = _OutputWorker(BlockingOutput())
+        lossless = _OutputWorker(BlockingOutput(), lossless=True)
+        self.assertGreater(lossless.join_timeout_s, drop_old.join_timeout_s)
+
+
+class PipelineDropMetricTests(unittest.TestCase):
+    """The drop count reaches pipeline metrics, where the GUI can read it."""
+
+    def workers(self, *specs):
+        made = []
+        for lossless, dropped in specs:
+            worker = _OutputWorker(BlockingOutput(), lossless=lossless)
+            worker.dropped = dropped
+            made.append(worker)
+        return tuple(made)
+
+    def test_only_lossless_drops_are_reported(self):
+        """A preview behind a 60 fps camera drops most frames and is fine.
+
+        Summing the two would report a healthy system as lossy and bury the
+        number that means something.
+        """
+        metrics = VisionPipeline._output_drop_metrics(
+            self.workers((False, 5000), (True, 3)))
+        self.assertEqual(metrics["dropped_output_frames"], 3)
+        self.assertEqual(list(metrics["output_drops"]), ["BlockingOutput"])
+
+    def test_a_healthy_recorder_publishes_a_zero_not_an_absence(self):
+        metrics = VisionPipeline._output_drop_metrics(self.workers((True, 0)))
+        self.assertEqual(metrics["dropped_output_frames"], 0)
+        self.assertEqual(metrics["output_drops"], {"BlockingOutput": 0})
+
+    def test_two_recorders_do_not_collide_on_one_key(self):
+        """A dict merge here would silently delete one of the two counts."""
+        metrics = VisionPipeline._output_drop_metrics(
+            self.workers((True, 1), (True, 2)))
+        self.assertEqual(metrics["dropped_output_frames"], 3)
+        self.assertEqual(sorted(metrics["output_drops"].values()), [1, 2])
+        self.assertEqual(len(metrics["output_drops"]), 2)
+
+    def test_the_metric_is_json_safe_for_the_event_api(self):
+        json.dumps(VisionPipeline._output_drop_metrics(self.workers((True, 4))))
+
+    def test_the_live_pipeline_publishes_the_count(self):
+        """End to end through the real capture loop, not the helper."""
+        source = SourceSpec.from_mapping({"type": "webcam", "index": 0})
+        # Real arrays: the capture loop runs a quality probe over the frame
+        # every 30 frames, and it is cv2 all the way down.
+        frame = np.zeros((8, 8, 3), dtype=np.uint8)
+        capture = ScriptedCapture([frame] * 400)
+        seen = threading.Event()
+
+        def processor(frame, src, sequence, captured_at):
+            return SceneFrame(src, sequence, captured_at, frame)
+
+        pipeline = VisionPipeline(source, processor, [],
+                                  opener=lambda _: capture,
+                                  retry_min_s=0.001, retry_max_s=0.002)
+        wedged = LossAwareOutput()
+        pipeline.add_output(wedged, lossless=True)
+        pipeline.add_output(CallbackOutput(lambda scene: seen.set()))
+        pipeline.start()
+        self.addCleanup(pipeline.join, 20.0)
+        self.addCleanup(pipeline.stop)
+        self.assertTrue(seen.wait(5.0))
+
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline:
+            metrics = pipeline.state().metrics
+            if metrics.get("dropped_output_frames", 0) > 0:
+                break
+            time.sleep(0.02)
+        self.assertGreater(metrics.get("dropped_output_frames", 0), 0)
+        self.assertEqual(sum(metrics["output_drops"].values()),
+                         metrics["dropped_output_frames"])
+        self.assertEqual(wedged.dropped_notices,
+                         metrics["dropped_output_frames"])
+        wedged.release(200)
+
+
+# ---------------------------------------------------------------------------
+# RecordingOutput — CFR, sidecar, finalisation, and where files may be written.
+# ---------------------------------------------------------------------------
+
+
+class FakeEncoder:
+    """A stand-in ffmpeg process. Counts what was piped into it."""
+
+    def __init__(self, command, frame_bytes=None, returncode=0):
+        self.command = list(command)
+        self.stdin = io.BytesIO()
+        self.stderr = io.BytesIO(b"")
+        self.returncode = returncode
+        self.waited = False
+        self.killed = False
+        self._frame_bytes = frame_bytes
+
+    def wait(self, timeout=None):
+        self.waited = True
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+
+    @property
+    def frames(self):
+        if not self._frame_bytes:
+            return 0
+        return len(self.stdin.getvalue()) // self._frame_bytes
+
+
+class RecordingTestCase(unittest.TestCase):
+    WIDTH, HEIGHT = 32, 24
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="acesvision-record-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.source = SourceSpec.from_mapping({"id": "webcam",
+                                               "type": "webcam", "index": 0})
+        self.raw = np.zeros((self.HEIGHT, self.WIDTH, 3), dtype=np.uint8)
+        self.spawned = []
+
+    def spawn(self, command):
+        encoder = FakeEncoder(command, frame_bytes=self.WIDTH * self.HEIGHT * 3)
+        self.spawned.append(encoder)
+        return encoder
+
+    def recorder(self, **kwargs):
+        kwargs.setdefault("fps", 30)
+        kwargs.setdefault("spawn", self.spawn)
+        output = RecordingOutput(self.tmp / "clip.mp4", **kwargs)
+        self.addCleanup(output.close)
+        return output
+
+    def scene(self, sequence, captured_at, **kwargs):
+        return SceneFrame(self.source, sequence, captured_at, self.raw,
+                          metadata=kwargs.pop("metadata", {}), **kwargs)
+
+    def sidecar(self, output):
+        return json.loads(output.sidecar_path.read_text())
+
+
+class RecordingPathTests(RecordingTestCase):
+    def test_the_name_carries_the_time_and_the_source(self):
+        name = recording_name("droidcam", datetime(2026, 8, 20, 15, 4, 5))
+        self.assertEqual(name, "acesvision-20260820-150405-droidcam.mp4")
+
+    def test_a_hostile_source_id_cannot_escape_the_filename(self):
+        name = recording_name("../../etc/passwd",
+                              datetime(2026, 8, 20, 15, 4, 5))
+        self.assertNotIn("/", name)
+        self.assertTrue(name.endswith(".mp4"))
+
+    def test_the_environment_overrides_the_default_directory(self):
+        self.assertEqual(recordings_dir({RECORDINGS_ENV: str(self.tmp)}),
+                         self.tmp.resolve())
+        self.assertEqual(recordings_dir({}),
+                         Path("~/Videos/AcesVision").expanduser().resolve())
+
+    def test_writing_inside_the_repository_is_refused(self):
+        """AGPL, published, and a recording is a video of somebody's room."""
+        for candidate in (REPO_ROOT, REPO_ROOT / "clip.mp4",
+                          REPO_ROOT / "acesvision" / "deep" / "clip.mp4"):
+            with self.subTest(candidate=candidate):
+                with self.assertRaises(ValueError) as caught:
+                    refuse_repo_path(candidate)
+                self.assertIn("inside the repository", str(caught.exception))
+
+    def test_the_refusal_covers_the_environment_variable_too(self):
+        with self.assertRaises(ValueError):
+            recordings_dir({RECORDINGS_ENV: str(REPO_ROOT / "recordings")})
+
+    def test_gitignore_is_the_second_lock_on_the_same_door(self):
+        ignore = (REPO_ROOT / ".gitignore").read_text().splitlines()
+        self.assertIn("*.mp4", ignore)
+        self.assertIn("*.mp4.json", ignore)
+
+    def test_a_directory_argument_gets_the_generated_name(self):
+        path = resolve_path(str(self.tmp), "webcam",
+                            now=datetime(2026, 8, 20, 15, 4, 5))
+        self.assertEqual(path,
+                         self.tmp.resolve() / "acesvision-20260820-150405-webcam.mp4")
+
+    def test_an_explicit_file_argument_is_taken_as_given(self):
+        self.assertEqual(resolve_path(str(self.tmp / "a.mp4"), "webcam"),
+                         (self.tmp / "a.mp4").resolve())
+
+    def test_no_argument_falls_back_to_the_recordings_directory(self):
+        path = resolve_path("", "webcam", now=datetime(2026, 8, 20, 15, 4, 5),
+                            environ={RECORDINGS_ENV: str(self.tmp)})
+        self.assertEqual(path.parent, self.tmp.resolve())
+
+    def test_the_sidecar_sits_beside_the_video_and_cannot_shadow_a_json(self):
+        output = self.recorder()
+        self.assertEqual(output.sidecar_path.name, "clip.mp4.json")
+        self.assertEqual(output.sidecar_path.parent, output.path.parent)
+
+
+class RecordingCommandTests(RecordingTestCase):
+    def test_the_software_command_is_browser_and_social_playable(self):
+        command = software_command("/tmp/a.mp4", 1280, 720, 30)
+        self.assertEqual(command[-1], "/tmp/a.mp4")
+        # yuv420p and +faststart are not tuning knobs. Without the first,
+        # browsers refuse the file; without the second, playback cannot start
+        # until the whole file has been fetched.
+        self.assertIn("yuv420p", command)
+        self.assertIn("+faststart", command)
+        self.assertIn("libx264", command)
+        self.assertEqual(command[command.index("-crf") + 1], "20")
+        self.assertEqual(command[command.index("-s") + 1], "1280x720")
+        self.assertEqual(command[command.index("-i") + 1], "-")
+        self.assertIn("bgr24", command)
+
+    def test_the_hardware_command_uploads_to_vaapi(self):
+        command = hardware_command("/tmp/a.mp4", 1280, 720, 30)
+        self.assertIn("h264_vaapi", command)
+        self.assertIn("format=nv12,hwupload", command)
+        self.assertEqual(command[command.index("-vaapi_device") + 1],
+                         "/dev/dri/renderD128")
+        self.assertIn("+faststart", command)
+        self.assertNotIn("libx264", command)
+
+    def test_the_recorder_picks_the_command_from_the_flag(self):
+        for hardware, codec in ((False, "libx264"), (True, "h264_vaapi")):
+            with self.subTest(hardware=hardware):
+                output = self.recorder(hardware=hardware)
+                output.publish(self.scene(0, 100.0))
+                self.assertIn(codec, output.command)
+                self.assertEqual(output.command[output.command.index("-s") + 1],
+                                 f"{self.WIDTH}x{self.HEIGHT}")
+
+
+class RecordingClockTests(RecordingTestCase):
+    """CFR against a fake clock — captured_at is the clock, so it is exact."""
+
+    def publish_at(self, output, times):
+        for sequence, captured_at in enumerate(times):
+            output.publish(self.scene(sequence, captured_at))
+
+    def test_capture_at_the_target_rate_writes_one_frame_each(self):
+        output = self.recorder(fps=30)
+        self.publish_at(output, [100.0 + n / 30.0 for n in range(30)])
+        self.assertEqual(output.frames_written, 30)
+        self.assertEqual(output.frames_duplicated, 0)
+        self.assertEqual(output.scenes_dropped_early, 0)
+        self.assertEqual(self.spawned[0].frames, 30)
+
+    def test_capture_slower_than_the_target_duplicates_to_fill_the_gap(self):
+        """15 fps in, 30 fps out: every frame is written twice."""
+        output = self.recorder(fps=30)
+        self.publish_at(output, [100.0 + n / 15.0 for n in range(10)])
+        self.assertEqual(output.frames_written, 19)   # slots 0..18
+        self.assertEqual(output.frames_duplicated, 9)
+        self.assertEqual(output.scenes_dropped_early, 0)
+        self.assertEqual(self.spawned[0].frames, 19)
+
+    def test_capture_faster_than_the_target_drops_from_the_video(self):
+        """60 fps in, 30 fps out: half the scenes land inside a filled slot."""
+        output = self.recorder(fps=30)
+        self.publish_at(output, [100.0 + n / 60.0 for n in range(20)])
+        self.assertEqual(output.frames_written, 10)
+        self.assertEqual(output.scenes_dropped_early, 10)
+        self.assertEqual(output.scenes_published, 20)
+
+    def test_a_long_stall_is_filled_rather_than_left_as_a_gap(self):
+        """The artefact this whole design exists to prevent.
+
+        A VFR writer would put a 1 s hole in the timeline here. CFR fills it,
+        and the sidecar still says the truth about when frames arrived.
+        """
+        output = self.recorder(fps=30)
+        self.publish_at(output, [100.0, 101.0])
+        self.assertEqual(output.frames_written, 31)
+        self.assertEqual(output.frames_duplicated, 29)
+        self.assertAlmostEqual(output.summary()["duration_s"], 31 / 30,
+                               places=5)
+
+    def test_the_slot_boundary_does_not_lose_a_frame_to_float_error(self):
+        """elapsed * fps landing on 0.9999999 would cost a frame every time."""
+        output = self.recorder(fps=30)
+        self.publish_at(output, [0.0 + n * (1.0 / 30.0) for n in range(600)])
+        self.assertEqual(output.frames_written, 600)
+        self.assertEqual(output.scenes_dropped_early, 0)
+
+    def test_a_frame_arriving_before_the_start_does_not_rewind_the_clock(self):
+        output = self.recorder(fps=30)
+        output.publish(self.scene(0, 100.0))
+        output.publish(self.scene(1, 99.0))       # a clock that went backwards
+        self.assertEqual(output.frames_written, 1)
+        self.assertEqual(output.scenes_dropped_early, 1)
+
+    def test_the_video_duration_is_the_frame_count_over_the_rate(self):
+        output = self.recorder(fps=25)
+        self.publish_at(output, [100.0 + n / 25.0 for n in range(50)])
+        self.assertEqual(output.summary()["duration_s"], 2.0)
+
+
+class RecordingSidecarTests(RecordingTestCase):
+    def test_the_sidecar_carries_every_frame_s_true_capture_time(self):
+        output = self.recorder(fps=30)
+        times = [100.0, 100.02, 100.031, 100.9]
+        for sequence, captured_at in enumerate(times):
+            output.publish(self.scene(sequence, captured_at,
+                                      metadata={"inference_fps": 40.0}))
+        output.close()
+
+        document = self.sidecar(output)
+        self.assertEqual(document["schema"], SIDECAR_SCHEMA)
+        self.assertEqual([f["captured_at"] for f in document["frames"]], times)
+        self.assertEqual([f["sequence"] for f in document["frames"]],
+                         [0, 1, 2, 3])
+        self.assertEqual(document["frames"][0]["metadata"],
+                         {"inference_fps": 40.0})
+
+    def test_a_scene_dropped_from_the_video_is_still_in_the_record(self):
+        """Nothing is lost by the CFR drop — that is why it is allowed."""
+        output = self.recorder(fps=30)
+        output.publish(self.scene(0, 100.0))
+        output.publish(self.scene(1, 100.001))    # inside slot 0
+        output.close()
+
+        frames = self.sidecar(output)["frames"]
+        self.assertEqual(len(frames), 2)
+        self.assertEqual(frames[1]["video_frames"], 0)
+        self.assertEqual(frames[1]["video_frame"], 0)   # shares slot 0
+        self.assertEqual(frames[1]["captured_at"], 100.001)
+
+    def test_the_sidecar_carries_the_inference_results(self):
+        output = self.recorder(fps=30)
+        output.publish(self.scene(
+            0, 100.0,
+            objects=[Detection(1, 2, 3, 4, "person", 0.9, 7)],
+            faces=[Face(1, 2, 3, 4, "Toby", 0.31, True)],
+            gestures=[Gesture("Victory", 0.8, 1, 2, 3, 4)]))
+        output.close()
+
+        frame = self.sidecar(output)["frames"][0]
+        self.assertEqual(frame["objects"][0]["label"], "person")
+        self.assertEqual(frame["objects"][0]["track_id"], 7)
+        self.assertEqual(frame["faces"][0]["name"], "Toby")
+        self.assertEqual(frame["gestures"][0]["name"], "Victory")
+
+    def test_numpy_scalars_from_the_detectors_survive_serialisation(self):
+        """YOLO hands back float32. json.dump refuses it by default."""
+        output = self.recorder(fps=30)
+        output.publish(self.scene(0, 100.0, objects=[
+            Detection(np.int64(1), np.int64(2), np.int64(3), np.int64(4),
+                      "person", np.float32(0.5), np.int64(7))]))
+        output.close()
+        self.assertAlmostEqual(
+            self.sidecar(output)["frames"][0]["objects"][0]["score"], 0.5,
+            places=5)
+
+    def test_the_dropped_frame_count_lands_in_the_sidecar(self):
+        output = self.recorder(fps=30)
+        output.publish(self.scene(0, 100.0))
+        output.note_dropped(4)
+        output.note_dropped()
+        output.close()
+        document = self.sidecar(output)
+        self.assertEqual(document["frames_dropped_by_backpressure"], 5)
+        self.assertEqual(document["scenes_published"], 1)
+
+    def test_a_healthy_recording_reports_zero_rather_than_omitting_it(self):
+        output = self.recorder(fps=30)
+        output.publish(self.scene(0, 100.0))
+        output.close()
+        self.assertEqual(self.sidecar(output)["frames_dropped_by_backpressure"],
+                         0)
+
+    def test_the_sidecar_names_the_source_and_the_encoder(self):
+        output = self.recorder(fps=30)
+        output.publish(self.scene(0, 100.0))
+        output.close()
+        document = self.sidecar(output)
+        self.assertEqual(document["source"]["id"], "webcam")
+        self.assertEqual(document["video"], "clip.mp4")
+        self.assertFalse(document["encoder"]["hardware"])
+        self.assertIn("libx264", document["encoder"]["command"])
+        self.assertEqual((document["width"], document["height"]),
+                         (self.WIDTH, self.HEIGHT))
+
+    def test_no_frames_means_no_sidecar_and_no_process(self):
+        output = self.recorder(fps=30)
+        output.close()
+        self.assertEqual(self.spawned, [])
+        self.assertFalse(output.sidecar_path.exists())
+
+
+class RecordingFinalisationTests(RecordingTestCase):
+    def test_close_shuts_the_pipe_and_waits_for_the_moov_atom(self):
+        output = self.recorder(fps=30)
+        output.publish(self.scene(0, 100.0))
+        output.close()
+        encoder = self.spawned[0]
+        self.assertTrue(encoder.stdin.closed)
+        self.assertTrue(encoder.waited)
+
+    def test_close_is_idempotent(self):
+        output = self.recorder(fps=30)
+        output.publish(self.scene(0, 100.0))
+        output.close()
+        output.close()
+        self.assertEqual(len(self.spawned), 1)
+
+    def test_publishing_after_close_does_not_resurrect_the_encoder(self):
+        output = self.recorder(fps=30)
+        output.publish(self.scene(0, 100.0))
+        output.close()
+        output.publish(self.scene(1, 101.0))
+        self.assertEqual(len(self.spawned), 1)
+        self.assertEqual(output.frames_written, 1)
+
+    def test_a_non_zero_exit_is_recorded_rather_than_swallowed(self):
+        def spawn(command):
+            encoder = FakeEncoder(command, returncode=1)
+            encoder.stderr = io.BytesIO(b"height not divisible by 2")
+            self.spawned.append(encoder)
+            return encoder
+
+        output = RecordingOutput(self.tmp / "clip.mp4", fps=30, spawn=spawn)
+        output.publish(self.scene(0, 100.0))
+        output.close()
+        self.assertIn("ffmpeg exited 1", output.error)
+        self.assertIn("divisible by 2", output.error)
+        self.assertIn("divisible by 2", self.sidecar(output)["error"])
+
+    def test_a_missing_ffmpeg_fails_loudly_at_the_first_frame(self):
+        def spawn(command):
+            raise FileNotFoundError("no ffmpeg")
+
+        output = RecordingOutput(self.tmp / "clip.mp4", fps=30, spawn=spawn)
+        with self.assertRaises(RecordingError):
+            output.publish(self.scene(0, 100.0))
+
+    def test_a_broken_pipe_does_not_claim_frames_the_file_does_not_have(self):
+        """An inflated frames_written would inflate duration_s in the sidecar,
+        and a record that claims seconds the video does not contain is worse
+        than one that reports an error."""
+        class Exploding(FakeEncoder):
+            def __init__(self, command):
+                super().__init__(command, returncode=1)
+                self.stdin = self
+
+            closed = False
+
+            def write(self, payload):
+                raise BrokenPipeError("gone")
+
+            def close(self):
+                Exploding.closed = True
+
+        def spawn(command):
+            encoder = Exploding(command)
+            self.spawned.append(encoder)
+            return encoder
+
+        output = RecordingOutput(self.tmp / "clip.mp4", fps=30, spawn=spawn)
+        with self.assertRaises(RecordingError):
+            output.publish(self.scene(0, 100.0))
+        self.assertEqual(output.frames_written, 0)
+        self.assertEqual(self.sidecar(output)["duration_s"], 0.0)
+        self.assertIn("stopped accepting frames", output.error)
+
+    def test_ffmpeg_is_detached_from_the_terminal_s_signal_group(self):
+        """Ctrl-C signals the process *group*, and ffmpeg is in it.
+
+        Measured on a real run: the terminal's SIGINT reached ffmpeg, which
+        wrote the trailer but exited 255, so a perfectly good recording was
+        reported as a failure. Detached, close() is the only thing that ends
+        the encode.
+        """
+        import acesvision.recording as recording
+
+        seen = {}
+
+        def fake_popen(command, **kwargs):
+            seen.update(kwargs)
+            return FakeEncoder(command)
+
+        with patch.object(recording.subprocess, "Popen", fake_popen):
+            recording._spawn(["ffmpeg"])
+        self.assertTrue(seen.get("start_new_session"))
+        self.assertIs(seen.get("stdin"), subprocess.PIPE)
+
+    def test_the_worker_finally_finalises_a_lossless_recorder(self):
+        """The seam Ctrl-C depends on: worker.run's finally -> close()."""
+        output = self.recorder(fps=30)
+        worker = _OutputWorker(output, lossless=True)
+        worker.start()
+        worker.submit(self.scene(0, 100.0))
+        deadline = time.monotonic() + 5.0
+        while not self.spawned and time.monotonic() < deadline:
+            time.sleep(0.01)
+        worker.stop()
+        worker.join(10.0)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(self.spawned[0].stdin.closed)
+        self.assertTrue(output.sidecar_path.exists())
+
+
+class RecordingOwnershipTests(RecordingTestCase):
+    def test_the_recorder_owns_its_own_smoother(self):
+        """Each output sees a different frame subset through its mailbox, so a
+        shared smoother would advance its clock against frames this recorder
+        never received."""
+        first, second = self.recorder(), self.recorder()
+        self.assertIsNot(first._smoother, second._smoother)
+        self.assertIsNot(first._smoother, LatestFrameOutput()._smoother)
+        self.assertIsNot(first._smoother, ObsVirtualCameraOutput()._smoother)
+        self.assertIsInstance(first._smoother, SceneSmoother)
+
+    def test_the_sidecar_records_the_unsmoothed_detections(self):
+        """The eased boxes are the picture; the raw detections are the record.
+
+        Same split as ``LatestFrameOutput.snapshot``.
+        """
+        output = self.recorder(fps=30)
+        start = Detection(10, 10, 20, 20, "person", 0.9, 1)
+        moved = start._replace(x=110)
+        metadata = {"inference_fps": 40.0}
+        output.publish(self.scene(0, 100.0, objects=[start],
+                                  metadata=dict(metadata)))
+        output.publish(self.scene(1, 100.01, objects=[moved],
+                                  metadata=dict(metadata)))
+        output.close()
+
+        recorded = [f["objects"][0]["x"] for f in self.sidecar(output)["frames"]]
+        self.assertEqual(recorded, [10, 110])
+
+    def test_a_source_switch_is_resized_rather_than_corrupting_the_stream(self):
+        output = self.recorder(fps=30)
+        output.publish(self.scene(0, 100.0))
+        other = SceneFrame(self.source, 1, 100.1,
+                           np.zeros((self.HEIGHT * 2, self.WIDTH * 2, 3),
+                                    dtype=np.uint8))
+        output.publish(other)
+        encoder = self.spawned[0]
+        # Every frame in the pipe is still the size the stream was opened at.
+        self.assertEqual(len(encoder.stdin.getvalue()) %
+                         (self.WIDTH * self.HEIGHT * 3), 0)
+        self.assertEqual(encoder.frames, output.frames_written)
+
+
+class RecordingCliTests(RecordingTestCase):
+    def parse(self, argv):
+        from acesvision.__main__ import build_parser
+
+        return build_parser().parse_args(argv)
+
+    def test_recording_is_off_unless_asked_for(self):
+        from acesvision.__main__ import build_recorder
+
+        args = self.parse([])
+        self.assertIsNone(args.record)
+        self.assertIsNone(build_recorder(args, self.source))
+
+    def test_the_bare_flag_uses_the_recordings_directory(self):
+        from acesvision.__main__ import build_recorder
+
+        recorder = build_recorder(self.parse(["--record"]), self.source,
+                                  now=datetime(2026, 8, 20, 15, 4, 5),
+                                  environ={RECORDINGS_ENV: str(self.tmp)})
+        self.assertEqual(recorder.path,
+                         self.tmp.resolve() /
+                         "acesvision-20260820-150405-webcam.mp4")
+        self.assertEqual(recorder.fps, 30)
+        self.assertFalse(recorder.hardware)
+
+    def test_the_flags_reach_the_recorder(self):
+        from acesvision.__main__ import build_recorder
+
+        args = self.parse(["--record", str(self.tmp / "a.mp4"),
+                           "--record-fps", "60", "--record-hw"])
+        recorder = build_recorder(args, self.source)
+        self.assertEqual(recorder.path, (self.tmp / "a.mp4").resolve())
+        self.assertEqual(recorder.fps, 60)
+        self.assertTrue(recorder.hardware)
+
+    def test_a_path_inside_the_repository_is_refused_at_startup(self):
+        from acesvision.__main__ import build_recorder
+
+        args = self.parse(["--record", str(REPO_ROOT / "a.mp4")])
+        with self.assertRaises(ValueError):
+            build_recorder(args, self.source)
+
+    def test_the_runner_adds_the_recorder_lossless(self):
+        """Read off the source, because getting this wrong is silent: the file
+        would simply have gaps in it and nothing would say so."""
+        import acesvision.__main__ as runner
+
+        source = inspect.getsource(runner.main)
+        self.assertRegex(source, r"add_output\(\s*recorder,\s*lossless=True")
 
 
 if __name__ == "__main__":
