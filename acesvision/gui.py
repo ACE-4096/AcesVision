@@ -1100,16 +1100,17 @@ class VisionBackend(QObject):
             self._overlay_before_clean = self._overlay
             self.setOverlayProfile("clean")
 
-    @Slot(bool, bool, bool, int, float, str, str, str, str)
+    @Slot(bool, bool, bool, int, float, str, str, str, str, bool)
     def applyOverlayStyle(self, show_objects, show_faces, show_gestures,
                           line_width, font_scale, object_hex, known_hex,
-                          unknown_hex, gesture_hex):
+                          unknown_hex, gesture_hex, show_landmarks=True):
         try:
             profile = OverlayProfile(
                 id="custom",
                 show_objects=show_objects,
                 show_faces=show_faces,
                 show_gestures=show_gestures,
+                show_landmarks=show_landmarks,
                 line_width=max(1, min(8, int(line_width))),
                 font_scale=max(0.3, min(2.0, float(font_scale))),
                 known_colour=self._hex_to_bgr(known_hex),

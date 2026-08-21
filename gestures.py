@@ -10,7 +10,8 @@ plus two custom poses derived from the hand landmarks rather than the model:
 The full vocabulary lives in gesture_catalog.GESTURES — that module is the
 single source of truth both this repo and AceRGB validate names against.
 
-GestureDetector.detect(frame_bgr, faces) -> list of Gesture(name, score, box).
+GestureDetector.detect(frame_bgr, faces) -> list of Gesture(name, score, box,
+landmarks). Landmark coordinates are image pixels, ready for the renderer.
 Pass the face boxes from engine.build_detector(); without them Shush cannot be
 told apart from the model's Pointing_Up and will never be emitted.
 Each detector instance is single-thread; give each camera worker its own.
@@ -31,7 +32,9 @@ from gesture_catalog import (MIDDLE_FINGER, SHUSH, is_middle_finger,
                              is_shush)
 
 MODEL = Path(__file__).parent / "models" / "gesture_recognizer.task"
-Gesture = namedtuple("Gesture", "name score x y w h")
+# ``landmarks`` deliberately has a default so every existing event, recording,
+# and plugin that constructs the six-field Gesture shape remains compatible.
+Gesture = namedtuple("Gesture", "name score x y w h landmarks", defaults=[()])
 _GLOCK = threading.Lock()   # serialise detect across camera threads, just in case
 
 
@@ -94,13 +97,14 @@ def classify_hands(hand_landmarks, gesture_categories, w, h, min_score,
         x0, y0 = int(min(xs) * w), int(min(ys) * h)
         x1, y1 = int(max(xs) * w), int(max(ys) * h)
         box = (x0, y0, x1 - x0, y1 - y0)
+        landmarks = tuple((int(lm.x * w), int(lm.y * h)) for lm in lms)
 
         if is_middle_finger(lms):
-            out.append(Gesture(MIDDLE_FINGER, 1.0, *box))
+            out.append(Gesture(MIDDLE_FINGER, 1.0, *box, landmarks))
             continue
 
         if is_shush(lms, faces, w, h):
-            out.append(Gesture(SHUSH, 1.0, *box))
+            out.append(Gesture(SHUSH, 1.0, *box, landmarks))
             continue
 
         cats = (gesture_categories[index]
@@ -110,5 +114,5 @@ def classify_hands(hand_landmarks, gesture_categories, w, h, min_score,
         g = cats[0]
         if g.category_name in ("None", "") or g.score < min_score:
             continue
-        out.append(Gesture(g.category_name, float(g.score), *box))
+        out.append(Gesture(g.category_name, float(g.score), *box, landmarks))
     return out

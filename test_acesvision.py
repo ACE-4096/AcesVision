@@ -785,6 +785,21 @@ class OverlayTests(unittest.TestCase):
         self.assertFalse(np.array_equal(red_frame, green_frame))
         self.assertTrue(np.array_equal(self.raw, np.zeros_like(self.raw)))
 
+    def test_hand_joints_render_without_needing_a_gesture_box(self):
+        from gestures import Gesture as RecognizedGesture
+
+        scene = SceneFrame(
+            self.source, 1, 1.0, self.raw,
+            gestures=[RecognizedGesture("Victory", 0.9, 20, 20, 40, 20,
+                                        ((20, 20), (60, 20)))],
+        )
+        joints = render(scene, OverlayProfile(show_gestures=False,
+                                              show_landmarks=True))
+        hidden = render(scene, OverlayProfile(show_gestures=False,
+                                              show_landmarks=False))
+        self.assertFalse(np.array_equal(joints, self.raw))
+        self.assertTrue(np.array_equal(hidden, self.raw))
+
 
 class FakeClock:
     """The injectable clock the smoother is written against, driven by hand.
@@ -2208,6 +2223,8 @@ class GestureCatalogTests(unittest.TestCase):
         rows = classify_hands(open_palm, [[Category("Open_Palm", 0.9)]],
                               100, 100, 0.5)
         self.assertEqual([row.name for row in rows], ["Open_Palm"])
+        self.assertEqual(rows[0].landmarks[0], (50, 90))
+        self.assertEqual(len(rows[0].landmarks), 21)
         rows = classify_hands(open_palm, [[Category("Open_Palm", 0.1)]],
                               100, 100, 0.5)
         self.assertEqual(rows, [])

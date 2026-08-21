@@ -1195,6 +1195,7 @@ ApplicationWindow {
                                                 Switch { id: showObjects; text: "Object boxes"; checked: true }
                                                 Switch { id: showFaces; text: "Face boxes"; checked: true }
                                                 Switch { id: showGestures; text: "Gesture boxes"; checked: true }
+                                                Switch { id: showLandmarks; text: "Hand joints"; checked: true }
                                             }
                                             RowLayout {
                                                 Layout.fillWidth: true
@@ -1278,11 +1279,12 @@ ApplicationWindow {
                                                         showGestures.checked,
                                                         Math.round(lineWidth.value), fontScale.value,
                                                         objectColour.text, knownColour.text,
-                                                        unknownColour.text, gestureColour.text)
+                                                        unknownColour.text, gestureColour.text,
+                                                        showLandmarks.checked)
                                                 }
                                             }
                                             Hint {
-                                                text: "Landmarks, trails, zones, privacy effects, and saving or loading profiles are not available yet."
+                                                text: "Hand joints use MediaPipe's live 21-point hand skeleton. Trails, zones, privacy effects, and saving or loading profiles are not available yet."
                                             }
                                             Item { Layout.fillHeight: true }
                                         }
