@@ -1058,6 +1058,20 @@ class SceneSmootherTests(unittest.TestCase):
             [item.alpha for item in changed.gestures
              if item.name == "Thumb_Up"][0], 0.0)
 
+    def test_hand_joints_ease_between_gesture_refreshes(self):
+        from gestures import Gesture as RecognizedGesture
+
+        first = RecognizedGesture("Open_Palm", 0.9, 0, 0, 20, 20,
+                                  ((0, 0), (10, 10)))
+        moved = RecognizedGesture("Open_Palm", 0.9, 10, 0, 20, 20,
+                                  ((10, 0), (20, 10)))
+        smoother = SceneSmoother(clock=self.clock)
+        smoother.apply(self.scene(gestures=[first]))
+        self.clock.advance(self.CAPTURE_DT)
+        item = smoother.apply(self.scene(gestures=[moved])).gestures[0]
+        self.assertGreater(item.landmarks[0][0], 0.0)
+        self.assertLess(item.landmarks[0][0], 10.0)
+
     def test_an_object_with_no_track_id_is_passed_through_untouched(self):
         """Two untracked boxes cannot be told apart between frames, and
         guessing which is which is the one thing this module refuses to do."""

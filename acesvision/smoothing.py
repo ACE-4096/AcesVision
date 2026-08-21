@@ -177,16 +177,18 @@ class SmoothedItem:
     or ``Face`` reaches the overlay without passing through here.
     """
 
-    __slots__ = ("item", "x", "y", "w", "h", "alpha")
+    __slots__ = ("item", "x", "y", "w", "h", "alpha", "landmarks")
 
     def __init__(self, item: Any, x: float, y: float, w: float, h: float,
-                 alpha: float = 1.0):
+                 alpha: float = 1.0, landmarks=None):
         self.item = item
         self.x = x
         self.y = y
         self.w = w
         self.h = h
         self.alpha = alpha
+        self.landmarks = (tuple(landmarks) if landmarks is not None
+                          else tuple(getattr(item, "landmarks", ()) or ()))
 
     def __getattr__(self, name):
         # Only reached for names that are not slots. Private names are never
@@ -203,7 +205,7 @@ class SmoothedItem:
 class _Track:
     """The smoother's memory of one detection between frames."""
 
-    __slots__ = ("key", "item", "x", "y", "w", "h", "alpha")
+    __slots__ = ("key", "item", "x", "y", "w", "h", "alpha", "landmarks")
 
     def __init__(self, key, item, alpha: float):
         self.key = key
@@ -213,6 +215,7 @@ class _Track:
         self.w = float(item.w)
         self.h = float(item.h)
         self.alpha = alpha
+        self.landmarks = _landmarks_of(item)
 
     def snap_to(self, item) -> None:
         self.x, self.y = float(item.x), float(item.y)
@@ -224,8 +227,35 @@ class _Track:
         self.w += (float(item.w) - self.w) * factor
         self.h += (float(item.h) - self.h) * factor
 
+    def ease_landmarks_towards(self, item, factor: float) -> None:
+        """Ease MediaPipe joints independently of the gesture label/box.
+
+        The recognizer refreshes at 15 Hz while the preview draws much faster.
+        Forwarding its raw landmark tuple made the skeleton visibly jump on
+        every recognizer result. A modest per-preview ease removes that jitter
+        without affecting the raw values the rule engine receives.
+        """
+        target = _landmarks_of(item)
+        if not target:
+            return
+        if len(target) != len(self.landmarks):
+            self.landmarks = target
+            return
+        # The first preview after a recognizer update moves only part-way; the
+        # repeated cached result advances it smoothly on subsequent previews.
+        factor = min(0.38, max(0.12, float(factor)))
+        self.landmarks = tuple(
+            (x + (tx - x) * factor, y + (ty - y) * factor)
+            for (x, y), (tx, ty) in zip(self.landmarks, target))
+
     def rendered(self) -> SmoothedItem:
-        return SmoothedItem(self.item, self.x, self.y, self.w, self.h, self.alpha)
+        return SmoothedItem(self.item, self.x, self.y, self.w, self.h,
+                            self.alpha, self.landmarks)
+
+
+def _landmarks_of(item):
+    return tuple((float(point[0]), float(point[1]))
+                 for point in (getattr(item, "landmarks", ()) or ()))
 
 
 def _object_key(item):
@@ -351,6 +381,7 @@ class SceneSmoother:
                     track.ease_towards(item, factor)
                 else:
                     track.snap_to(item)
+                track.ease_landmarks_towards(item, factor)
             track.alpha = _faded_in(track.alpha, dt)
             survivors.append(track)
             rendered.append(track.rendered())
