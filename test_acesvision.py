@@ -3324,6 +3324,14 @@ class GuiConnectorTests(unittest.TestCase):
         self.assertEqual([rule["executable"] for rule in backend.rules],
                          [False, True])
 
+    def test_gui_gesture_events_feed_the_authenticated_sse_surface(self):
+        from acesvision.gui import VisionBackend
+
+        backend = VisionBackend(initialize_models=False, load_saved_rules=False)
+        self.assertIs(backend.gestures.emitter, backend.emitter)
+        self.assertIs(backend.preview.emitter, backend.emitter)
+        self.assertIs(backend.preview.bus, backend.emitter.bus)
+
     def test_an_armed_overlay_rule_toggles_clean_and_restores_the_prior_profile(self):
         from acesvision.gui import VisionBackend
 

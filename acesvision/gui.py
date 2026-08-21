@@ -18,6 +18,7 @@ from gesture_catalog import ANY_ACTOR, GESTURE_IDS
 
 from .connectors import OverlayConnector, default_registry
 from .contracts import SceneFrame, SourceSpec
+from .emitter import EventBus, GestureEmitter, PublishFilter
 from .events import GestureEventOutput
 from .discovery import (
     discover_webcams,
@@ -338,8 +339,14 @@ class VisionBackend(QObject):
             "device_path": default_webcam.stable_path if default_webcam else None,
         })
         self.latest = LatestFrameOutput(MINIMAL)
+        # The GUI is the primary desktop runtime, not merely a preview. It
+        # therefore owns the same authenticated event surface as headless
+        # AcesVision: local rules execute in-process and subscribers (including
+        # acergb-visiond) receive the projected SSE event from this exact frame.
+        self.emitter = GestureEmitter(EventBus(), publish_filter=PublishFilter.load())
         self.gestures = GestureEventOutput(self._receive_gesture,
-                                           enabled=self._events_enabled)
+                                           enabled=self._events_enabled,
+                                           emitter=self.emitter)
         # The GUI used to build FaceGestureProcessor() with no arguments while
         # __main__ passed all three knobs, so the desktop app was pinned to the
         # defaults and had no way to reach its own runtime controls.
@@ -359,7 +366,8 @@ class VisionBackend(QObject):
         # authenticates the same way.
         token, _ = load_or_create_token()
         self.preview = VisionServer(self.latest, self.pipeline,
-                                    port=preview_port, token=token)
+                                    port=preview_port, token=token,
+                                    bus=self.emitter.bus, emitter=self.emitter)
         self.preview_url = (f"http://127.0.0.1:{preview_port}/latest.jpg"
                             f"?token={quote(token)}")
 
