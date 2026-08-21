@@ -18,6 +18,16 @@ systemctl --user daemon-reload
 if systemctl --user is-active --quiet acesvision-gui-current.service; then
   systemctl --user stop acesvision-gui-current.service
 fi
+# Older development launches also used this final unit name through
+# ``systemd-run``. A failed transient remains preferred over the installed
+# fragment until it is explicitly cleared, and it lacked WorkingDirectory.
+# Remove only that known transient before loading the persistent unit.
+if [ "$(systemctl --user show acesvision-gui.service -p FragmentPath --value 2>/dev/null || true)" \
+     = "/run/user/$(id -u)/systemd/transient/acesvision-gui.service" ]; then
+  systemctl --user stop acesvision-gui.service || true
+  systemctl --user reset-failed acesvision-gui.service || true
+  systemctl --user daemon-reload
+fi
 systemctl --user start acesvision-gui.service
 
 printf '%s\n' "Installed AcesVision. Find it in the application launcher or pin it to the panel."
