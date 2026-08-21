@@ -312,6 +312,11 @@ class VisionBackend(QObject):
         # No engine-wide dry_run any more. Each rule carries its own, and every
         # rule loaded from a file written before that change defaults to True,
         # so nothing gets armed by this wiring.
+        # An armed saved rule is an explicit opt-in to gesture processing. The
+        # old GUI restarted with its event output off regardless, leaving an
+        # armed rule looking live yet permanently unfireable.
+        self._events_enabled = any(rule.enabled and not rule.dry_run
+                                   for rule in self._rules)
         self.executor = default_registry() if executor is None else executor
         if executor is None:
             self.executor.register(OverlayConnector(
@@ -333,7 +338,8 @@ class VisionBackend(QObject):
             "device_path": default_webcam.stable_path if default_webcam else None,
         })
         self.latest = LatestFrameOutput(MINIMAL)
-        self.gestures = GestureEventOutput(self._receive_gesture)
+        self.gestures = GestureEventOutput(self._receive_gesture,
+                                           enabled=self._events_enabled)
         # The GUI used to build FaceGestureProcessor() with no arguments while
         # __main__ passed all three knobs, so the desktop app was pinned to the
         # defaults and had no way to reach its own runtime controls.
@@ -1172,6 +1178,10 @@ class VisionBackend(QObject):
             return
         self._rules = updated
         self.rule_engine.rules = list(self._rules)
+        if not dry_run:
+            # Arming this named rule was the deliberate gesture opt-in. Do not
+            # make the operator find a separate, reset-on-restart output gate.
+            self.setEventsEnabled(True)
         self._save_rules()
         self.rulesChanged.emit()
 

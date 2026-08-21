@@ -2900,7 +2900,7 @@ class ConnectorDispatchTests(unittest.TestCase):
                 return "muted"
 
         registry = connectors.default_registry().register(FakePipewire())
-        self.assertEqual(registry.names(), ["acergb", "pipewire"])
+        self.assertEqual(registry.names(), ["acergb", "mpris", "pipewire"])
         self.assertTrue(registry.dispatch("pipewire", "mute").ok)
 
     def test_connector_actions_match_the_policy_catalog(self):
@@ -2918,6 +2918,36 @@ class ConnectorDispatchTests(unittest.TestCase):
         result = registry.dispatch("overlay", "toggle_clean")
         self.assertTrue(result.ok)
         self.assertEqual(calls, ["toggle"])
+
+    def test_mpris_discovers_a_player_then_sends_play_pause(self):
+        player_name = "org.mpris.MediaPlayer2.firefox.instance_1"
+        discovery = FakeTransport({"ListNames": [([player_name],)]})
+        player = FakeTransport({"PlayPause": [()]})
+        factories = []
+
+        def factory(*args, **kwargs):
+            factories.append((args, kwargs))
+            return player
+
+        detail = connectors.MprisConnector(
+            discovery_transport=discovery, transport_factory=factory,
+        ).execute("play_pause")
+
+        self.assertEqual(discovery.session.members(), ["ListNames"])
+        self.assertEqual(player.session.members(), ["PlayPause"])
+        self.assertEqual(factories[0][0][:3], (
+            player_name, connectors.MPRIS_OBJECT_PATH, connectors.MPRIS_INTERFACE))
+        self.assertTrue(discovery.session.closed)
+        self.assertTrue(player.session.closed)
+        self.assertIn("PlayPause", detail)
+
+    def test_mpris_reports_no_registered_player_loudly(self):
+        discovery = FakeTransport({"ListNames": [([],)]})
+        result = connectors.ConnectorRegistry([
+            connectors.MprisConnector(discovery_transport=discovery),
+        ]).dispatch("mpris", "play_pause")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_kind, "player_absent")
 
     def test_bindings_that_name_acergb_are_all_executable(self):
         registry = connectors.default_registry()
@@ -3014,6 +3044,7 @@ class ConnectorErrorModeTests(unittest.TestCase):
             connectors.TransportUnavailableError,
             connectors.BusUnavailableError,
             connectors.DaemonUnavailableError,
+            connectors.MediaPlayerUnavailableError,
             connectors.DaemonNotReadyError,
             connectors.MethodFailedError,
             connectors.ConnectorTimeoutError,
@@ -3256,6 +3287,7 @@ class GuiConnectorTests(unittest.TestCase):
             second = Rule.create("Victory", "acergb", "off")
             backend._rules = [first, second]
             backend.setRuleDryRun(first.id, False)
+            self.assertTrue(backend.eventsEnabled)
             self.assertEqual([rule["dryRun"] for rule in backend.rules],
                              [False, True])
             self.assertEqual(
@@ -3268,7 +3300,8 @@ class GuiConnectorTests(unittest.TestCase):
         from acesvision.gui import VisionBackend
 
         backend = VisionBackend(initialize_models=False, load_saved_rules=False)
-        self.assertEqual(backend.executableConnectors, ["acergb", "overlay"])
+        self.assertEqual(backend.executableConnectors,
+                         ["acergb", "mpris", "overlay"])
         backend._rules = [Rule.create("Shush", "pipewire", "mute"),
                           Rule.create("Victory", "acergb", "next_theme")]
         self.assertEqual([rule["executable"] for rule in backend.rules],

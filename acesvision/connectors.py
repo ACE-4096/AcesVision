@@ -25,11 +25,11 @@ gone, and when it is not ready yet (acergbd ``control.rs:386,395,500``).
 
 The registry stays open. ``gesture_catalog.CONNECTOR_BINDINGS`` already maps
 catalog actions onto ``(connector, action)`` pairs for mpris, pipewire and the
-rest; ``policy.CONNECTORS`` declares them all. Only ``acergb`` has an executor
-today, and dispatching an unexecuted connector reports ``not_implemented``
-loudly rather than doing nothing quietly. Adding mpris/pipewire/kde/
-notification/home_assistant means writing a class with ``name``, ``actions()``
-and ``execute()`` and registering it — no change to dispatch.
+rest; ``policy.CONNECTORS`` declares them all. ``acergb`` and ``mpris`` have
+executors today, and dispatching an unexecuted connector reports
+``not_implemented`` loudly rather than doing nothing quietly. Adding
+pipewire/kde/notification/home_assistant means writing a class with ``name``,
+``actions()`` and ``execute()`` and registering it — no change to dispatch.
 """
 from __future__ import annotations
 
@@ -40,6 +40,12 @@ from typing import Optional
 ACERGB_BUS_NAME = "org.acergb.Daemon"
 ACERGB_OBJECT_PATH = "/org/acergb/Daemon"
 ACERGB_INTERFACE = "org.acergb.Daemon"
+DBUS_BUS_NAME = "org.freedesktop.DBus"
+DBUS_OBJECT_PATH = "/org/freedesktop/DBus"
+DBUS_INTERFACE = "org.freedesktop.DBus"
+MPRIS_BUS_PREFIX = "org.mpris.MediaPlayer2."
+MPRIS_OBJECT_PATH = "/org/mpris/MediaPlayer2"
+MPRIS_INTERFACE = "org.mpris.MediaPlayer2.Player"
 
 
 class ConnectorError(Exception):
@@ -72,6 +78,12 @@ class DaemonUnavailableError(ConnectorError):
     """
 
     kind = "daemon_absent"
+
+
+class MediaPlayerUnavailableError(ConnectorError):
+    """No MPRIS player currently owns a name on the session bus."""
+
+    kind = "player_absent"
 
 
 class DaemonNotReadyError(ConnectorError):
@@ -121,6 +133,7 @@ ERROR_KINDS = (
     TransportUnavailableError.kind,
     BusUnavailableError.kind,
     DaemonUnavailableError.kind,
+    MediaPlayerUnavailableError.kind,
     DaemonNotReadyError.kind,
     MethodFailedError.kind,
     ConnectorTimeoutError.kind,
@@ -292,6 +305,68 @@ class OverlayConnector:
         return "toggled clean camera overlay"
 
 
+class MprisConnector:
+    """Typed MPRIS transport controls over the session bus.
+
+    Player discovery and the method call are both D-Bus messages: no shell
+    parsing, no playerctl dependency and no success inferred from stdout. The
+    first player name is chosen in sorted order, making repeated gestures
+    deterministic when more than one application exposes MPRIS.
+    """
+
+    name = "mpris"
+
+    def __init__(self, discovery_transport=None, transport_factory=JeepneyTransport,
+                 call_timeout_s=5.0):
+        self._discovery_transport = discovery_transport or JeepneyTransport(
+            DBUS_BUS_NAME, DBUS_OBJECT_PATH, DBUS_INTERFACE,
+            timeout_s=call_timeout_s, connector=self.name)
+        self._transport_factory = transport_factory
+        self.call_timeout_s = float(call_timeout_s)
+
+    @staticmethod
+    def actions():
+        return ("play_pause", "next", "previous", "stop")
+
+    def execute(self, action, params=None):
+        methods = {
+            "play_pause": "PlayPause",
+            "next": "Next",
+            "previous": "Previous",
+            "stop": "Stop",
+        }
+        method = methods.get(action)
+        if method is None:
+            raise UnsupportedActionError(
+                f"mpris cannot do {action!r}. Actions: " + ", ".join(self.actions()),
+                connector=self.name, action=action)
+        player = self._player(action)
+        transport = self._transport_factory(
+            player, MPRIS_OBJECT_PATH, MPRIS_INTERFACE,
+            timeout_s=self.call_timeout_s, connector=self.name)
+        session = transport.open(action=action)
+        try:
+            session.call(method, action=action)
+        finally:
+            session.close()
+        return f"sent {method} to {player}"
+
+    def _player(self, action):
+        session = self._discovery_transport.open(action=action)
+        try:
+            body = session.call("ListNames", action=action)
+        finally:
+            session.close()
+        names = body[0] if body else []
+        players = sorted(str(name) for name in names
+                         if str(name).startswith(MPRIS_BUS_PREFIX))
+        if not players:
+            raise MediaPlayerUnavailableError(
+                "no MPRIS media player is registered on the session bus",
+                connector=self.name, action=action)
+        return players[0]
+
+
 class AceRgbConnector:
     """Dispatches ``CONNECTORS["acergb"]`` actions as typed D-Bus calls.
 
@@ -448,5 +523,5 @@ class ConnectorRegistry:
 
 
 def default_registry():
-    """The connectors that have a real executor today. Only acergb."""
-    return ConnectorRegistry([AceRgbConnector()])
+    """The connectors with portable, typed local executors."""
+    return ConnectorRegistry([AceRgbConnector(), MprisConnector()])
