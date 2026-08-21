@@ -16,7 +16,7 @@ from PySide6.QtQml import QQmlApplicationEngine
 
 from gesture_catalog import ANY_ACTOR, GESTURE_IDS
 
-from .connectors import default_registry
+from .connectors import OverlayConnector, default_registry
 from .contracts import SceneFrame, SourceSpec
 from .events import GestureEventOutput
 from .discovery import (
@@ -224,6 +224,10 @@ class VisionBackend(QObject):
 
     gestureFromWorker = Signal(str)
     droidScanFinished = Signal(str)
+    # A rule is evaluated on the pipeline worker. Presentation state belongs
+    # to Qt's GUI thread, so the local overlay connector asks that thread to
+    # perform the toggle instead of touching QObjects from the worker.
+    overlayToggleRequested = Signal()
 
     def __init__(self, preview_port=8765, initialize_models=True,
                  load_saved_rules=True, executor=None, parent=None,
@@ -251,6 +255,7 @@ class VisionBackend(QObject):
         self._obs_enabled = False
         self._events_enabled = False
         self._overlay = "minimal"
+        self._overlay_before_clean = "minimal"
         # Whether *this* session has an applied custom profile. Overlay Studio
         # needs a card for it, otherwise "Apply custom" leaves every card
         # reading "Select" and nothing reading "Active".
@@ -308,6 +313,9 @@ class VisionBackend(QObject):
         # rule loaded from a file written before that change defaults to True,
         # so nothing gets armed by this wiring.
         self.executor = default_registry() if executor is None else executor
+        if executor is None:
+            self.executor.register(OverlayConnector(
+                self.overlayToggleRequested.emit))
         self.rule_engine = RuleEngine(self._rules, executor=self.executor)
         self._connector_names = list(self.executor.names())
         self._actor_names = [ANY_ACTOR] + known_actors()
@@ -351,6 +359,7 @@ class VisionBackend(QObject):
 
         self.gestureFromWorker.connect(self._set_gesture)
         self.droidScanFinished.connect(self._apply_droid_scan)
+        self.overlayToggleRequested.connect(self.toggleCleanOverlay)
         self._poll = QTimer(self)
         self._poll.setInterval(100)
         self._poll.timeout.connect(self._refresh)
@@ -1062,12 +1071,28 @@ class VisionBackend(QObject):
             PROFILES["custom"] = self._custom_overlay
         if profile_id not in PROFILES:
             return
+        if profile_id != "clean":
+            self._overlay_before_clean = profile_id
         self._overlay = profile_id
         profile = PROFILES[profile_id]
         self.latest.set_profile(profile)
         if self._obs is not None:
             self._obs.set_profile(profile)
         self.overlayChanged.emit()
+
+    @Slot()
+    def toggleCleanOverlay(self):
+        """Toggle visible annotations without interrupting the camera stream.
+
+        ``clean`` is a compositor profile, not a capture switch: the raw
+        camera, recognition pipeline and gesture event output stay live. The
+        second gesture restores the exact profile selected before clean.
+        """
+        if self._overlay == "clean":
+            self.setOverlayProfile(self._overlay_before_clean)
+        else:
+            self._overlay_before_clean = self._overlay
+            self.setOverlayProfile("clean")
 
     @Slot(bool, bool, bool, int, float, str, str, str, str)
     def applyOverlayStyle(self, show_objects, show_faces, show_gestures,

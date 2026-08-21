@@ -35,6 +35,10 @@ RISK_SENSITIVE = "sensitive"
 KNOWN_FACES_DIR = Path(__file__).resolve().parents[1] / "known_faces"
 
 CONNECTORS = {
+    # Local presentation only: clean keeps the camera stream running but hides
+    # every rendered box, label and gesture annotation. It is deliberately
+    # convenience class because a second gesture restores the previous view.
+    "overlay": {"toggle_clean": RISK_CONVENIENCE},
     "acergb": {
         "next_theme": RISK_CONVENIENCE,
         "off": RISK_CONVENIENCE,

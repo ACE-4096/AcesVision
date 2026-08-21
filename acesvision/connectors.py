@@ -264,6 +264,34 @@ class JeepneyTransport:
 # --------------------------------------------------------------------------
 
 
+class OverlayConnector:
+    """GUI-local presentation actions.
+
+    The callback is intentionally supplied by the GUI rather than importing
+    Qt here. That keeps the headless runner free of GUI imports; a saved overlay
+    rule run headlessly is reported as unwired rather than silently affecting
+    an unrelated process.
+    """
+
+    name = "overlay"
+
+    def __init__(self, toggle_clean):
+        self._toggle_clean = toggle_clean
+
+    @staticmethod
+    def actions():
+        return ("toggle_clean",)
+
+    def execute(self, action, params=None):
+        if action not in self.actions():
+            raise UnsupportedActionError(
+                f"overlay cannot do {action!r}. Actions: "
+                + ", ".join(self.actions()),
+                connector=self.name, action=action)
+        self._toggle_clean()
+        return "toggled clean camera overlay"
+
+
 class AceRgbConnector:
     """Dispatches ``CONNECTORS["acergb"]`` actions as typed D-Bus calls.
 

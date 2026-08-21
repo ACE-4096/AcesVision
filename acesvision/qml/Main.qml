@@ -1406,6 +1406,10 @@ ApplicationWindow {
                                                                   ruleAction.currentText)
                                     }
                                 }
+                                Hint {
+                                    Layout.fillWidth: true
+                                    text: "For clean video, choose Overlay / toggle_clean, add the rule, then turn off Dry run. It hides boxes and labels; the next matching gesture restores your previous overlay."
+                                }
                             }
                         }
 

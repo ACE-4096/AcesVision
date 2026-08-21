@@ -2909,6 +2909,16 @@ class ConnectorDispatchTests(unittest.TestCase):
         self.assertEqual(sorted(connectors.AceRgbConnector.actions()),
                          sorted(CONNECTORS["acergb"]))
 
+    def test_overlay_connector_is_typed_and_calls_only_its_callback(self):
+        calls = []
+        connector = connectors.OverlayConnector(lambda: calls.append("toggle"))
+        registry = connectors.ConnectorRegistry([connector])
+        self.assertEqual(sorted(connector.actions()),
+                         sorted(CONNECTORS["overlay"]))
+        result = registry.dispatch("overlay", "toggle_clean")
+        self.assertTrue(result.ok)
+        self.assertEqual(calls, ["toggle"])
+
     def test_bindings_that_name_acergb_are_all_executable(self):
         registry = connectors.default_registry()
         bound = [(name, pair) for name, pair
@@ -3258,11 +3268,28 @@ class GuiConnectorTests(unittest.TestCase):
         from acesvision.gui import VisionBackend
 
         backend = VisionBackend(initialize_models=False, load_saved_rules=False)
-        self.assertEqual(backend.executableConnectors, ["acergb"])
+        self.assertEqual(backend.executableConnectors, ["acergb", "overlay"])
         backend._rules = [Rule.create("Shush", "pipewire", "mute"),
                           Rule.create("Victory", "acergb", "next_theme")]
         self.assertEqual([rule["executable"] for rule in backend.rules],
                          [False, True])
+
+    def test_an_armed_overlay_rule_toggles_clean_and_restores_the_prior_profile(self):
+        from acesvision.gui import VisionBackend
+
+        backend = VisionBackend(initialize_models=False, load_saved_rules=False)
+        backend.setOverlayProfile("broadcast")
+        backend._rules = [Rule.create("Open_Palm", "overlay", "toggle_clean",
+                                      dry_run=False)]
+        backend.rule_engine.rules = list(backend._rules)
+
+        event = {"gesture": "Open_Palm", "actor": "Toby", "source": "webcam"}
+        backend._receive_gesture(event)
+        self.assertEqual(backend.overlayProfile, "clean")
+        self.assertIn("executed", backend.lastDecision)
+
+        backend._receive_gesture(event)
+        self.assertEqual(backend.overlayProfile, "broadcast")
 
 
 class HeadlessConnectorTests(unittest.TestCase):
