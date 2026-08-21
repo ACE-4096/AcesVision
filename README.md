@@ -203,6 +203,17 @@ Launch the native desktop shell:
 python -m acesvision.gui
 ```
 
+For a normal Plasma launcher and a single managed GUI process, install it once
+from the checkout:
+
+```bash
+./scripts/install-desktop.sh
+```
+
+Then open **AcesVision** from the application launcher and pin it to the panel
+if you want it in the taskbar. The launcher starts the managed user service, so
+reopening it never starts a second process that fights for the camera.
+
 The native shell currently includes live runtime status, webcam and DroidCam
 switching, named physical-camera selectors, an on-demand local DroidCam scan,
 live preview-side exposure/brightness/contrast/gamma controls, black/privacy-frame warnings,

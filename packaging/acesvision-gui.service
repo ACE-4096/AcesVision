@@ -1,0 +1,14 @@
+[Unit]
+Description=AcesVision desktop camera and gesture control
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ace4096/Documents/git_private/face-id
+ExecStart=/home/ace4096/Documents/git_private/face-id/.venv/bin/python -m acesvision.gui
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
