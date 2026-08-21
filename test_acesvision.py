@@ -4965,6 +4965,13 @@ class QmlSourceTests(unittest.TestCase):
     def test_the_overlay_selector_can_render_a_custom_profile(self):
         self.assertIn("vision.customOverlayReady", self.qml)
 
+    def test_live_video_has_a_resize_splitter_and_the_rail_has_a_toggle(self):
+        self.assertIn('objectName: "liveSplit"', self.qml)
+        self.assertIn("orientation: Qt.Vertical", self.qml)
+        self.assertIn("SplitView.preferredHeight:", self.qml)
+        self.assertIn('objectName: "navCollapse"', self.qml)
+        self.assertIn("window.railExpanded = !window.railExpanded", self.qml)
+
     def test_every_notifying_property_and_slot_still_has_a_reader(self):
         """The layout rework moved controls; it must not have dropped any.
 
@@ -5137,12 +5144,20 @@ def measure(width, height):
         "actual": [window.width(), window.height()],
         "stack": box(stack),
         "rail": box(find("navRail")),
+        "liveSplit": box(find("liveSplit")),
         "statusBar": box(find("statusBar")),
         "nav": [box(find("nav%%d" %% index)) for index in range(4)],
         "pages": [],
         "tools": [],
         "panels": [],
     }
+    # The rail must also be collapsible by choice at a wide size, not only at
+    # the automatic narrow-window breakpoint.
+    window.setProperty("railExpanded", False)
+    settle(120)
+    data["railManuallyCollapsed"] = box(find("navRail"))
+    window.setProperty("railExpanded", True)
+    settle(120)
     for index in range(4):
         window.setProperty("currentPage", index)
         settle(170)
@@ -5375,6 +5390,12 @@ class QmlNavRailTests(QmlRenderedLayoutTestCase):
         self.assertLess(narrow["rail"]["w"] / narrow["actual"][0], 0.14)
         self.assertGreater(wide["rail"]["w"], narrow["rail"]["w"])
 
+    def test_the_operator_can_collapse_the_rail_at_a_wide_size(self):
+        wide = self.report["sizes"]["1280x800"]
+        self.assertLess(wide["railManuallyCollapsed"]["w"], 80)
+        self.assertGreater(wide["rail"]["w"],
+                           wide["railManuallyCollapsed"]["w"])
+
     def test_the_status_the_rail_used_to_carry_is_on_screen_everywhere(self):
         # It was a fixed-height card pinned to the bottom of the rail column,
         # so a short window squeezed it. It is a wrapping bar at the top now.
@@ -5392,6 +5413,9 @@ class QmlToolingDockTests(QmlRenderedLayoutTestCase):
     def test_the_feed_the_metrics_and_the_dock_stack_without_overlapping(self):
         for size, data in self.sizes():
             feed, metrics, dock = data["feed"], data["metrics"], data["dock"]
+            split = data["liveSplit"]
+            self.assertIsNotNone(split, f"no live splitter at {size}")
+            self.assertGreater(split["h"], 0, f"flat live splitter at {size}")
             for name, rect in (("feed", feed), ("metrics", metrics),
                                ("dock", dock)):
                 self.assertIsNotNone(rect, f"{size} has no {name}")

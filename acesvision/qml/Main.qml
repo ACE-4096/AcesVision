@@ -39,13 +39,13 @@ ApplicationWindow {
     readonly property int toolCount: 5
     readonly property int pageMargin: 20
 
-    // The one width decision in this file, named once. Above it the nav rail
-    // can afford words. Below it, it keeps the icons and hands the width back
-    // to the video — which is the thing the operator is actually looking at.
-    // A 220 px word rail is 27% of an 800 px window and 35% of a 620 px one;
-    // at 620 it left the feed a 20 px sliver.
+    // A narrow window collapses the rail automatically. At usable widths the
+    // operator can still collapse it deliberately, which hands more space to
+    // the Live feed without hiding navigation.
     readonly property bool wideLayout: width >= 1100
-    readonly property int railWidth: wideLayout ? 176 : 60
+    property bool railExpanded: true
+    readonly property bool showRailLabels: wideLayout && railExpanded
+    readonly property int railWidth: showRailLabels ? 176 : 60
 
     component Card: Rectangle {
         color: window.panel
@@ -132,7 +132,7 @@ ApplicationWindow {
         hoverEnabled: true
         // The label is the only thing the compact rail drops, so it has to come
         // back somewhere. Hovering an icon says which page it is.
-        ToolTip.visible: !window.wideLayout && navControl.hovered
+        ToolTip.visible: !window.showRailLabels && navControl.hovered
         ToolTip.text: navControl.text
         ToolTip.delay: 400
         background: Rectangle {
@@ -151,11 +151,11 @@ ApplicationWindow {
                 // Centred when there is no label beside it, indented when
                 // there is. Computed rather than re-anchored, so nothing has to
                 // assign `undefined` to an anchor at a breakpoint.
-                anchors.leftMargin: window.wideLayout
+                anchors.leftMargin: window.showRailLabels
                                     ? 14 : Math.max(0, (parent.width - width) / 2)
             }
             Text {
-                visible: window.wideLayout
+                visible: window.showRailLabels
                 text: navControl.text
                 color: navControl.checked ? window.textMain : window.textMuted
                 font.pixelSize: 14
@@ -389,6 +389,17 @@ ApplicationWindow {
                     anchors.topMargin: 12
                     spacing: 6
 
+                    ToolButton {
+                        objectName: "navCollapse"
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 30
+                        text: window.showRailLabels ? "Collapse" : ">"
+                        onClicked: window.railExpanded = !window.railExpanded
+                        ToolTip.visible: hovered
+                        ToolTip.text: window.showRailLabels
+                                      ? "Collapse navigation"
+                                      : "Expand navigation"
+                    }
                     NavButton { objectName: "nav0"; text: "Live"; glyph: "feed"; page: 0 }
                     NavButton { objectName: "nav1"; text: "Rules"; glyph: "rules"; page: 1 }
                     NavButton { objectName: "nav2"; text: "People"; glyph: "person"; page: 2 }
@@ -492,28 +503,38 @@ ApplicationWindow {
                             }
                         }
 
+                        // The divider belongs around the feed, not inside a
+                        // settings tab: drag it to give live video or the
+                        // controls the room the current task needs.
+                        SplitView {
+                            id: liveSplit
+                            objectName: "liveSplit"
+                            Layout.fillWidth: true
+                            Layout.fillHeight: true
+                            orientation: Qt.Vertical
+                            handle: Rectangle {
+                                implicitHeight: 10
+                                color: "transparent"
+                                Rectangle {
+                                    anchors.centerIn: parent
+                                    width: Math.min(72, parent.width * 0.22)
+                                    height: 3
+                                    radius: 2
+                                    color: window.border
+                                }
+                            }
+
                         // ---- the feed itself ----------------------------
                         Card {
                             objectName: "feedCard"
-                            Layout.fillWidth: true
-                            Layout.fillHeight: true
-                            Layout.minimumHeight: 160
-                            // Video is 16:9, so that is both what the feed asks
-                            // for and the most it can use — past it the extra
-                            // height is letterbox, and the dock can have it.
-                            // Asking for it explicitly is what makes the picture
-                            // the biggest thing on the page instead of splitting
-                            // the slack evenly with the controls under it.
-                            // Asked for explicitly, and asked for FIRST: a
-                            // ColumnLayout splits leftover height evenly between
-                            // everything that fills, so a feed with no stated
-                            // preference ends up the same size as the controls
-                            // under it. Bounded by the window so a short window
-                            // still has room for the dock without scrolling.
-                            Layout.preferredHeight:
+                            SplitView.minimumHeight: 160
+                            SplitView.fillHeight: true
+                            // The 16:9 feed is the initial split. Once dragged,
+                            // SplitView owns this preference rather than snapping
+                            // the video back when the dock refreshes.
+                            SplitView.preferredHeight:
                                 Math.max(160, Math.min(width * 9 / 16,
-                                                       livePage.availableHeight * 0.44))
-                            Layout.maximumHeight: Math.max(160, width * 9 / 16)
+                                                       livePage.availableHeight * 0.54))
                             color: "#050608"
                             clip: true
                             Image {
@@ -606,6 +627,14 @@ ApplicationWindow {
                                 }
                             }
                         }
+
+                        Item {
+                            SplitView.minimumHeight: 230
+                            SplitView.fillHeight: true
+
+                            ColumnLayout {
+                                anchors.fill: parent
+                                spacing: 12
 
                         // ---- live measurements --------------------------
                         Card {
@@ -1302,6 +1331,9 @@ ApplicationWindow {
                                 }
                             }
                         }
+                            }
+                        }
+                    }
                     }
                 }
 
