@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Person-in-view alerter — one-line launcher.
 #
-#   ./watch.sh                         # watch DroidCam (192.168.1.187), both alerts
+#   ./watch.sh                         # watch local webcam index 0, both alerts
 #   ./watch.sh --source 0             # local webcam index 0
 #   WATCH_ALERT=desktop ./watch.sh    # desktop pop-ups only
 #

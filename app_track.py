@@ -87,28 +87,28 @@ def run_tracker(
 
     # Build summary markdown table
     n_frames = len(frames)
-    n_toby = sum(1 for r in summary if r["is_toby"])
+    n_recognised = sum(1 for r in summary if r["is_recognised"])
 
     lines = [
         f"**Video:** `{source.name}`  ",
         f"**Frames processed:** {n_frames}  ",
         f"**Tracks found:** {len(summary)}  ",
-        f"**Toby tracks:** {n_toby}  ",
+        f"**Recognised tracks:** {n_recognised}  ",
         "",
         "| Track ID | Label | Frames Present | Avg Conf |",
         "|----------|-------|----------------|----------|",
     ]
     for row in summary:
-        label = "**Toby**" if row["is_toby"] else "unknown"
+        label = "**Recognised**" if row["is_recognised"] else "unknown"
         lines.append(
             f"| {row['track_id']} | {label} | {row['frames_present']} | {row['avg_conf']:.3f} |"
         )
 
-    if n_toby == 0:
+    if n_recognised == 0:
         lines += [
             "",
-            "> **Note:** No Toby match found in this video. This is expected if the video",
-            "> does not contain Toby. Upload a video with Toby to verify face-ID labelling.",
+            "> **Note:** No enrolled face was recognised in this video. Ensure the enrolled",
+            "> person is visible and the face-match tolerance has been calibrated.",
         ]
 
     summary_md = "\n".join(lines)
@@ -166,7 +166,7 @@ def build_ui() -> gr.Blocks:
             # Right column: outputs
             with gr.Column(scale=2):
                 annotated_video = gr.Video(
-                    label="Annotated video (Toby=GREEN, others=GREY)",
+                    label="Annotated video (Recognised=GREEN, others=GREY)",
                     interactive=False,
                 )
                 summary_md = gr.Markdown(
@@ -190,12 +190,12 @@ def build_ui() -> gr.Blocks:
             '[\n'
             '  {"frame": 0, "tracks": [\n'
             '    {"id": 1, "box_xywh_norm": [0.5, 0.3, 0.2, 0.6],\n'
-            '     "is_toby": false, "conf": 0.87, "face_distance": null}\n'
+            '     "is_recognised": false, "conf": 0.87, "face_distance": null}\n'
             "  ]}\n"
             "]\n"
             "```\n"
             "`box_xywh_norm`: normalised [cx, cy, w, h] (0–1) — Remotion-consumable.\n"
-            "`is_toby`: sticky label; true once confirmed below tolerance.\n"
+            "`is_recognised`: sticky label; true once confirmed below tolerance.\n"
             "`face_distance`: dlib Euclidean distance on frames where face-ID ran; null otherwise."
         )
 

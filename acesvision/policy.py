@@ -3,7 +3,7 @@
 Rule identifiers are validated against a shared vocabulary at entry. They used
 to be free text matched exactly (gui.py addRule -> RuleEngine._matches), which
 made every mistyped rule a permanent silent no-op: "open_palm" never equals the
-emitted "Open_Palm", "toby" never equals the enrolled "Toby".
+emitted "Open_Palm", "sampleperson" never equals the enrolled "SamplePerson".
 
 ``dry_run`` is a **per-rule** field defaulting to True. It used to be a global:
 hardcoded ``True`` at the RuleEngine construction site and written
@@ -161,7 +161,7 @@ def known_actors(root=None):
 def validate_actor(actor, actors=None):
     """Canonical enrolled name, or '*' for anyone. Raises on an unknown actor.
 
-    Matching is case-insensitive so "toby" resolves to the enrolled "Toby"
+    Matching is case-insensitive so "sampleperson" resolves to the enrolled "SamplePerson"
     rather than matching nothing forever.
     """
     text = str(actor or "").strip()

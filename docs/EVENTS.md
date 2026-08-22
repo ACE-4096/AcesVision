@@ -105,14 +105,14 @@ One JSON object per event.
   "gesture": "Open_Palm",
   "confidence": 0.91,
   "held_frames": 6,
-  "actor": "Toby",
+  "actor": "SamplePerson",
   "identity_state": "identified",
   "liveness_state": "not_evaluated",
   "security_authorized": false,
   "source": {
     "id": "desk",
     "kind": "network",
-    "label": "Desk cam (network: rtsp://192.168.68.40:554/h264)",
+    "label": "Desk cam (network: rtsp://camera.local:554/h264)",
     "trusted_device": false
   },
   "frame_sequence": 117,
@@ -168,7 +168,7 @@ is published as `ambiguous`**, because a proximity guess is not an
 identification and a subscriber gated on `identified` must not act on one.
 
 **Under `ambiguous`, the candidate names are not listed.** Saying "it was either
-Toby or Ana" publishes both of them in order to identify neither.
+SamplePerson or Ana" publishes both of them in order to identify neither.
 
 No endpoint enumerates enrolled identities. There is no roster to fetch. A name
 appears only attached to an event, only when the emitter is certain, and only

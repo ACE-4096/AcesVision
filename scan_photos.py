@@ -1,7 +1,7 @@
 """scan_photos.py — batch face-search over a photo library.
 
-Finds every image in --source that contains Toby's (or any enrolled person's)
-face, using the same detector and embedder as the live camera pipeline.  Runs
+Finds every image in --source that contains an enrolled person's face, using
+the same detector and embedder as the live camera pipeline. Runs
 headlessly; no cv2.imshow.
 
     --engine arcface (default)  YuNet + ArcFace ONNX. Scores COSINE

@@ -5,7 +5,7 @@ FFMPEG, so a Reolink camera plugs straight into roomview.open_source once the
 URL is built. A camera config entry looks like:
 
     {"name": "Front Door", "type": "reolink",
-     "ip": "192.168.1.50", "user": "admin", "password": "secret",
+     "ip": "camera.local", "user": "admin", "password": "secret",
      "stream": "sub", "channel": 1}
 
     stream:  "sub" (lower-res, lighter on CPU/bandwidth — good for detection)

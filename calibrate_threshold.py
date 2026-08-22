@@ -28,9 +28,9 @@ below is labelled with its metric for that reason.
 Cleanup: removes /tmp/lfw_calibration/ on exit (unless --keep-downloads).
 
 Usage:
-    python calibrate_threshold.py --engine arcface --arcface-model w600k_r50
-    python calibrate_threshold.py --engine arcface --arcface-model w600k_mbf
-    python calibrate_threshold.py --engine dlib
+    python calibrate_threshold.py --person "Your Name" --engine arcface --arcface-model w600k_r50
+    python calibrate_threshold.py --person "Your Name" --engine arcface --arcface-model w600k_mbf
+    python calibrate_threshold.py --person "Your Name" --engine dlib
 """
 from __future__ import annotations
 
@@ -81,7 +81,7 @@ _WORKER_PIPELINE = None
 # Step 1: Enrol genuine embeddings (the SAME path production enrols with)
 # -----------------------------------------------------------------------
 
-def load_genuine_arcface(variant: str) -> list[np.ndarray]:
+def load_genuine_arcface(variant: str, person: str) -> list[np.ndarray]:
     """ArcFace embeddings for every enrolled photo, via ArcFacePipeline.
 
     This is literally the function ``engine._build_arcface`` enrols with. If
@@ -93,10 +93,10 @@ def load_genuine_arcface(variant: str) -> list[np.ndarray]:
     print(f"  embedding space: {pipeline.embedding_space()}")
 
     encs: list[np.ndarray] = []
-    toby_dir = KNOWN_DIR / "Toby"
-    if not toby_dir.exists():
-        raise RuntimeError(f"known_faces/Toby/ not found at {toby_dir}")
-    for img_path in sorted(toby_dir.iterdir()):
+    person_dir = KNOWN_DIR / person
+    if not person_dir.is_dir():
+        raise RuntimeError(f"enrolled person not found: {person_dir}")
+    for img_path in sorted(person_dir.iterdir()):
         if img_path.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
             continue
         emb = pipeline.encode_file(img_path)
@@ -104,11 +104,11 @@ def load_genuine_arcface(variant: str) -> list[np.ndarray]:
             print(f"  [warn] no face in {img_path.name}, skipping")
             continue
         encs.append(emb)
-    print(f"  Loaded {len(encs)} genuine embeddings from {toby_dir}")
+    print(f"  Loaded {len(encs)} genuine embeddings from {person_dir}")
     return encs
 
 
-def load_genuine_dlib() -> list[np.ndarray]:
+def load_genuine_dlib(person: str) -> list[np.ndarray]:
     """dlib 128-d encodings for every enrolled image.
 
     DETECTOR ORDER: YuNet first, HOG fallback — MUST match
@@ -126,11 +126,11 @@ def load_genuine_dlib() -> list[np.ndarray]:
 
     IMG_EXT = {".jpg", ".jpeg", ".png"}
     encs: list[np.ndarray] = []
-    toby_dir = KNOWN_DIR / "Toby"
-    if not toby_dir.exists():
-        raise RuntimeError(f"known_faces/Toby/ not found at {toby_dir}")
+    person_dir = KNOWN_DIR / person
+    if not person_dir.is_dir():
+        raise RuntimeError(f"enrolled person not found: {person_dir}")
 
-    for img_path in sorted(toby_dir.iterdir()):
+    for img_path in sorted(person_dir.iterdir()):
         if img_path.suffix.lower() not in IMG_EXT:
             continue
         arr = _fr.load_image_file(str(img_path))
@@ -154,7 +154,7 @@ def load_genuine_dlib() -> list[np.ndarray]:
         if found:
             encs.append(found[0])
 
-    print(f"  Loaded {len(encs)} genuine encodings from {toby_dir}")
+    print(f"  Loaded {len(encs)} genuine encodings from {person_dir}")
     return encs
 
 
@@ -197,20 +197,20 @@ def download_lfw() -> None:
 
 
 # -----------------------------------------------------------------------
-# Step 3: Collect impostor image paths (exclude Toby by name)
+# Step 3: Collect impostor image paths (exclude the calibrated person by name)
 # -----------------------------------------------------------------------
 
-def collect_impostor_paths(max_impostors: int) -> list[Path]:
+def collect_impostor_paths(max_impostors: int, person: str) -> list[Path]:
     """
-    Return up to max_impostors image paths from LFW, excluding any person
-    whose directory name contains 'Toby' or 'Bellramsay' (case-insensitive).
+    Return up to max_impostors image paths from LFW, excluding a matching name.
     Samples evenly across identities for diversity.
     """
     all_dirs = sorted(p for p in LFW_DIR.iterdir() if p.is_dir())
-    # Exclude any accidental Toby entries in LFW (very unlikely but safe)
+    # Exclude an accidental matching identity in LFW (very unlikely but safe).
+    normalized_person = person.casefold().replace(" ", "_")
     impostor_dirs = [
         d for d in all_dirs
-        if "toby" not in d.name.lower() and "bellramsay" not in d.name.lower()
+        if normalized_person not in d.name.casefold()
     ]
 
     per_identity_first: list[Path] = []
@@ -507,6 +507,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Threshold calibration for face-id.")
     ap.add_argument("--engine", choices=["arcface", "dlib"], default="arcface",
                     help="Which embedder to calibrate (default: arcface)")
+    ap.add_argument("--person", required=True,
+                    help="Name of the enrolled person under known_faces/")
     ap.add_argument("--arcface-model", default=arcface.DEFAULT_VARIANT,
                     choices=sorted(arcface.VARIANTS),
                     help=f"ArcFace variant (default: {arcface.DEFAULT_VARIANT})")
@@ -529,8 +531,8 @@ def main() -> None:
     print("=" * 70)
     print(f"STEP 1: Loading enrolled genuine embeddings ({engine_label})")
     print("=" * 70)
-    genuine = (load_genuine_arcface(args.arcface_model) if args.engine == "arcface"
-               else load_genuine_dlib())
+    genuine = (load_genuine_arcface(args.arcface_model, args.person)
+               if args.engine == "arcface" else load_genuine_dlib(args.person))
     if len(genuine) < 2:
         print("ERROR: Need at least 2 genuine embeddings for leave-one-out. Exiting.")
         sys.exit(1)
@@ -543,7 +545,7 @@ def main() -> None:
     print("\n" + "=" * 70)
     print("STEP 3: Collecting impostor image paths")
     print("=" * 70)
-    impostor_paths = collect_impostor_paths(args.max_impostors)
+    impostor_paths = collect_impostor_paths(args.max_impostors, args.person)
 
     print("\n" + "=" * 70)
     print(f"STEP 4: Encoding {len(impostor_paths)} impostor images "

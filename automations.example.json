@@ -1,7 +1,7 @@
 [
   {
     "_comment": "PRESENCE: someone is recognised entering / leaving a room",
-    "event": "enter", "person": "Toby", "room": "Office",
+    "event": "enter", "person": "Sample Person", "room": "Office",
     "command": "notify-send 'Office' '{person} arrived at {time}'"
   },
   {
@@ -23,7 +23,7 @@
     "command": "echo '{person} waved {gesture} in the {room} at {time}'"
   },
   {
-    "event": "gesture", "gesture": "Victory", "person": "Toby",
+    "event": "gesture", "gesture": "Victory", "person": "Sample Person",
     "command": "notify-send 'Gesture' 'Peace sign by {person} in {room}'"
   },
 
@@ -47,7 +47,7 @@
   },
   {
     "_comment": "PRESENCE can drive lighting too — e.g. bring the rig up when you arrive, off when you leave:",
-    "event": "enter", "person": "Toby", "room": "Office",
+    "event": "enter", "person": "Sample Person", "room": "Office",
     "command": "ledctl mode gradient"
   },
   {

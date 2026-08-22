@@ -6,9 +6,25 @@ set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 config_dir="${XDG_CONFIG_HOME:-$HOME/.config}"
 data_dir="${XDG_DATA_HOME:-$HOME/.local/share}"
+python_bin="${ACESVISION_PYTHON:-$repo_dir/.venv/bin/python}"
 
-install -Dm644 "$repo_dir/packaging/acesvision-gui.service" \
-  "$config_dir/systemd/user/acesvision-gui.service"
+if [ ! -x "$python_bin" ]; then
+  printf '%s\n' "AcesVision Python was not found at $python_bin." >&2
+  printf '%s\n' "Create .venv first, or rerun with ACESVISION_PYTHON=/path/to/python." >&2
+  exit 1
+fi
+
+install -d "$config_dir/systemd/user"
+escape_sed_replacement() {
+  printf '%s' "$1" | sed 's/[\\&|]/\\\\&/g'
+}
+repo_dir_escaped="$(escape_sed_replacement "$repo_dir")"
+python_bin_escaped="$(escape_sed_replacement "$python_bin")"
+sed -e "s|@PROJECT_DIR@|$repo_dir_escaped|g" \
+    -e "s|@PYTHON_BIN@|$python_bin_escaped|g" \
+    "$repo_dir/packaging/acesvision-gui.service.in" \
+    > "$config_dir/systemd/user/acesvision-gui.service"
+chmod 0644 "$config_dir/systemd/user/acesvision-gui.service"
 install -Dm644 "$repo_dir/packaging/acesvision.desktop" \
   "$data_dir/applications/acesvision.desktop"
 

@@ -1,7 +1,8 @@
-# face-id
+# AcesVision
 
-Webcam face recognition — detects faces, draws bounding boxes, and labels you
-and your child (or "Unknown").
+Local-first webcam vision — face recognition, object and pose overlays, and
+gesture-controlled desktop automations. Enrolled people are labelled by the
+names you choose; everyone else is shown as "Unknown".
 
 **AcesVision is the supported entry point.** The recognition engines live in
 `engine.py` and are selected with `FACE_ID_ENGINE`:
@@ -448,10 +449,10 @@ can widen the scan past a `/24` or reach a public network; both are refused with
 a message rather than quietly narrowed. If no interface qualifies, discovery
 says so — it does not return an empty list that reads like "no phone found".
 
-## Setup (done already, for reference)
+## Setup
 
 ```bash
-cd face-id
+cd acesvision
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -460,8 +461,8 @@ pip install -r requirements.txt
 ## 1. Enrol the people to recognise
 
 ```bash
-python enroll.py "Toby"
-python enroll.py "Emma"      # your child's name
+python enroll.py "Your Name"
+python enroll.py "Another Person"
 ```
 
 SPACE grabs a frame (only when exactly one face is visible), Q quits. Aim for
@@ -640,9 +641,9 @@ python roomview.py                      # or: python roomview.py my_cams.json
 
 ```json
 [
-  { "name": "Webcam", "index": 9 },
-  { "name": "Lounge", "url": "http://192.168.68.50:81/stream" },
-  { "name": "Door",   "url": "rtsp://user:pass@192.168.68.51/h264" }
+  { "name": "Webcam", "index": 0 },
+  { "name": "Camera A", "url": "http://camera-a.local:81/stream" },
+  { "name": "Camera B", "url": "rtsp://user:password@camera-b.local/h264" }
 ]
 ```
 
@@ -665,9 +666,8 @@ between recognitions per feed), `FACE_ID_RECENCY` (seconds), `FACE_ID_CELL`
 
 ## Person-in-view alerter (`watch_person.py`)
 
-**The ask:** alert me whenever a person comes into view on a camera — using the
-DroidCam phone feed (`192.168.1.187`) and the Reolink security cameras — and tap
-the existing face recognition to say *who* it is.
+**The ask:** alert when a person comes into view on a local or network camera,
+and use existing face recognition to identify them when possible.
 
 **How it works.** Detection is YOLOv8's `person` class, **not** the face engine —
 so it fires for strangers and backs of heads too (the `presence.py` path only
@@ -677,9 +677,9 @@ calibrated YuNet/dlib engine to label who (or "Unknown") and sends an alert via
 with which camera saw them. One thread per camera, each auto-reconnecting.
 
 ```bash
-./watch.sh                                   # all cams in watch_cameras.json, else DroidCam
+./watch.sh                                   # all cams in watch_cameras.json, else webcam 0
 ./watch.sh --source 0                        # one local webcam
-./watch.sh --source http://192.168.1.187:4747/video
+./watch.sh --source http://phone.local:4747/video
 ./watch.sh --cameras watch_cameras.example.json
 WATCH_ALERT=desktop ./watch.sh               # pop-ups only (no Telegram)
 ```
@@ -722,11 +722,11 @@ camera passwords and is gitignored.** Each entry is one of:
 
 ```json
 [
-  { "name": "DroidCam",   "url": "http://192.168.1.187:4747/video" },
-  { "name": "Front Door", "type": "reolink", "ip": "192.168.1.50",
+  { "name": "DroidCam",   "url": "http://phone.local:4747/video" },
+  { "name": "Front Door", "type": "reolink", "ip": "front-door.local",
                           "user": "admin", "password": "secret",
                           "stream": "sub", "channel": 1 },
-  { "name": "Lounge",     "url": "rtsp://user:pass@192.168.1.52:554/h264Preview_01_sub" },
+  { "name": "Lounge",     "url": "rtsp://user:password@lounge.local:554/h264Preview_01_sub" },
   { "name": "Webcam",     "index": 0 }
 ]
 ```
@@ -738,14 +738,13 @@ camera passwords and is gitignored.** Each entry is one of:
   firmware: add `"path":"Preview_01_sub"` to drop the `h264` prefix. `reolink.py`
   also exposes `snapshot_url()` (HTTP JPEG CGI).
 - **DroidCam**: start the app on the phone; default MJPEG is `…:4747/video`
-  (fallback `…:4747/mjpegfeed`). This box and the phone share `192.168.1.0/24`.
+  (fallback `…:4747/mjpegfeed`). The computer and phone must share a LAN.
 
 ### Telegram (optional — desktop works with zero config)
 
-Reads `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` from the env, else a local
-(gitignored) `face-id/.env`, else `ops-hq/.env`. Use a **dedicated @BotFather
-bot** (token from BotFather, chat id from @userinfobot) — do **not** reuse the
-ops-hq poll-only gate bot. Leave creds unset and Telegram is silently skipped.
+Reads `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` from the environment, a local
+(gitignored) `.env`, or an explicit `ACESVISION_SECRETS_FILE`. Use a dedicated
+@BotFather bot and leave credentials unset to silently skip Telegram.
 
 ### Tuning (env vars)
 
@@ -928,3 +927,15 @@ having it installed causes no harm.
   every time, and cached in memory under a key naming the embedding space it
   came from. That is what makes switching engines free and what stops
   embeddings from one model being compared against queries from another.
+
+## Open-source project
+
+AcesVision is licensed under the [GNU Affero General Public License v3.0](LICENSE).
+Before contributing, read [CONTRIBUTING.md](CONTRIBUTING.md); security issues
+belong in the private channel described by [SECURITY.md](SECURITY.md), not in a
+public issue. The repository deliberately excludes biometric data, recordings,
+camera configuration, secrets, databases, and downloaded model binaries.
+
+The code does not redistribute third-party model weights. Download models from
+their publishers and review the terms that apply to the models and any optional
+components you choose to use.

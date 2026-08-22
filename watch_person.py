@@ -7,17 +7,17 @@ face engine (engine.py). On a new arrival it fires a desktop pop-up and/or a
 Telegram push with a snapshot, tagged with which camera saw them.
 
     python watch_person.py                       # all cams in watch_cameras.json,
-                                                 # else just the DroidCam
+                                                 # else local webcam index 0
     python watch_person.py --source 0            # one local webcam, index 0
-    python watch_person.py --source http://192.168.1.187:4747/video
+    python watch_person.py --source http://phone.local:4747/video
     python watch_person.py --cameras my_cams.json   # explicit multi-cam config
     WATCH_ALERT=telegram python watch_person.py  # phone push only
 
 Camera config (JSON list) — each entry is one of:
-    {"name": "DroidCam",   "url": "http://192.168.1.187:4747/video"}
-    {"name": "Front Door", "type": "reolink", "ip": "192.168.1.50",
+    {"name": "DroidCam",   "url": "http://phone.local:4747/video"}
+    {"name": "Front Door", "type": "reolink", "ip": "camera.local",
                            "user": "admin", "password": "secret", "stream": "sub"}
-    {"name": "Lounge",     "url": "rtsp://user:pass@192.168.1.51:554/h264Preview_01_sub"}
+    {"name": "Lounge",     "url": "rtsp://user:pass@camera.local:554/h264Preview_01_sub"}
     {"name": "Webcam",     "index": 0}
 See reolink.py for the full Reolink spec, and watch_cameras.example.json.
 
@@ -26,14 +26,14 @@ enrolled faces. "A person is in view" must fire for strangers and for backs of
 heads too, so detection is YOLO's `person` class; the face engine only adds the
 name when a face happens to be visible.
 
-Telegram: reads TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID from the environment, else
-a local (gitignored) face-id/.env, else ops-hq/.env. Use a dedicated @BotFather
-bot or any token you control; get your chat id from @userinfobot. Sending does
-not touch the poll-only approval gate. Leave creds unset to silently skip
-Telegram (desktop alerts still fire).
+Telegram: reads TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID from the environment, a
+local (gitignored) `.env`, or the explicit `ACESVISION_SECRETS_FILE`. Use a
+dedicated @BotFather bot or any token you control; get your chat id from
+@userinfobot. Leave creds unset to silently skip Telegram (desktop alerts still
+fire).
 
 Env knobs:
-    WATCH_SOURCE        camera source (overridden by --source). Default DroidCam URL.
+    WATCH_SOURCE        camera source (overridden by --source). Default local webcam (0).
     WATCH_ALERT         both | telegram | desktop                     (default both)
     WATCH_CONF          YOLO person confidence 0-1                    (default 0.40)
     WATCH_DETECT_EVERY  run YOLO every N frames                       (default 5)
@@ -41,7 +41,7 @@ Env knobs:
     WATCH_CLEAR_AFTER   seconds with no person before "left"          (default 15)
     WATCH_COOLDOWN      min seconds between alerts                     (default 60)
     WATCH_SNAPSHOT      1 = attach annotated frame to Telegram        (default 1)
-    OPS_HQ_ENV          path to ops-hq/.env for Telegram fallback
+    ACESVISION_SECRETS_FILE  optional path to a dotenv-style credential file
     plus the engine.py face vars (FACE_ID_TOLERANCE, FACE_ID_ENGINE, ...).
 """
 from __future__ import annotations
@@ -65,7 +65,7 @@ if str(_REPO) not in sys.path:
 import reolink  # noqa: E402  Reolink RTSP/snapshot URL builder
 import roomview  # noqa: E402  reuse open_source (network/local camera opener)
 
-DEFAULT_SOURCE = os.environ.get("WATCH_SOURCE", "http://192.168.1.187:4747/video")
+DEFAULT_SOURCE = os.environ.get("WATCH_SOURCE", "0")
 DEFAULT_CAMERAS = _REPO / "watch_cameras.json"
 _YOLO_LOCK = threading.Lock()  # ultralytics inference serialised across cam threads
 # Recognition runs in the face-id venv (working dlib); this watcher runs YOLO in
@@ -85,13 +85,13 @@ PERSON_CLASS = 0  # COCO class id for "person"
 
 # --- Telegram --------------------------------------------------------------
 def _load_telegram_creds():
-    """(token, chat_id). Env vars win, then a local face-id/.env, then ops-hq/.env.
+    """(token, chat_id). Env vars win, then the local .env or an explicit file.
     Either may be None — in which case the Telegram channel is skipped."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat = os.environ.get("TELEGRAM_CHAT_ID") or os.environ.get("TELEGRAM_OWNER_CHAT_ID")
-    candidates = [_REPO / ".env",
-                  Path(os.environ.get("OPS_HQ_ENV",
-                                      Path.home() / "Documents/git_private/ops-hq/.env"))]
+    candidates = [_REPO / ".env"]
+    if os.environ.get("ACESVISION_SECRETS_FILE"):
+        candidates.append(Path(os.environ["ACESVISION_SECRETS_FILE"]))
     for env_path in candidates:
         if token and chat:
             break
@@ -285,7 +285,11 @@ def main():
     elif DEFAULT_CAMERAS.exists():
         cams = load_cameras(DEFAULT_CAMERAS)
     else:
-        cams = [resolve_spec({"name": "DroidCam", "url": DEFAULT_SOURCE})]
+        source = DEFAULT_SOURCE.strip()
+        default_spec = ({"name": "Webcam", "index": int(source)}
+                        if source.isdigit()
+                        else {"name": "Network camera", "url": source})
+        cams = [resolve_spec(default_spec)]
 
     from ultralytics import YOLO
     model_path = str(_REPO / "yolov8n.pt")

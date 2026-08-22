@@ -299,7 +299,7 @@ Example event:
   "confidence": 0.94,
   "held_ms": 520,
   "track_id": "office-1842",
-  "actor": "Toby",
+  "actor": "SamplePerson",
   "identity_state": "verified",
   "liveness_state": "live",
   "source": "monitor-webcam",

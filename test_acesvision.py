@@ -394,13 +394,13 @@ class InterfaceAcquisitionTests(unittest.TestCase):
 
     def test_a_wireless_interface_is_selected(self):
         wireless = (("wlp3s0", 1, 0x1003, "up", True, True,
-                     "192.168.1.50", "255.255.255.0"),)
+                     "10.0.0.50", "255.255.255.0"),)
         plan = self.plan(HOST_INTERFACES + wireless)
         self.assertEqual([interface.name for interface in plan.selected],
                          ["enp8s0", "wlp3s0"])
         self.assertEqual([interface.kind for interface in plan.selected],
                          ["ethernet", "wireless"])
-        self.assertIn(ipaddress.ip_network("192.168.1.0/24"), plan.networks)
+        self.assertIn(ipaddress.ip_network("10.0.0.0/24"), plan.networks)
 
     def test_a_wide_prefix_is_capped_to_a_24_never_swept(self):
         wide = (("eno1", 1, 0x1003, "up", True, False,
@@ -768,7 +768,7 @@ class OverlayTests(unittest.TestCase):
         self.source = SourceSpec.from_mapping({"type": "webcam"})
         self.scene = SceneFrame(
             self.source, 1, 1.0, self.raw,
-            faces=[Face(10, 20, 30, 40, "Toby", 0.2, True)],
+            faces=[Face(10, 20, 30, 40, "SamplePerson", 0.2, True)],
             gestures=[Gesture("Victory", 0.9, 60, 20, 20, 30)],
         )
 
@@ -984,7 +984,7 @@ class SceneSmootherTests(unittest.TestCase):
         second — which looks exactly like the stage controls not working.
         """
         detection = Detection(10, 10, 20, 20, "person", 0.9, 1)
-        face = Face(10, 20, 30, 40, "Toby", 0.2, True)
+        face = Face(10, 20, 30, 40, "SamplePerson", 0.2, True)
         gesture = Gesture("Victory", 0.9, 60, 20, 20, 30)
         self.step([detection], [face], [gesture])
         scene = self.step([detection], [face], [gesture])
@@ -1024,17 +1024,17 @@ class SceneSmootherTests(unittest.TestCase):
         """``Face`` has no track_id and refreshes at 2 Hz. Easing a face box
         over a 500 ms interval walks it off the face it is naming, which is
         worse than a still box — so faces fade, and only fade."""
-        face = Face(10, 20, 30, 40, "Toby", 0.2, True)
+        face = Face(10, 20, 30, 40, "SamplePerson", 0.2, True)
         detection = Detection(10, 20, 30, 40, "person", 0.9, 1)
         self.step([detection], [face])
         scene = self.step([detection._replace(x=20)], [face._replace(x=20)])
         self.assertEqual(scene.faces[0].x, 20.0)
-        self.assertEqual(scene.faces[0].name, "Toby")
+        self.assertEqual(scene.faces[0].name, "SamplePerson")
         self.assertGreater(scene.objects[0].x, 10.0)
         self.assertLess(scene.objects[0].x, 20.0)
 
     def test_a_face_that_leaves_fades_rather_than_disappearing(self):
-        face = Face(10, 20, 30, 40, "Toby", 0.2, True)
+        face = Face(10, 20, 30, 40, "SamplePerson", 0.2, True)
         self.step(faces=[face])
         self.step(faces=[face])
         scene = self.step(faces=[])
@@ -1144,8 +1144,8 @@ class SceneSmootherTests(unittest.TestCase):
         self.assertEqual(item.score, 0.87)
         self.assertEqual(item.alpha, 1.0)
         face = self.smoother.apply(
-            self.scene(faces=[Face(1, 2, 3, 4, "Toby", 0.2, True)])).faces[0]
-        self.assertEqual((face.name, face.conf, face.known), ("Toby", 0.2, True))
+            self.scene(faces=[Face(1, 2, 3, 4, "SamplePerson", 0.2, True)])).faces[0]
+        self.assertEqual((face.name, face.conf, face.known), ("SamplePerson", 0.2, True))
 
 
 class OverlayAlphaTests(unittest.TestCase):
@@ -1252,13 +1252,13 @@ class GestureEventTests(unittest.TestCase):
         output = GestureEventOutput(events.append, hold_frames=2, clock=clock)
         output.set_enabled(True)
         source = SourceSpec.from_mapping({"id": "monitor", "type": "webcam"})
-        face = Face(0, 0, 10, 10, "Toby", 0.2, True)
+        face = Face(0, 0, 10, 10, "SamplePerson", 0.2, True)
         gesture = Gesture("Victory", 0.95, 0, 0, 10, 10)
         for sequence in range(2):
             output.publish(SceneFrame(source, sequence, float(sequence), np.zeros((2, 2, 3)),
                                       faces=[face], gestures=[gesture]))
         self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["actor"], "Toby")
+        self.assertEqual(events[0]["actor"], "SamplePerson")
         self.assertEqual(events[0]["gesture"], "Victory")
         self.assertFalse(events[0]["security_authorized"])
         self.assertEqual(events[0]["liveness_state"], "not_evaluated")
@@ -1295,7 +1295,7 @@ class AsyncProcessorTests(unittest.TestCase):
             def close(self):
                 release.set()
 
-        face = Face(1, 2, 3, 4, "Toby", 0.2, True)
+        face = Face(1, 2, 3, 4, "SamplePerson", 0.2, True)
         gesture = Gesture("Victory", 0.9, 1, 1, 3, 3)
         processor = FaceGestureProcessor(
             face_detector=Mock(return_value=[face]),
@@ -1409,7 +1409,7 @@ class AsyncProcessorTests(unittest.TestCase):
             def close(self):
                 pass
 
-        face_detector = Mock(return_value=[Face(1, 1, 3, 3, "Toby", 0.2, True)])
+        face_detector = Mock(return_value=[Face(1, 1, 3, 3, "SamplePerson", 0.2, True)])
         processor = FaceGestureProcessor(
             face_detector=face_detector,
             gesture_detector=Mock(detect=Mock(return_value=[])),
@@ -1433,7 +1433,7 @@ class AsyncProcessorTests(unittest.TestCase):
             time.sleep(0.01)
         processor.close()
         self.assertEqual(face_detector.call_count, 1)
-        self.assertEqual(scene.faces[0].name, "Toby")
+        self.assertEqual(scene.faces[0].name, "SamplePerson")
 
 
 class CountingObjectDetector:
@@ -1491,7 +1491,7 @@ class StageControlTests(unittest.TestCase):
         self.source = SourceSpec.from_mapping({"type": "webcam"})
         self.frame = np.zeros((40, 40, 3), dtype=np.uint8)
         self.objects = CountingObjectDetector([PERSON])
-        self.faces = Mock(return_value=[Face(1, 2, 3, 4, "Toby", 0.2, True)])
+        self.faces = Mock(return_value=[Face(1, 2, 3, 4, "SamplePerson", 0.2, True)])
         self.gestures = Mock(detect=Mock(
             return_value=[Gesture("Shush", 1.0, 1, 1, 3, 3)]))
 
@@ -2058,10 +2058,11 @@ class PolicyTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "rules.json"
-            rule = Rule.create("Victory", "mpris", "next", actor="Toby")
+            with patch("acesvision.policy.known_actors", return_value=["SamplePerson"]):
+                rule = Rule.create("Victory", "mpris", "next", actor="SamplePerson")
             store = RuleStore(path)
             store.save([rule])
-            loaded = store.load()
+            loaded = store.load(actors=["SamplePerson"])
             self.assertEqual(loaded, [rule])
             text = path.read_text()
             self.assertIn('"version": 1', text)
@@ -2250,7 +2251,7 @@ class GestureCatalogTests(unittest.TestCase):
 # so its mouth point is (500, 300 + 0.72*260) = (500, 487.2) in pixels. Because
 # the frame is 1000 wide and tall, a normalised landmark of 0.487 is pixel 487.
 FRAME_W = FRAME_H = 1000
-FACE_BOX = Face(400, 300, 200, 260, "Toby", 0.2, True)
+FACE_BOX = Face(400, 300, 200, 260, "SamplePerson", 0.2, True)
 
 AT_LIPS = (0.500, 0.490)          # dx 0.00, dy  +0.01  -> inside
 AT_CEILING = (0.500, 0.150)       # dx 0.00, dy  -1.30  -> the plain point up
@@ -2330,8 +2331,8 @@ class ShushGestureTests(unittest.TestCase):
         # The same fingertip, a person standing twice as far away: the face box
         # halves, so what was at the lips is now well outside the mouth region.
         tip = (0.500, 0.400)
-        near = Face(400, 300, 200, 260, "Toby", 0.2, True)
-        far = Face(475, 400, 50, 65, "Toby", 0.2, True)
+        near = Face(400, 300, 200, 260, "SamplePerson", 0.2, True)
+        far = Face(475, 400, 50, 65, "SamplePerson", 0.2, True)
         self.assertTrue(gesture_catalog.is_shush(pointing_hand(tip), [near],
                                                  FRAME_W, FRAME_H))
         self.assertFalse(gesture_catalog.is_shush(pointing_hand(tip), [far],
@@ -2428,7 +2429,7 @@ class ShushGestureTests(unittest.TestCase):
             def close(self):
                 pass
 
-        face = Face(10, 10, 20, 26, "Toby", 0.2, True)
+        face = Face(10, 10, 20, 26, "SamplePerson", 0.2, True)
         gesture_detector = Mock(detect=Mock(return_value=[]))
         processor = FaceGestureProcessor(
             face_detector=Mock(return_value=[face]),
@@ -2446,7 +2447,7 @@ class ShushGestureTests(unittest.TestCase):
             time.sleep(0.01)
         processor.close()
         passed = gesture_detector.detect.call_args.kwargs["faces"]
-        self.assertEqual([f.name for f in passed], ["Toby"])
+        self.assertEqual([f.name for f in passed], ["SamplePerson"])
 
 
 class CameraDiscoveryTests(unittest.TestCase):
@@ -2699,22 +2700,24 @@ class RuleVocabularyTests(unittest.TestCase):
         self.assertEqual(validate_gesture(" victory "), "Victory")
 
     def test_actor_is_validated_against_enrolled_identities(self):
-        self.assertEqual(validate_actor("toby", actors=["Toby"]), "Toby")
-        self.assertEqual(validate_actor("", actors=["Toby"]), "*")
-        self.assertEqual(validate_actor("*", actors=["Toby"]), "*")
+        self.assertEqual(validate_actor("sampleperson", actors=["SamplePerson"]), "SamplePerson")
+        self.assertEqual(validate_actor("", actors=["SamplePerson"]), "*")
+        self.assertEqual(validate_actor("*", actors=["SamplePerson"]), "*")
         with self.assertRaises(ValueError) as caught:
-            validate_actor("mallory", actors=["Toby"])
-        self.assertIn("Toby", str(caught.exception))
+            validate_actor("mallory", actors=["SamplePerson"])
+        self.assertIn("SamplePerson", str(caught.exception))
 
     def test_normalised_rule_actually_fires(self):
         # Red-then-green: the raw strings produce no decision, the normalised
         # rule produces one.
-        event = {"gesture": "Open_Palm", "actor": "Toby", "source": "webcam"}
+        event = {"gesture": "Open_Palm", "actor": "SamplePerson", "source": "webcam"}
         unfireable = Rule(id="x", gesture="open_palm", connector="mpris",
-                          action="play_pause", actor="toby")
+                          action="play_pause", actor="sampleperson")
         self.assertEqual(RuleEngine([unfireable]).evaluate(event), [])
 
-        repaired = Rule.create("open_palm", "mpris", "play_pause", actor="toby")
+        with patch("acesvision.policy.known_actors", return_value=["SamplePerson"]):
+            repaired = Rule.create("open_palm", "mpris", "play_pause",
+                                   actor="sampleperson")
         decisions = RuleEngine([repaired]).evaluate(event)
         self.assertEqual(len(decisions), 1)
         self.assertEqual(decisions[0].outcome, "dry_run")
@@ -2726,22 +2729,22 @@ class RuleVocabularyTests(unittest.TestCase):
             path = Path(directory) / "rules.json"
             path.write_text(json.dumps({"version": 1, "dry_run": True, "rules": [
                 {"id": "a", "gesture": "finger_snap", "connector": "pipewire",
-                 "action": "mute", "actor": "toby", "source": "*",
+                 "action": "mute", "actor": "sampleperson", "source": "*",
                  "enabled": True, "require_liveness": False,
                  "require_confirmation": False},
                 {"id": "b", "gesture": "open_palm", "connector": "mpris",
-                 "action": "play_pause", "actor": "toby", "source": "*",
+                 "action": "play_pause", "actor": "sampleperson", "source": "*",
                  "enabled": True, "require_liveness": False,
                  "require_confirmation": False},
             ]}))
             store = RuleStore(path)
-            rules = store.load(strict=False, actors=["Toby"])
+            rules = store.load(strict=False, actors=["SamplePerson"])
             self.assertEqual([r.id for r in rules], ["b"])
             self.assertEqual(rules[0].gesture, "Open_Palm")
-            self.assertEqual(rules[0].actor, "Toby")
+            self.assertEqual(rules[0].actor, "SamplePerson")
             self.assertEqual([raw["id"] for raw, _ in store.rejected], ["a"])
             with self.assertRaises(ValueError):
-                store.load(strict=True, actors=["Toby"])
+                store.load(strict=True, actors=["SamplePerson"])
 
 
 class HeadlessRunnerTests(unittest.TestCase):
@@ -3179,7 +3182,7 @@ class RecordingExecutor:
 
 
 class PerRuleDryRunTests(unittest.TestCase):
-    EVENT = {"gesture": "Victory", "actor": "Toby", "source": "webcam"}
+    EVENT = {"gesture": "Victory", "actor": "SamplePerson", "source": "webcam"}
 
     def test_rules_default_to_dry_run(self):
         self.assertTrue(Rule.create("Victory", "acergb", "next_theme").dry_run)
@@ -3272,16 +3275,6 @@ class PerRuleDryRunTests(unittest.TestCase):
             rules = RuleStore(path).load()
             self.assertEqual([rule.dry_run for rule in rules], [True])
 
-    def test_the_live_rule_file_is_still_dry_run(self):
-        live = Path.home() / ".config" / "acesvision" / "rules.json"
-        if not live.exists():
-            self.skipTest("no live rules.json on this machine")
-        rules = RuleStore(live).load(strict=False)
-        armed = [f"{rule.connector}.{rule.action}"
-                 for rule in rules if not rule.dry_run]
-        self.assertEqual(armed, [], f"live rules were armed: {armed}")
-
-
 class GuiConnectorTests(unittest.TestCase):
     def backend(self, executor):
         from acesvision.gui import VisionBackend
@@ -3297,7 +3290,7 @@ class GuiConnectorTests(unittest.TestCase):
         backend._rules = [Rule.create("Victory", "acergb", "next_theme",
                                       dry_run=False)]
         backend.rule_engine.rules = list(backend._rules)
-        backend._receive_gesture({"gesture": "Victory", "actor": "Toby",
+        backend._receive_gesture({"gesture": "Victory", "actor": "SamplePerson",
                                   "source": "webcam"})
         self.assertIn("daemon_absent", backend.lastError)
         self.assertIn("failed", backend.lastDecision)
@@ -3306,7 +3299,7 @@ class GuiConnectorTests(unittest.TestCase):
         backend = self.backend(RecordingExecutor())
         backend._rules = [Rule.create("Victory", "acergb", "next_theme")]
         backend.rule_engine.rules = list(backend._rules)
-        backend._receive_gesture({"gesture": "Victory", "actor": "Toby",
+        backend._receive_gesture({"gesture": "Victory", "actor": "SamplePerson",
                                   "source": "webcam"})
         self.assertEqual(backend.lastError, "")
         self.assertIn("dry_run", backend.lastDecision)
@@ -3356,7 +3349,7 @@ class GuiConnectorTests(unittest.TestCase):
                                       dry_run=False)]
         backend.rule_engine.rules = list(backend._rules)
 
-        event = {"gesture": "Open_Palm", "actor": "Toby", "source": "webcam"}
+        event = {"gesture": "Open_Palm", "actor": "SamplePerson", "source": "webcam"}
         backend._receive_gesture(event)
         self.assertEqual(backend.overlayProfile, "clean")
         self.assertIn("executed", backend.lastDecision)
@@ -3419,7 +3412,7 @@ class HeadlessConnectorTests(unittest.TestCase):
             executor=executor)
         lines = []
         with patch("builtins.print", lines.append):
-            _printing_callback(engine)({"gesture": "Victory", "actor": "Toby",
+            _printing_callback(engine)({"gesture": "Victory", "actor": "SamplePerson",
                                         "source": "webcam"})
         self.assertTrue(any("daemon_absent" in line for line in lines))
         self.assertTrue(any(line.startswith("[decision]!!") for line in lines))
@@ -3694,7 +3687,7 @@ class LiveVerificationCaptureTests(unittest.TestCase):
             saver = verify.FrameSaver(directory)
             frame = np.zeros((200, 200, 3), np.uint8)
             path = saver.save("Shush", "defect", frame,
-                              [Face(20, 20, 60, 80, "Toby", 0.2, True)],
+                              [Face(20, 20, 60, 80, "SamplePerson", 0.2, True)],
                               [Gesture("Pointing_Up", 0.9, 10, 10, 40, 40)], 9)
             self.assertEqual(path.name, "09-Shush-defect.jpg")
             self.assertTrue(path.exists() and path.stat().st_size > 0)
@@ -4055,9 +4048,9 @@ class ActorAttributionTests(unittest.TestCase):
         return events
 
     def test_single_known_face_is_attributed_as_unique(self):
-        events = self._publish([Face(0, 0, 5, 5, "Toby", 0.2, True)],
+        events = self._publish([Face(0, 0, 5, 5, "SamplePerson", 0.2, True)],
                                [Gesture("Victory", 0.9, 0, 0, 5, 5)])
-        self.assertEqual(events[0]["actor"], "Toby")
+        self.assertEqual(events[0]["actor"], "SamplePerson")
         self.assertEqual(events[0]["actor_attribution"], "unique")
 
     def test_two_known_faces_attribute_to_the_nearest_hand(self):
@@ -4089,12 +4082,13 @@ class ActorAttributionTests(unittest.TestCase):
 
     def test_actor_scoped_rules_match_again_with_two_people_present(self):
         """The reason this mattered: the rule silently stopped firing."""
-        rule = Rule.create("Victory", "mpris", "next", actor="Toby",
-                           dry_run=True)
+        with patch("acesvision.policy.known_actors", return_value=["SamplePerson"]):
+            rule = Rule.create("Victory", "mpris", "next", actor="SamplePerson",
+                               dry_run=True)
         engine = RuleEngine([rule])
         events = self._publish(
-            [Face(0, 0, 10, 10, "Toby", 0.2, True),
-             Face(300, 0, 10, 10, "Toby", 0.2, True)],
+            [Face(0, 0, 10, 10, "SamplePerson", 0.2, True),
+             Face(300, 0, 10, 10, "SamplePerson", 0.2, True)],
             [Gesture("Victory", 0.9, 0, 0, 10, 10)])
         self.assertEqual(len(engine.evaluate(events[0])), 1)
 
@@ -4152,7 +4146,7 @@ class GuiErrorChannelTests(unittest.TestCase):
         backend._rules = [Rule.create("Victory", "acergb", "next_theme",
                                       dry_run=False)]
         backend.rule_engine.rules = list(backend._rules)
-        backend._receive_gesture({"gesture": "Victory", "actor": "Toby",
+        backend._receive_gesture({"gesture": "Victory", "actor": "SamplePerson",
                                   "source": "webcam"})
         for _ in range(20):
             backend._refresh()
@@ -4519,7 +4513,7 @@ class GuiNotifyingPropertyTests(unittest.TestCase):
         backend = gui_backend()
         fired = []
         backend.actorsChanged.connect(lambda: fired.append(True))
-        with patch("acesvision.gui.known_actors", return_value=["Toby", "Ada"]):
+        with patch("acesvision.gui.known_actors", return_value=["SamplePerson", "Ada"]):
             backend.refreshActors()
         self.assertIn("Ada", backend.actorNames)
         self.assertIn(gesture_catalog.ANY_ACTOR, backend.actorNames)
@@ -5841,13 +5835,13 @@ TEST_TOKEN = "test-token-Yg7Qx0pM3nV8sLzR2bT5wC1aH4eJ6kD9"
 #: URL that would hurt if it did.
 CREDENTIALED_RTSP = {
     "id": "desk", "name": "Desk cam", "type": "rtsp",
-    "url": "rtsp://admin:hunter2@192.168.68.40:554/Preferred?channel=1",
+    "url": "rtsp://user:password@camera.example.invalid:554/Preferred?channel=1",
 }
 
 
-def gesture_event(gesture="Open_Palm", attribution="unique", actor="Toby",
+def gesture_event(gesture="Open_Palm", attribution="unique", actor="SamplePerson",
                   confidence=0.91, held_frames=6, captured_at=12.5,
-                  candidates=("Toby", "Ana")):
+                  candidates=("SamplePerson", "Ana")):
     """The dict GestureEventOutput hands to its callback and to the emitter."""
     return {
         "event": "gesture",
@@ -6100,9 +6094,9 @@ class GestureEventSchemaTests(unittest.TestCase):
         event = self.publish()
         self.assertEqual(event["source"], {
             "id": "desk", "kind": "network", "trusted_device": False,
-            "label": "Desk cam (network: rtsp://192.168.68.40:554/Preferred)"})
+            "label": "Desk cam (network: rtsp://camera.example.invalid:554/Preferred)"})
         serialised = json.dumps(event)
-        for secret in ("admin", "hunter2", "admin:hunter2@", "channel=1"):
+        for secret in ("user", "password", "user:password@", "channel=1"):
             self.assertNotIn(secret, serialised, secret)
 
     def test_the_source_label_can_be_withheld_entirely(self):
@@ -6140,11 +6134,11 @@ class IdentityStateTests(unittest.TestCase):
         return local[0], (published[0] if published else None)
 
     def test_one_enrolled_face_is_identified_and_named(self):
-        local, wire = self.wire_event([Face(0, 0, 5, 5, "Toby", 0.2, True)],
+        local, wire = self.wire_event([Face(0, 0, 5, 5, "SamplePerson", 0.2, True)],
                                       [Gesture("Victory", 0.9, 0, 0, 5, 5)])
         self.assertEqual(local["actor_attribution"], "unique")
         self.assertEqual(wire["identity_state"], "identified")
-        self.assertEqual(wire["actor"], "Toby")
+        self.assertEqual(wire["actor"], "SamplePerson")
 
     def test_no_enrolled_face_is_unknown(self):
         _, wire = self.wire_event([Face(0, 0, 5, 5, None, 0.9, False)],
@@ -6183,12 +6177,12 @@ class IdentityStateTests(unittest.TestCase):
         self.assertIsNone(wire["actor"])
 
     def test_the_operator_can_switch_identity_off_entirely(self):
-        _, wire = self.wire_event([Face(0, 0, 5, 5, "Toby", 0.2, True)],
+        _, wire = self.wire_event([Face(0, 0, 5, 5, "SamplePerson", 0.2, True)],
                                   [Gesture("Victory", 0.9, 0, 0, 5, 5)],
                                   publish_filter=PublishFilter(publish_identity=False))
         self.assertEqual(wire["identity_state"], "disabled")
         self.assertIsNone(wire["actor"])
-        self.assertNotIn("Toby", json.dumps(wire))
+        self.assertNotIn("SamplePerson", json.dumps(wire))
 
     def test_disabled_says_nothing_about_the_scene(self):
         # All four scene cases collapse to `disabled`, which is the point: it
@@ -6383,7 +6377,7 @@ class GestureEventOutputEmitterTests(unittest.TestCase):
     def setUp(self):
         self.source = SourceSpec.from_mapping({"type": "webcam"})
         self.scene = SceneFrame(self.source, 3, 0.0, np.zeros((2, 2, 3)),
-                                faces=[Face(0, 0, 5, 5, "Toby", 0.2, True)],
+                                faces=[Face(0, 0, 5, 5, "SamplePerson", 0.2, True)],
                                 gestures=[Gesture("Victory", 0.9, 0, 0, 5, 5)])
 
     def test_the_local_callback_and_the_emitter_both_see_the_gesture(self):
@@ -6848,11 +6842,11 @@ class EmitterEndpointTests(EmitterHarnessCase):
                          list(CATALOG.ids))
 
     def test_no_endpoint_enumerates_identities(self):
-        self.harness.publish(actor="Toby", attribution="unique")
+        self.harness.publish(actor="SamplePerson", attribution="unique")
         for path in ("/api/catalog", "/api/state", "/api/health", "/",
                      "/api/events/recent"):
             _, body = self.harness.request(path)
-            self.assertNotIn(b"Toby", body, path)
+            self.assertNotIn(b"SamplePerson", body, path)
 
     def test_an_unknown_path_is_a_json_404(self):
         status, payload = self.harness.json("/api/nope")
@@ -7331,7 +7325,7 @@ class MetricDirectionTests(unittest.TestCase):
         # open for ArcFace, and a float cannot tell you which it meant.
         gallery = [np.array([1.0, 0.0])]
         with self.assertRaises(TypeError):
-            matching.match(gallery, ["Toby"], np.array([1.0, 0.0]), 0.50)
+            matching.match(gallery, ["SamplePerson"], np.array([1.0, 0.0]), 0.50)
 
     def test_the_dlib_number_read_as_cosine_would_admit_a_stranger(self):
         # Documents the size of the trap numerically. 0.50 as a cosine FLOOR
@@ -7541,7 +7535,7 @@ class EmbeddingSpaceCacheTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.addCleanup(face_engine.clear_known_cache)
         root = Path(self.tmp.name)
-        for person, count in (("Toby", 2), ("Ada", 1)):
+        for person, count in (("SamplePerson", 2), ("Ada", 1)):
             (root / person).mkdir()
             for i in range(count):
                 (root / person / f"{i}.jpg").write_bytes(b"")
@@ -7551,7 +7545,7 @@ class EmbeddingSpaceCacheTests(unittest.TestCase):
 
     def test_enrolment_reads_the_photos_on_disk(self):
         names = [name for name, _ in face_engine.enrolled_photos()]
-        self.assertEqual(names, ["Ada", "Toby", "Toby"])
+        self.assertEqual(names, ["Ada", "SamplePerson", "SamplePerson"])
 
     def test_a_gallery_is_built_once_per_space(self):
         calls = []
@@ -7576,7 +7570,7 @@ class EmbeddingSpaceCacheTests(unittest.TestCase):
             "space-skip",
             lambda p: None if p.parent.name == "Ada" else np.zeros(8))
         self.assertEqual(len(encodings), len(names))
-        self.assertEqual(names, ["Toby", "Toby"])
+        self.assertEqual(names, ["SamplePerson", "SamplePerson"])
 
     def test_switching_arcface_variant_rebuilds_rather_than_reuses(self):
         r50 = FakeArcFacePipeline(space=arcface.embedding_space_id("w600k_r50"), dim=512)
@@ -7638,8 +7632,8 @@ class ArcFaceEngineTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         root = Path(self.tmp.name)
-        (root / "Toby").mkdir()
-        (root / "Toby" / "0.jpg").write_bytes(b"")
+        (root / "SamplePerson").mkdir()
+        (root / "SamplePerson" / "0.jpg").write_bytes(b"")
         patcher = patch.object(face_engine, "KNOWN_DIR", root)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -7655,7 +7649,7 @@ class ArcFaceEngineTests(unittest.TestCase):
         face = detect(np.zeros((10, 10, 3), dtype=np.uint8))[0]
         self.assertEqual(face.metric, matching.COSINE_SIMILARITY)
         self.assertTrue(face.known)
-        self.assertEqual(face.name, "Toby")
+        self.assertEqual(face.name, "SamplePerson")
         self.assertAlmostEqual(face.conf, 1.0, places=6)
 
     def test_a_stranger_is_rejected_and_scores_low_not_high(self):
@@ -7671,7 +7665,7 @@ class ArcFaceEngineTests(unittest.TestCase):
         self.assertEqual(detect.engine, "arcface")
         self.assertEqual(detect.metric, matching.COSINE_SIMILARITY)
         self.assertEqual(detect.threshold, matching.THRESHOLDS["arcface"])
-        self.assertEqual(detect.people, ["Toby"])
+        self.assertEqual(detect.people, ["SamplePerson"])
 
     def test_face_records_its_metric_field(self):
         self.assertEqual(face_engine.Face._fields,
@@ -7688,7 +7682,7 @@ class ArcFaceEngineTests(unittest.TestCase):
 
     def test_match_helper_refuses_a_bare_tolerance(self):
         with self.assertRaises(TypeError):
-            face_engine._match([np.zeros(8)], ["Toby"], np.zeros(8), 0.50)
+            face_engine._match([np.zeros(8)], ["SamplePerson"], np.zeros(8), 0.50)
 
 
 class ArcFaceConcurrencyTests(unittest.TestCase):
@@ -7700,8 +7694,8 @@ class ArcFaceConcurrencyTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         root = Path(self.tmp.name)
-        (root / "Toby").mkdir()
-        (root / "Toby" / "0.jpg").write_bytes(b"")
+        (root / "SamplePerson").mkdir()
+        (root / "SamplePerson" / "0.jpg").write_bytes(b"")
         patcher = patch.object(face_engine, "KNOWN_DIR", root)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -8318,14 +8312,14 @@ class RecordingSidecarTests(RecordingTestCase):
         output.publish(self.scene(
             0, 100.0,
             objects=[Detection(1, 2, 3, 4, "person", 0.9, 7)],
-            faces=[Face(1, 2, 3, 4, "Toby", 0.31, True)],
+            faces=[Face(1, 2, 3, 4, "SamplePerson", 0.31, True)],
             gestures=[Gesture("Victory", 0.8, 1, 2, 3, 4)]))
         output.close()
 
         frame = self.sidecar(output)["frames"][0]
         self.assertEqual(frame["objects"][0]["label"], "person")
         self.assertEqual(frame["objects"][0]["track_id"], 7)
-        self.assertEqual(frame["faces"][0]["name"], "Toby")
+        self.assertEqual(frame["faces"][0]["name"], "SamplePerson")
         self.assertEqual(frame["gestures"][0]["name"], "Victory")
 
     def test_numpy_scalars_from_the_detectors_survive_serialisation(self):

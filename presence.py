@@ -11,12 +11,12 @@ Rooms are the camera "name" fields in cameras.json.
 
 automations.json is a list of rules; each fires on a matching event:
     [
-      { "event": "enter", "person": "Toby", "room": "Office",
+      { "event": "enter", "person": "SamplePerson", "room": "Office",
         "webhook": { "url": "http://homeassistant.local/api/webhook/office_on", "method": "POST" } },
       { "event": "leave", "room": "Office",
         "webhook": { "url": "http://homeassistant.local/api/webhook/office_off" } },
-      { "event": "enter", "person": "Emma",
-        "command": "notify-send 'Emma is in the {room}'" }
+      { "event": "enter", "person": "SamplePerson",
+        "command": "notify-send '{person} is in the {room}'" }
     ]
 person/room may be omitted or "*" to match any. Command/webhook strings get
 {person} {room} {event} {time} substituted.

@@ -1,9 +1,9 @@
 """Enrol a person's face from the local webcam OR a network camera (ESP32-CAM).
 
-    python enroll.py "Toby"                              # local colour webcam
-    python enroll.py "Toby" --source ESP32-CAM           # a name from cameras.json
-    python enroll.py "Toby" --source http://192.168.68.111:81/stream
-    python enroll.py "Toby" --source 9 --model hog       # explicit index + model
+    python enroll.py "Your Name"                                 # local colour webcam
+    python enroll.py "Your Name" --source ESP32-CAM              # a name from cameras.json
+    python enroll.py "Your Name" --source http://camera.local:81/stream
+    python enroll.py "Your Name" --source 9 --model hog          # explicit index + model
 
 SPACE captures (saves a face crop only when exactly one face is found), Q quits.
 Enrol at the distances and angles you'll actually be recognised at — and from

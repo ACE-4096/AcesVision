@@ -1,14 +1,14 @@
 [
-  { "name": "DroidCam", "url": "http://192.168.1.187:4747/video" },
+  { "name": "DroidCam", "url": "http://phone.local:4747/video" },
 
   { "name": "Front Door", "type": "reolink",
-    "ip": "192.168.1.50", "user": "admin", "password": "CHANGE_ME",
+    "ip": "front-door.local", "user": "admin", "password": "CHANGE_ME",
     "stream": "sub", "channel": 1 },
 
   { "name": "Driveway", "type": "reolink",
-    "ip": "192.168.1.51", "user": "admin", "password": "CHANGE_ME",
+    "ip": "driveway.local", "user": "admin", "password": "CHANGE_ME",
     "stream": "sub", "channel": 1 },
 
   { "name": "Lounge (raw RTSP)",
-    "url": "rtsp://user:pass@192.168.1.52:554/h264Preview_01_sub" }
+    "url": "rtsp://user:password@lounge.local:554/h264Preview_01_sub" }
 ]

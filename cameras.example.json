@@ -1,5 +1,5 @@
 [
-  { "name": "Webcam", "index": 9 },
-  { "name": "Lounge", "url": "http://192.168.68.50:81/stream" },
-  { "name": "Door",   "url": "http://192.168.68.51:81/stream" }
+  { "name": "Webcam", "index": 0 },
+  { "name": "Camera A", "url": "http://camera-a.local:81/stream" },
+  { "name": "Camera B", "url": "rtsp://user:password@camera-b.local/h264" }
 ]

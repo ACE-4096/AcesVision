@@ -5,8 +5,8 @@ Pipeline:
   2. Every FACE_SAMPLE_INTERVAL frames per active track: crop the person box,
      run the YuNet-first face-detect+dlib-encode pipeline (same as engine.py /
      scan_photos.py), compare to enrolled embeddings.
-  3. Sticky labelling: once a track is confirmed as "Toby" at <= tolerance,
-     that label persists. Reconfirm every FACE_SAMPLE_INTERVAL frames to handle
+  3. Sticky recognition: once a track is confirmed at <= tolerance, it stays
+     marked recognised. Reconfirm every FACE_SAMPLE_INTERVAL frames to handle
      track ID reuse and long takes.
   4. Output: per-frame list of track dicts; write to JSON file.
 
@@ -66,15 +66,15 @@ class TrackState:
 
     def __init__(self, track_id: int):
         self.track_id = track_id
-        self.is_toby: bool = False
+        self.is_recognised: bool = False
         self.best_face_distance: Optional[float] = None
         self.last_face_check_frame: int = -9999
         self.frame_count: int = 0
         self.conf_sum: float = 0.0
 
-    def update_face(self, is_toby: bool, face_distance: float) -> None:
-        if is_toby:
-            self.is_toby = True
+    def update_face(self, is_recognised: bool, face_distance: float) -> None:
+        if is_recognised:
+            self.is_recognised = True
         self.best_face_distance = (
             face_distance
             if self.best_face_distance is None
@@ -130,7 +130,7 @@ def _face_id_crop(
 ) -> tuple[bool, Optional[float]]:
     """
     Run face detect + encode on a BGR crop.
-    Returns (is_toby: bool, face_distance: float | None).
+    Returns (is_recognised: bool, face_distance: float | None).
     Face distance is None if no face was detected in the crop.
     """
     if crop_bgr is None or crop_bgr.size == 0:
@@ -187,7 +187,7 @@ def track_video(
     verbose: bool = True,
 ) -> list[dict]:
     """
-    Track persons in a video, label Toby by face-ID, write per-frame JSON.
+    Track people in a video, mark recognised tracks, and write per-frame JSON.
 
     Args:
         source:           Input video path.
@@ -323,7 +323,7 @@ def track_video(
                 tracks_this_frame.append({
                     "id": tid,
                     "box_xywh_norm": [round(float(v), 4) for v in box_norm],
-                    "is_toby": st.is_toby,
+                    "is_recognised": st.is_recognised,
                     "conf": round(det_conf, 3),
                     "face_distance": round(face_distance, 4) if face_distance is not None else None,
                 })
@@ -333,9 +333,9 @@ def track_video(
                     x1, y1, x2, y2 = (int(v) for v in box_xyxy)
                     x1, y1 = max(0, x1), max(0, y1)
                     x2, y2 = min(frame_w, x2), min(frame_h, y2)
-                    color = (0, 200, 0) if st.is_toby else (180, 180, 180)
+                    color = (0, 200, 0) if st.is_recognised else (180, 180, 180)
                     cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), color, 2)
-                    label = f"{'Toby' if st.is_toby else 'ID'} #{tid}  {det_conf:.2f}"
+                    label = f"{'Recognised' if st.is_recognised else 'ID'} #{tid}  {det_conf:.2f}"
                     (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
                     cv2.rectangle(frame_bgr, (x1, y1 - lh - 6), (x1 + lw + 4, y1), color, -1)
                     cv2.putText(
@@ -366,8 +366,8 @@ def track_video(
     fps_actual = frame_idx / max(elapsed, 0.001)
     if verbose:
         print(f"\n[track] Done: {frame_idx} frames in {elapsed:.1f}s ({fps_actual:.1f} it/s)")
-        toby_tracks = [tid for tid, st in states.items() if st.is_toby]
-        print(f"[track] Tracks found: {len(states)} | Toby tracks: {toby_tracks}")
+        recognised_tracks = [tid for tid, st in states.items() if st.is_recognised]
+        print(f"[track] Tracks found: {len(states)} | Recognised tracks: {recognised_tracks}")
 
     # --- Write JSON ---
     output_json.parent.mkdir(parents=True, exist_ok=True)
@@ -391,11 +391,11 @@ def summarize_tracks(frames: list[dict]) -> list[dict]:
         for t in fr["tracks"]:
             tid = t["id"]
             if tid not in totals:
-                totals[tid] = {"id": tid, "is_toby": False, "frames_present": 0, "conf_sum": 0.0}
+                totals[tid] = {"id": tid, "is_recognised": False, "frames_present": 0, "conf_sum": 0.0}
             totals[tid]["frames_present"] += 1
             totals[tid]["conf_sum"] += t["conf"]
-            if t["is_toby"]:
-                totals[tid]["is_toby"] = True
+            if t["is_recognised"]:
+                totals[tid]["is_recognised"] = True
 
     summary = []
     for tid in sorted(totals):
@@ -403,7 +403,7 @@ def summarize_tracks(frames: list[dict]) -> list[dict]:
         n = d["frames_present"]
         summary.append({
             "track_id": tid,
-            "is_toby": d["is_toby"],
+            "is_recognised": d["is_recognised"],
             "frames_present": n,
             "avg_conf": round(d["conf_sum"] / max(n, 1), 3),
         })
@@ -417,7 +417,7 @@ def summarize_tracks(frames: list[dict]) -> list[dict]:
 def main() -> None:
     import argparse
     parser = argparse.ArgumentParser(
-        description="Track persons in a video and label Toby by face-ID.",
+        description="Track people in a video and mark recognised tracks.",
     )
     parser.add_argument("source", type=Path, help="Input video file")
     parser.add_argument("--output-json", type=Path, default=None,
@@ -452,7 +452,7 @@ def main() -> None:
     summary = summarize_tracks(frames)
     print("\n=== Track Summary ===")
     for row in summary:
-        label = "TOBY" if row["is_toby"] else "unknown"
+        label = "RECOGNISED" if row["is_recognised"] else "unknown"
         print(f"  Track {row['track_id']:3d}: {label:7s}  "
               f"{row['frames_present']:4d} frames  avg_conf={row['avg_conf']:.3f}")
 

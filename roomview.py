@@ -10,8 +10,8 @@ feeds (with which camera each person is on).
 
 Config (JSON list); each camera is one of:
     {"name": "Webcam",  "index": 9}                      # local V4L2 camera
-    {"name": "Lounge",  "url": "http://192.168.68.50:81/stream"}   # ESP32-CAM MJPEG
-    {"name": "Door",    "url": "rtsp://user:pass@192.168.68.51/h264"}  # RTSP also OK
+    {"name": "Camera A", "url": "http://camera-a.local:81/stream"}  # ESP32-CAM MJPEG
+    {"name": "Camera B", "url": "rtsp://user:password@camera-b.local/h264"}  # RTSP also OK
 
 Keys:  Q or ESC = quit.
 
