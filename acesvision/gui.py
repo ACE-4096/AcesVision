@@ -240,6 +240,10 @@ class VisionBackend(QObject):
         self._status = "starting"
         discovered_webcams = discover_webcams()
         default_webcam = preferred_webcam(discovered_webcams)
+        self._preferred_webcam = default_webcam
+        self._virtual_webcam_indexes = {
+            device.index for device in discovered_webcams if device.kind == "virtual"
+        }
         self._source = default_webcam.label if default_webcam else "Webcam (auto)"
         self._sequence = 0
         # Two independent error channels. The pipeline one is a live mirror of
@@ -441,6 +445,14 @@ class VisionBackend(QObject):
     def _refresh(self):
         now = self._clock()
         state = self.pipeline.state()
+        if (state.source.kind == "webcam"
+                and state.source.index in self._virtual_webcam_indexes
+                and self._preferred_webcam is not None):
+            # Never ingest our own v4l2loopback output. Besides wasting the
+            # perception budget it recursively re-encodes the preview and
+            # produces the visible feedback flicker the guard exists to stop.
+            self.useWebcamIndex(self._preferred_webcam.index)
+            return
         if state.status != self._status:
             self._status = state.status
             self.statusChanged.emit()
