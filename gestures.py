@@ -109,10 +109,14 @@ def classify_hands(hand_landmarks, gesture_categories, w, h, min_score,
 
         cats = (gesture_categories[index]
                 if gesture_categories and index < len(gesture_categories) else [])
-        if not cats:
-            continue
-        g = cats[0]
-        if g.category_name in ("None", "") or g.score < min_score:
-            continue
-        out.append(Gesture(g.category_name, float(g.score), *box, landmarks))
+        if cats:
+            g = cats[0]
+            if g.category_name not in ("None", "") and g.score >= min_score:
+                out.append(Gesture(g.category_name, float(g.score), *box, landmarks))
+                continue
+        # A hand is still useful visual evidence when the classifier has no
+        # confident gesture name. It gets an empty name so renderers retain the
+        # skeleton, while GestureEventOutput (which requires a non-empty name)
+        # can never turn it into an action.
+        out.append(Gesture("", 0.0, *box, landmarks))
     return out

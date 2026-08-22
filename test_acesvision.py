@@ -2241,7 +2241,8 @@ class GestureCatalogTests(unittest.TestCase):
         self.assertEqual(len(rows[0].landmarks), 21)
         rows = classify_hands(open_palm, [[Category("Open_Palm", 0.1)]],
                               100, 100, 0.5)
-        self.assertEqual(rows, [])
+        self.assertEqual([(row.name, row.score) for row in rows], [("", 0.0)])
+        self.assertEqual(len(rows[0].landmarks), 21)
 
 
 # One 1000x1000 frame and one face box, shared by every shush test so the

@@ -60,6 +60,9 @@ def render(scene: SceneFrame, profile: OverlayProfile = MINIMAL):
     if profile.show_gestures:
         for gesture in scene.gestures:
             label = str(getattr(gesture, "name", "Gesture"))
+            if not label:
+                # Landmark-only hands are deliberately not gesture boxes.
+                continue
             score = getattr(gesture, "score", None)
             if profile.show_confidence and score is not None:
                 label += f" {score:.0%}"
