@@ -373,12 +373,18 @@ class VisionServer:
                     return
                 if path == "/api/state":
                     state = outer.pipeline.state()
+                    scene, _ = outer.latest_output.snapshot()
                     self._reply_json(200, {
                         "status": state.status,
                         "source": state.source.safe_label(),
                         "sequence": state.sequence,
                         "last_error": state.last_error,
                         "metrics": state.metrics,
+                        "scene_counts": {
+                            "objects": len(scene.objects) if scene else 0,
+                            "faces": len(scene.faces) if scene else 0,
+                            "gestures": len(scene.gestures) if scene else 0,
+                        },
                     })
                     return
                 if path == "/api/catalog":
