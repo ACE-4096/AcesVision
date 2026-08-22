@@ -6,6 +6,7 @@ PartOf=graphical-session.target
 [Service]
 Type=simple
 WorkingDirectory=/home/ace4096/Documents/git_private/face-id
+Environment=FACE_ID_CAM=/dev/video0
 ExecStart=/home/ace4096/Documents/git_private/face-id/.venv/bin/python -m acesvision.gui
 Restart=on-failure
 RestartSec=3

@@ -326,7 +326,11 @@ class VisionBackend(QObject):
         self._connector_names = list(self.executor.names())
         self._actor_names = [ANY_ACTOR] + known_actors()
         self._obs = None
-        self._webcams = [device.as_dict() for device in discovered_webcams]
+        # AcesVision's own v4l2loopback output is a valid camera device at the
+        # kernel level but never a valid *input* here: selecting it feeds our
+        # rendered preview back into capture and creates visible flicker.
+        self._webcams = [device.as_dict() for device in discovered_webcams
+                         if device.kind != "virtual"]
         self._droid_cams = []
         self._droid_scan_active = False
         self._droid_scan_status = "Not scanned"
@@ -963,7 +967,8 @@ class VisionBackend(QObject):
 
     @Slot()
     def refreshWebcams(self):
-        self._webcams = [device.as_dict() for device in discover_webcams()]
+        self._webcams = [device.as_dict() for device in discover_webcams()
+                         if device.kind != "virtual"]
         self.webcamsChanged.emit()
 
     @Slot(str)
