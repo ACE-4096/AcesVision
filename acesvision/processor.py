@@ -8,14 +8,15 @@ from collections import deque
 from .contracts import SceneFrame
 from .perception import YoloSubprocessDetector
 
-#: The three perception stages, in the order the inference loop runs them.
+#: The perception stages, in the order the inference loop runs them.
 #: Shared with the GUI so the control panel and the loop cannot disagree about
 #: what exists.
-STAGES = ("object", "face", "gesture")
+STAGES = ("object", "face", "gesture", "pose")
 
 DEFAULT_DETECT_EVERY = 1
 DEFAULT_FACE_HZ = 2.0
 DEFAULT_GESTURE_HZ = 15.0
+DEFAULT_POSE_HZ = 8.0
 
 #: A refresh interval is 1/hz, so a rate of zero is an infinite interval and a
 #: negative rate is a time machine. Clamp rather than divide by zero on a knob
@@ -50,15 +51,20 @@ class FaceGestureProcessor:
                  object_detector=None, object_detector_factory=None,
                  detect_every: int = DEFAULT_DETECT_EVERY,
                  face_hz: float = DEFAULT_FACE_HZ,
-                 gesture_hz: float = DEFAULT_GESTURE_HZ):
+                 gesture_hz: float = DEFAULT_GESTURE_HZ,
+                 pose_detector=None, pose_hz: float = DEFAULT_POSE_HZ):
         if face_detector is None:
             from engine import build_detector
             face_detector = build_detector()
         if gesture_detector is None:
             from gestures import GestureDetector
             gesture_detector = GestureDetector()
+        if pose_detector is None:
+            from .pose import PoseDetector
+            pose_detector = PoseDetector()
         self.face_detector = face_detector
         self.gesture_detector = gesture_detector
+        self.pose_detector = pose_detector
         self.object_detector = object_detector or YoloSubprocessDetector()
         self.object_detector_factory = (object_detector_factory or
                                         (lambda model: YoloSubprocessDetector(model=model)))
@@ -67,6 +73,7 @@ class FaceGestureProcessor:
         self._detect_every = max(1, int(detect_every))
         self._face_interval_s = 1.0 / max(MIN_STAGE_HZ, float(face_hz))
         self._gesture_interval_s = 1.0 / max(MIN_STAGE_HZ, float(gesture_hz))
+        self._pose_interval_s = 1.0 / max(MIN_STAGE_HZ, float(pose_hz))
         self._stage_enabled = {stage: True for stage in STAGES}
         self._pending = None
         self._requested_model = None
@@ -74,6 +81,7 @@ class FaceGestureProcessor:
         self._objects = []
         self._faces = []
         self._gestures = []
+        self._poses = []
         self._metadata = {
             "object_model": "warming up",
             "face_engine": getattr(self.face_detector, "engine", "unknown"),
@@ -95,6 +103,12 @@ class FaceGestureProcessor:
             "gesture_refreshed": False,
             "gesture_refresh_hz": 1.0 / self._gesture_interval_s,
             "gesture_enabled": True,
+            "pose_stage_ms": 0.0,
+            "pose_refreshed": False,
+            "pose_refresh_hz": 1.0 / self._pose_interval_s,
+            "pose_enabled": True,
+            "pose_count": 0,
+            "pose_error": str(getattr(self.pose_detector, "error", "")),
         }
         self._thread = threading.Thread(
             target=self._run, daemon=True, name="vision-inference"
@@ -114,6 +128,7 @@ class FaceGestureProcessor:
             objects = list(self._objects)
             faces = list(self._faces)
             gestures = list(self._gestures)
+            poses = list(self._poses)
         return SceneFrame(
             source=source,
             sequence=sequence,
@@ -122,6 +137,7 @@ class FaceGestureProcessor:
             objects=objects,
             faces=faces,
             gestures=gestures,
+            poses=poses,
             metadata=metadata,
         )
 
@@ -152,6 +168,11 @@ class FaceGestureProcessor:
     def gesture_interval_s(self):
         with self._condition:
             return self._gesture_interval_s
+
+    @property
+    def pose_interval_s(self):
+        with self._condition:
+            return self._pose_interval_s
 
     def stage_enabled(self, stage):
         with self._condition:
@@ -185,6 +206,13 @@ class FaceGestureProcessor:
             self._metadata["gesture_refresh_hz"] = 1.0 / self._gesture_interval_s
             self._condition.notify()
 
+    def set_pose_hz(self, hz):
+        """Change full-body landmark refresh rate without restarting capture."""
+        with self._condition:
+            self._pose_interval_s = 1.0 / max(MIN_STAGE_HZ, float(hz))
+            self._metadata["pose_refresh_hz"] = 1.0 / self._pose_interval_s
+            self._condition.notify()
+
     def set_stage_enabled(self, stage, enabled):
         """Switch one perception stage off, or back on, without a restart.
 
@@ -205,9 +233,11 @@ class FaceGestureProcessor:
         cycle_latencies = deque(maxlen=30)
         last_face_at = 0.0
         last_gesture_at = 0.0
+        last_pose_at = 0.0
         last_people_signature = ()
         faces = []
         gestures = []
+        poses = []
         while True:
             with self._condition:
                 while (self._pending is None and self._requested_model is None
@@ -235,6 +265,7 @@ class FaceGestureProcessor:
                 # capture thread, and is read there under the same lock.)
                 face_interval_s = self._face_interval_s
                 gesture_interval_s = self._gesture_interval_s
+                pose_interval_s = self._pose_interval_s
                 enabled = dict(self._stage_enabled)
             started = time.monotonic()
             errors = []
@@ -300,6 +331,20 @@ class FaceGestureProcessor:
                 gesture_ms = (time.monotonic() - gesture_started) * 1000.0
                 gesture_refreshed = True
                 last_gesture_at = time.monotonic()
+            pose_ms = 0.0
+            pose_refreshed = False
+            if not enabled["pose"]:
+                poses = []
+            elif now - last_pose_at >= pose_interval_s:
+                pose_started = time.monotonic()
+                try:
+                    poses = self.pose_detector.detect(frame)
+                except Exception as exc:
+                    poses = []
+                    errors.append(f"pose: {exc}")
+                pose_ms = (time.monotonic() - pose_started) * 1000.0
+                pose_refreshed = True
+                last_pose_at = time.monotonic()
             finished = time.monotonic()
             elapsed_ms = (finished - started) * 1000.0
             cycle_latencies.append(elapsed_ms)
@@ -313,6 +358,7 @@ class FaceGestureProcessor:
                 self._objects = objects
                 self._faces = faces
                 self._gestures = gestures
+                self._poses = poses
                 dropped = self._metadata["dropped_inference_frames"]
                 self._metadata = {
                     "object_model": model_id,
@@ -345,6 +391,12 @@ class FaceGestureProcessor:
                     "gesture_refresh_hz": 1.0 / self._gesture_interval_s,
                     "gesture_enabled": self._stage_enabled["gesture"],
                     "gesture_count": len(gestures),
+                    "pose_stage_ms": pose_ms,
+                    "pose_refreshed": pose_refreshed,
+                    "pose_refresh_hz": 1.0 / self._pose_interval_s,
+                    "pose_enabled": self._stage_enabled["pose"],
+                    "pose_count": len(poses),
+                    "pose_error": str(getattr(self.pose_detector, "error", "")),
                     "inference_sequence": sequence,
                     "inference_age_ms": max(0.0, (finished - captured_at) * 1000.0),
                     "dropped_inference_frames": dropped,
@@ -380,3 +432,6 @@ class FaceGestureProcessor:
         close_gesture = getattr(self.gesture_detector, "close", None)
         if close_gesture is not None:
             close_gesture()
+        close_pose = getattr(self.pose_detector, "close", None)
+        if close_pose is not None:
+            close_pose()

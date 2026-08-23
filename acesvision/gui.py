@@ -17,6 +17,7 @@ from PySide6.QtQml import QQmlApplicationEngine
 from gesture_catalog import ANY_ACTOR, GESTURE_IDS
 
 from .connectors import OverlayConnector, default_registry
+from .audio import discover_audio_sources
 from .contracts import SceneFrame, SourceSpec
 from .emitter import EventBus, GestureEmitter, PublishFilter
 from .events import GestureEventOutput
@@ -36,6 +37,7 @@ from .processor import (
     DEFAULT_DETECT_EVERY,
     DEFAULT_FACE_HZ,
     DEFAULT_GESTURE_HZ,
+    DEFAULT_POSE_HZ,
     FaceGestureProcessor,
 )
 from .perception import file_sha256
@@ -112,6 +114,18 @@ PERCEPTION_STAGES = (
         "rateMax": 30.0,
         "rateStep": 1.0,
     },
+    {
+        "id": "pose",
+        "label": "Body pose — MediaPipe (33 joints)",
+        "detail": ("Tracks shoulders, hips, knees, ankles and other whole-body "
+                   "joints for posture and workout form. Keep your full body in frame."),
+        "rateLabel": "Refresh rate",
+        "rateKind": "hz",
+        "rateSuffix": " Hz",
+        "rateMin": 1.0,
+        "rateMax": 20.0,
+        "rateStep": 1.0,
+    },
 )
 
 STAGE_IDS = tuple(stage["id"] for stage in PERCEPTION_STAGES)
@@ -124,6 +138,7 @@ STAGE_RATE_SETTERS = {
     "object": "set_detect_every",
     "face": "set_face_hz",
     "gesture": "set_gesture_hz",
+    "pose": "set_pose_hz",
 }
 
 # Below this rate the newest face box the gesture stage can consult is over a
@@ -205,6 +220,7 @@ class VisionBackend(QObject):
     obsChanged = Signal()
     eventsChanged = Signal()
     recordingChanged = Signal()
+    audioSourcesChanged = Signal()
     sceneCountsChanged = Signal()
     overlayChanged = Signal()
     gestureChanged = Signal()
@@ -244,7 +260,7 @@ class VisionBackend(QObject):
                  load_saved_rules=True, executor=None, parent=None,
                  clock=time.monotonic, processor=None,
                  detect_every=DEFAULT_DETECT_EVERY, face_hz=DEFAULT_FACE_HZ,
-                 gesture_hz=DEFAULT_GESTURE_HZ,
+                 gesture_hz=DEFAULT_GESTURE_HZ, pose_hz=DEFAULT_POSE_HZ,
                  recording_factory=RecordingOutput,
                  recording_path_factory=resolve_path):
         super().__init__(parent)
@@ -294,12 +310,16 @@ class VisionBackend(QObject):
         self._object_count = 0
         self._face_count = 0
         self._gesture_count = 0
+        self._pose_count = 0
+        self._audio_sources = discover_audio_sources()
+        self._audio_source = ""
         # Seeded from the same knobs the processor is built with, so the panel
         # reads true before the first inference cycle publishes anything.
         self._stage_rate = {
             "object": float(max(1, int(detect_every))),
             "face": float(face_hz),
             "gesture": float(gesture_hz),
+            "pose": float(pose_hz),
         }
         self._stage_enabled = {stage: True for stage in STAGE_IDS}
         self._stage_ms = {stage: 0.0 for stage in STAGE_IDS}
@@ -381,7 +401,7 @@ class VisionBackend(QObject):
         if processor is None:
             processor = FaceGestureProcessor(
                 detect_every=detect_every, face_hz=face_hz,
-                gesture_hz=gesture_hz,
+                gesture_hz=gesture_hz, pose_hz=pose_hz,
             ) if initialize_models else (
                 lambda frame, src, sequence, captured_at:
                 SceneFrame(src, sequence, captured_at, frame)
@@ -509,9 +529,12 @@ class VisionBackend(QObject):
         metrics = state.metrics
         counts = (int(metrics.get("object_count", 0)),
                   int(metrics.get("face_count", 0)),
-                  int(metrics.get("gesture_count", 0)))
-        if counts != (self._object_count, self._face_count, self._gesture_count):
-            self._object_count, self._face_count, self._gesture_count = counts
+                  int(metrics.get("gesture_count", 0)),
+                  int(metrics.get("pose_count", 0)))
+        if counts != (self._object_count, self._face_count, self._gesture_count,
+                      self._pose_count):
+            (self._object_count, self._face_count, self._gesture_count,
+             self._pose_count) = counts
             self.sceneCountsChanged.emit()
         capture_fps = float(metrics.get("capture_fps", 0.0))
         inference_fps = float(metrics.get("inference_fps", 0.0))
@@ -571,6 +594,7 @@ class VisionBackend(QObject):
         """
         self.refreshActors()
         self.refreshConnectors()
+        self.refreshAudioSources()
         device = describe_compute_device()
         if device != self._compute_device:
             self._compute_device = device
@@ -627,6 +651,32 @@ class VisionBackend(QObject):
         if names != self._connector_names:
             self._connector_names = names
             self.connectorsChanged.emit()
+
+    @Slot()
+    def refreshAudioSources(self):
+        sources = discover_audio_sources()
+        known = {item["id"] for item in sources}
+        selection_changed = False
+        if self._audio_source and self._audio_source not in known:
+            self._audio_source = ""
+            selection_changed = True
+        if sources != self._audio_sources:
+            self._audio_sources = sources
+            selection_changed = True
+        if selection_changed:
+            self.audioSourcesChanged.emit()
+
+    @Slot(str)
+    def setRecordingAudioSource(self, source_id):
+        """Choose audio for the *next* recording; active files stay coherent."""
+        source_id = str(source_id or "")
+        if source_id not in {item["id"] for item in self._audio_sources}:
+            self._set_action_error("Selected audio input is no longer available")
+            return
+        if source_id == self._audio_source:
+            return
+        self._audio_source = source_id
+        self.audioSourcesChanged.emit()
 
     @Slot()
     def refreshModels(self):
@@ -701,6 +751,28 @@ class VisionBackend(QObject):
     @Property(int, notify=sceneCountsChanged)
     def gestureCount(self):
         return self._gesture_count
+
+    @Property(int, notify=sceneCountsChanged)
+    def poseCount(self):
+        return self._pose_count
+
+    @Property("QVariantList", notify=audioSourcesChanged)
+    def audioSources(self):
+        return list(self._audio_sources)
+
+    @Property(int, notify=audioSourcesChanged)
+    def audioSourceIndex(self):
+        for index, item in enumerate(self._audio_sources):
+            if item["id"] == self._audio_source:
+                return index
+        return 0
+
+    @Property(str, notify=audioSourcesChanged)
+    def recordingAudioLabel(self):
+        for item in self._audio_sources:
+            if item["id"] == self._audio_source:
+                return item["label"]
+        return "No audio (video only)"
 
     @Property(bool, notify=recordingChanged)
     def recordingEnabled(self):
@@ -792,6 +864,8 @@ class VisionBackend(QObject):
                                       self._stage_rate["face"])),
             "gesture": float(metrics.get("gesture_refresh_hz",
                                          self._stage_rate["gesture"])),
+            "pose": float(metrics.get("pose_refresh_hz",
+                                      self._stage_rate["pose"])),
         }
         enabled = {stage: bool(metrics.get(f"{stage}_enabled", True))
                    for stage in STAGE_IDS}
@@ -1156,8 +1230,11 @@ class VisionBackend(QObject):
             source = self.pipeline.state().source
             try:
                 path = self._recording_path_factory("", source.id)
-                recorder = self._recording_factory(
-                    path, profile=PROFILES[self._overlay])
+                kwargs = {"profile": PROFILES[self._overlay]}
+                if self._audio_source:
+                    kwargs.update(audio_source=self._audio_source,
+                                  audio_label=self.recordingAudioLabel)
+                recorder = self._recording_factory(path, **kwargs)
                 self.pipeline.add_output(recorder, lossless=True)
             except (OSError, ValueError, RecordingError) as exc:
                 self._recording_status = "Recording could not start"
@@ -1165,7 +1242,9 @@ class VisionBackend(QObject):
                 self.recordingChanged.emit()
                 return
             self._recorder = recorder
-            self._recording_status = f"Recording to {recorder.path}"
+            suffix = (f" with {self.recordingAudioLabel}"
+                      if self._audio_source else " (video only)")
+            self._recording_status = f"Recording to {recorder.path}{suffix}"
             self.recordingChanged.emit()
             return
 
@@ -1227,10 +1306,11 @@ class VisionBackend(QObject):
             self._overlay_before_clean = self._overlay
             self.setOverlayProfile("clean")
 
-    @Slot(bool, bool, bool, int, float, str, str, str, str, bool)
+    @Slot(bool, bool, bool, int, float, str, str, str, str, bool, bool)
     def applyOverlayStyle(self, show_objects, show_faces, show_gestures,
                           line_width, font_scale, object_hex, known_hex,
-                          unknown_hex, gesture_hex, show_landmarks=True):
+                          unknown_hex, gesture_hex, show_landmarks=True,
+                          show_pose=True):
         try:
             profile = OverlayProfile(
                 id="custom",
@@ -1238,6 +1318,7 @@ class VisionBackend(QObject):
                 show_faces=show_faces,
                 show_gestures=show_gestures,
                 show_landmarks=show_landmarks,
+                show_pose=show_pose,
                 line_width=max(1, min(8, int(line_width))),
                 font_scale=max(0.3, min(2.0, float(font_scale))),
                 known_colour=self._hex_to_bgr(known_hex),

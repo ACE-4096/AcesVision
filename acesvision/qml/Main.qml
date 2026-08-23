@@ -472,6 +472,7 @@ ApplicationWindow {
                                     Metric { label: "Objects"; value: String(vision.objectCount) }
                                     Metric { label: "Faces"; value: String(vision.faceCount) }
                                     Metric { label: "Gestures"; value: String(vision.gestureCount) }
+                                    Metric { label: "Bodies"; value: String(vision.poseCount) }
                                     Metric { label: "Recording"; value: vision.recordingEnabled ? "ON" : "Off" }
                                 }
                                 RowLayout {
@@ -1268,6 +1269,7 @@ ApplicationWindow {
                                                 Switch { id: showFaces; text: "Face boxes"; checked: true }
                                                 Switch { id: showGestures; text: "Gesture boxes"; checked: true }
                                                 Switch { id: showLandmarks; text: "Hand joints"; checked: true }
+                                                Switch { id: showPose; text: "Body joints"; checked: true }
                                             }
                                             RowLayout {
                                                 Layout.fillWidth: true
@@ -1352,11 +1354,11 @@ ApplicationWindow {
                                                         Math.round(lineWidth.value), fontScale.value,
                                                         objectColour.text, knownColour.text,
                                                         unknownColour.text, gestureColour.text,
-                                                        showLandmarks.checked)
+                                                        showLandmarks.checked, showPose.checked)
                                                 }
                                             }
                                             Hint {
-                                                text: "Hand joints use MediaPipe's live 21-point hand skeleton. Trails, zones, privacy effects, and saving or loading profiles are not available yet."
+                                                text: "Hand joints use MediaPipe's 21-point skeleton; Body joints use MediaPipe Pose's 33-point posture skeleton. Trails, zones and saved profiles are not available yet."
                                             }
                                             Item { Layout.fillHeight: true }
                                         }
@@ -1400,6 +1402,19 @@ ApplicationWindow {
                                             }
                                             Hint {
                                                 text: vision.recordingStatus
+                                            }
+                                            SectionTitle { text: "Recording audio" }
+                                            ComboBox {
+                                                objectName: "audioSourcePicker"
+                                                Layout.fillWidth: true
+                                                model: vision.audioSources
+                                                textRole: "label"
+                                                currentIndex: vision.audioSourceIndex
+                                                onActivated: vision.setRecordingAudioSource(
+                                                    vision.audioSources[currentIndex].id)
+                                            }
+                                            Hint {
+                                                text: "Audio is off by default. Choose a Microphone for narration or an explicit System audio monitor for desktop sound. The choice applies to the next recording."
                                             }
                                             Hint {
                                                 text: "Record video writes an MP4 and JSON sidecar outside this checkout. It uses this live pipeline, never a second camera."

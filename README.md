@@ -113,6 +113,12 @@ records the exact overlaid feed shown by the app without opening another camera
 process. Turning it off finalises a constant-frame-rate MP4 and writes a JSON
 sidecar with the raw detections and timing for each frame.
 
+Audio is deliberately off by default. In **Recording audio**, choose a
+microphone for narration or an explicit PipeWire/Pulse **System audio** monitor
+for desktop sound; the selector applies to the next recording. A system-audio
+monitor can include calls and other applications, so AcesVision never enables
+one automatically.
+
 By default, recordings go to `~/Videos/AcesVision`. Set
 `ACESVISION_RECORDINGS` before starting the desktop service to choose another
 directory outside the checkout. Recordings can contain faces, rooms, and
@@ -128,7 +134,7 @@ The Live page is designed around the picture:
 - Drag the splitters around the video to resize the workspace.
 - Collapse the left navigation rail when you want a larger preview.
 - Use the overlay controls to show or hide object boxes, face labels, hand
-  joints, and pose landmarks independently.
+  joints, and the 33-point full-body pose skeleton independently.
 - The clean-overlay control hides annotations only; it does not disable the
   perception stages or event output.
 - After a model or source change, allow a short warm-up before judging whether
@@ -139,9 +145,12 @@ inference continue at their configured rate. This avoids a desktop-renderer
 flicker caused by replacing a decoded JPEG snapshot for every incoming frame.
 
 Hand joints are drawn whenever MediaPipe supplies hand landmarks, including
-hands that have not yet been classified as a named gesture. Full body pose
-depends on the installed pose model and current frame quality; it is separate
-from hand tracking.
+hands that have not yet been classified as a named gesture. The **Body pose**
+stage is independent of hand tracking: it uses the optional
+`models/pose_landmarker.task` model to draw visible shoulders, hips, knees,
+ankles, and the rest of MediaPipe Pose's 33 landmarks. For workout form or
+posture, frame your entire body, avoid severe backlighting, and use the stage's
+refresh-rate control to balance responsiveness against inference cost.
 
 ## Enrolment and recognition
 

@@ -800,6 +800,19 @@ class OverlayTests(unittest.TestCase):
         self.assertFalse(np.array_equal(joints, self.raw))
         self.assertTrue(np.array_equal(hidden, self.raw))
 
+    def test_body_joints_render_independently_of_hand_landmarks(self):
+        from acesvision.pose import BodyPose
+
+        points = [(10 + index * 2, 40, 0.9) for index in range(33)]
+        scene = SceneFrame(self.source, 1, 1.0, self.raw,
+                           poses=[BodyPose(tuple(points))])
+        visible = render(scene, OverlayProfile(show_pose=True,
+                                               show_landmarks=False))
+        hidden = render(scene, OverlayProfile(show_pose=False,
+                                              show_landmarks=False))
+        self.assertFalse(np.array_equal(visible, self.raw))
+        self.assertTrue(np.array_equal(hidden, self.raw))
+
 
 class FakeClock:
     """The injectable clock the smoother is written against, driven by hand.
@@ -1480,7 +1493,7 @@ def drive(processor, source, frame, sequence, cycles=1, timeout_s=1.0):
 
 
 class StageControlTests(unittest.TestCase):
-    """The three perception knobs were constructor-only. Now they are live.
+    """The perception knobs were constructor-only. Now they are live.
 
     Every stage cost the GUI wants to show is produced by this loop, and every
     knob that moves those costs is read by it on every cycle. So each setter is
@@ -1494,6 +1507,7 @@ class StageControlTests(unittest.TestCase):
         self.faces = Mock(return_value=[Face(1, 2, 3, 4, "SamplePerson", 0.2, True)])
         self.gestures = Mock(detect=Mock(
             return_value=[Gesture("Shush", 1.0, 1, 1, 3, 3)]))
+        self.poses = Mock(detect=Mock(return_value=[]))
 
     def processor(self, **kwargs):
         # Both refresh rates default to "due every cycle" here on purpose. At
@@ -1502,9 +1516,11 @@ class StageControlTests(unittest.TestCase):
         # would assert green whether or not disabling it did anything.
         kwargs.setdefault("face_hz", 1000.0)
         kwargs.setdefault("gesture_hz", 1000.0)
+        kwargs.setdefault("pose_hz", 1000.0)
         processor = FaceGestureProcessor(
             face_detector=self.faces,
             gesture_detector=self.gestures,
+            pose_detector=self.poses,
             object_detector=self.objects,
             **kwargs)
         self.addCleanup(processor.close)
@@ -1559,6 +1575,18 @@ class StageControlTests(unittest.TestCase):
         processor.set_gesture_hz(1000.0)
         drive(processor, self.source, self.frame, sequence, cycles=3)
         self.assertGreater(self.gestures.detect.call_count, 1)
+
+    def test_pose_stage_is_live_and_can_be_disabled(self):
+        processor = self.processor()
+        sequence = self.assertRanEveryCycle(
+            lambda: self.poses.detect.call_count, processor, 0)
+        processor.set_stage_enabled("pose", False)
+        ran = self.poses.detect.call_count
+        sequence = drive(processor, self.source, self.frame, sequence, cycles=3)
+        scene = processor(self.frame, self.source, sequence, time.monotonic())
+        self.assertEqual(self.poses.detect.call_count, ran)
+        self.assertEqual(scene.poses, [])
+        self.assertFalse(processor.metrics()["pose_enabled"])
 
     def test_a_rate_of_zero_is_clamped_instead_of_dividing_by_zero(self):
         processor = self.processor()
@@ -4566,6 +4594,24 @@ class GuiRecordingTests(unittest.TestCase):
         self.assertIn("could not start", backend.recordingStatus)
         self.assertIn("ffmpeg", backend.lastError)
 
+    def test_audio_is_off_until_an_explicit_source_is_selected(self):
+        captured = []
+
+        def factory(path, **kwargs):
+            captured.append(kwargs)
+            return self.Recorder(path, profile=kwargs["profile"])
+
+        backend = gui_backend(recording_factory=factory,
+                              recording_path_factory=lambda *_: Path("/tmp/clip.mp4"))
+        backend._audio_sources = [
+            {"id": "", "label": "No audio (video only)", "kind": "none"},
+            {"id": "mic.test", "label": "Microphone — Test", "kind": "microphone"},
+        ]
+        backend.setRecordingAudioSource("mic.test")
+        backend.setRecordingEnabled(True)
+        self.assertEqual(captured[0]["audio_source"], "mic.test")
+        self.assertIn("Microphone", backend.recordingStatus)
+
 
 class GuiNotifyingPropertyTests(unittest.TestCase):
     """`constant=True` on anything that can change is a stale-UI bug."""
@@ -4575,7 +4621,8 @@ class GuiNotifyingPropertyTests(unittest.TestCase):
                        "gestureNames", "computeDevice", "stageIds",
                        "stageStats", "shushWarning", "shushDegraded",
                        "latestInferenceMs", "modelInferenceMs", "objectCount",
-                       "faceCount", "gestureCount")
+                       "faceCount", "gestureCount", "poseCount", "audioSources",
+                       "audioSourceIndex", "recordingAudioLabel")
 
     def test_none_of_the_live_properties_are_declared_constant(self):
         backend = gui_backend()
@@ -4711,6 +4758,10 @@ class RecordingProcessor:
             "gesture_refreshed": True,
             "gesture_refresh_hz": 15.0,
             "gesture_enabled": True,
+            "pose_stage_ms": 21.2,
+            "pose_refreshed": True,
+            "pose_refresh_hz": 8.0,
+            "pose_enabled": True,
         }
         self.metrics_dict.update(overrides)
 
@@ -4735,6 +4786,10 @@ class RecordingProcessor:
     def set_gesture_hz(self, hz):
         self.calls.append(("set_gesture_hz", hz))
         self.metrics_dict["gesture_refresh_hz"] = hz
+
+    def set_pose_hz(self, hz):
+        self.calls.append(("set_pose_hz", hz))
+        self.metrics_dict["pose_refresh_hz"] = hz
 
     def close(self):
         pass
@@ -4772,7 +4827,8 @@ class GuiStageControlTests(StagePanelTestCase):
         self.poll(backend, processor)
         self.assertEqual({stage: row["ms"] for stage, row in
                           self.rows(backend).items()},
-                         {"object": 12.3, "face": 78.0, "gesture": 19.6})
+                         {"object": 12.3, "face": 78.0, "gesture": 19.6,
+                          "pose": 21.2})
         # And the two cycle-level numbers that were also being dropped.
         self.assertEqual(backend.latestInferenceMs, 121.0)
         self.assertEqual(backend.modelInferenceMs, 9.9)
@@ -4828,13 +4884,16 @@ class GuiStageControlTests(StagePanelTestCase):
         backend.setStageRate("object", 3.0)
         backend.setStageRate("face", 4.5)
         backend.setStageRate("gesture", 20.0)
+        backend.setStageRate("pose", 8.0)
         self.assertEqual(processor.calls, [
             ("set_detect_every", 3),
             ("set_face_hz", 4.5),
             ("set_gesture_hz", 20.0),
+            ("set_pose_hz", 8.0),
         ])
         rates = {stage: row["rate"] for stage, row in self.rows(backend).items()}
-        self.assertEqual(rates, {"object": 3.0, "face": 4.5, "gesture": 20.0})
+        self.assertEqual(rates, {"object": 3.0, "face": 4.5, "gesture": 20.0,
+                                 "pose": 8.0})
 
     def test_a_rate_outside_the_advertised_range_is_clamped(self):
         backend, processor = self.controlled_backend()
@@ -4866,9 +4925,10 @@ class GuiStageControlTests(StagePanelTestCase):
             backend = gui_backend(initialize_models=True, detect_every=3,
                                   face_hz=4.0, gesture_hz=12.0)
         self.assertEqual(factory.call_args.kwargs,
-                         {"detect_every": 3, "face_hz": 4.0, "gesture_hz": 12.0})
+                         {"detect_every": 3, "face_hz": 4.0, "gesture_hz": 12.0,
+                          "pose_hz": 8.0})
         self.assertEqual([row["rate"] for row in backend.stageStats],
-                         [3.0, 4.0, 12.0])
+                         [3.0, 4.0, 12.0, 8.0])
 
     def test_the_desktop_entry_point_accepts_the_same_knobs(self):
         import subprocess
@@ -5132,10 +5192,12 @@ class QmlSourceTests(unittest.TestCase):
                         "vision.captureFps", "vision.inferenceFps",
                         "vision.inferenceMs", "vision.sourceLabel",
                         "vision.objectCount", "vision.faceCount",
-                        "vision.gestureCount",
+                        "vision.gestureCount", "vision.poseCount",
                         "vision.setObjectModel(", "vision.setObsEnabled(",
                         "vision.setEventsEnabled(", "vision.recordingEnabled",
                         "vision.recordingStatus", "vision.setRecordingEnabled(",
+                        "vision.audioSources", "vision.audioSourceIndex",
+                        "vision.setRecordingAudioSource(",
                         "vision.setOverlayProfile(",
                         "vision.applyOverlayStyle(", "vision.setCameraTuning(",
                         "vision.scanDroidCams()", "vision.useDroidCam(",
@@ -5678,8 +5740,8 @@ class QmlStagePanelTests(QmlRenderedLayoutTestCase):
 
     def test_every_stage_gets_a_switch_and_a_rate_control(self):
         controls = self.controls()
-        self.assertEqual(len(controls["switches"]), 3, controls["switches"])
-        self.assertEqual(controls["count"], 3)
+        self.assertEqual(len(controls["switches"]), 4, controls["switches"])
+        self.assertEqual(controls["count"], 4)
         for label in controls["switches"]:
             self.assertTrue(label, "a stage switch rendered with no label")
 
@@ -5694,10 +5756,10 @@ class QmlStagePanelTests(QmlRenderedLayoutTestCase):
         """
         controls = self.controls()
         self.assertEqual(controls["names"],
-                         ["stageRate0", "stageRate1", "stageRate2"])
-        self.assertEqual(controls["tagsAfter"], [0, 1, 2],
+                         ["stageRate0", "stageRate1", "stageRate2", "stageRate3"])
+        self.assertEqual(controls["tagsAfter"], [0, 1, 2, 3],
                          "the rate sliders were rebuilt by the poll")
-        self.assertEqual(controls["enabledAfter"], [True, True, True])
+        self.assertEqual(controls["enabledAfter"], [True, True, True, True])
         self.assertEqual(controls["valuesAfter"], controls["valuesBefore"])
 
 
@@ -8290,6 +8352,16 @@ class RecordingCommandTests(RecordingTestCase):
                          "/dev/dri/renderD128")
         self.assertIn("+faststart", command)
         self.assertNotIn("libx264", command)
+
+    def test_audio_requires_an_explicit_local_source(self):
+        muted = software_command("/tmp/a.mp4", 1280, 720, 30)
+        with_audio = software_command("/tmp/a.mp4", 1280, 720, 30,
+                                      audio_source="mic.test")
+        self.assertIn("-an", muted)
+        self.assertNotIn("-an", with_audio)
+        self.assertEqual(with_audio[with_audio.index("pulse") + 2], "mic.test")
+        self.assertIn("aac", with_audio)
+        self.assertIn("-shortest", with_audio)
 
     def test_the_recorder_picks_the_command_from_the_flag(self):
         for hardware, codec in ((False, "libx264"), (True, "h264_vaapi")):

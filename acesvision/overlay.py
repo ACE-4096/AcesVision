@@ -15,6 +15,7 @@ class OverlayProfile:
     show_faces: bool = True
     show_gestures: bool = True
     show_landmarks: bool = True
+    show_pose: bool = True
     show_confidence: bool = True
     known_colour: tuple[int, int, int] = (0, 200, 0)
     unknown_colour: tuple[int, int, int] = (40, 40, 220)
@@ -25,7 +26,7 @@ class OverlayProfile:
 
 
 CLEAN = OverlayProfile(id="clean", show_objects=False, show_faces=False,
-                       show_gestures=False, show_landmarks=False)
+                       show_gestures=False, show_landmarks=False, show_pose=False)
 MINIMAL = OverlayProfile()
 BROADCAST = OverlayProfile(id="broadcast", line_width=3, font_scale=0.8)
 SECURITY = OverlayProfile(id="security", show_confidence=True, line_width=3)
@@ -72,6 +73,9 @@ def render(scene: SceneFrame, profile: OverlayProfile = MINIMAL):
             _hand_skeleton(frame, getattr(gesture, "landmarks", ()),
                            profile.gesture_colour, profile,
                            float(getattr(gesture, "alpha", 1.0)))
+    if profile.show_pose:
+        for pose in scene.poses:
+            _pose_skeleton(frame, getattr(pose, "landmarks", ()), profile)
     return frame
 
 
@@ -119,6 +123,20 @@ HAND_CONNECTIONS = (
 )
 
 
+# MediaPipe's 33-point body topology.  Face-detail links are deliberately
+# omitted: the pose stage is for posture and exercise form, not another face
+# renderer.  Hands remain the dedicated 21-point GestureRecognizer overlay.
+POSE_CONNECTIONS = (
+    (0, 1), (1, 2), (2, 3), (3, 7), (0, 4), (4, 5), (5, 6), (6, 8),
+    (9, 10), (11, 12), (11, 13), (13, 15), (15, 17), (15, 19), (15, 21),
+    (17, 19), (12, 14), (14, 16), (16, 18), (16, 20), (16, 22), (18, 20),
+    (11, 23), (12, 24), (23, 24), (23, 25), (25, 27), (27, 29), (27, 31),
+    (29, 31), (24, 26), (26, 28), (28, 30), (28, 32), (30, 32),
+)
+POSE_COLOUR = (210, 70, 255)
+POSE_VISIBILITY = 0.45
+
+
 def _hand_skeleton(frame, landmarks, colour, profile, alpha=1.0):
     """Draw a recognizer hand's actual joints and bones, respecting fades."""
     points = tuple((int(point[0]), int(point[1])) for point in landmarks or ())
@@ -134,3 +152,25 @@ def _hand_skeleton(frame, landmarks, colour, profile, alpha=1.0):
         cv2.circle(target, point, radius, colour, -1, cv2.LINE_AA)
     if alpha < 1.0:
         cv2.addWeighted(target, alpha, frame, 1.0 - alpha, 0.0, dst=frame)
+
+
+def _pose_skeleton(frame, landmarks, profile):
+    """Render visible MediaPipe body joints without drawing guessed limbs."""
+    points = tuple(landmarks or ())
+    if not points:
+        return
+
+    def visible(index):
+        return (index < len(points) and len(points[index]) >= 3 and
+                float(points[index][2]) >= POSE_VISIBILITY)
+
+    for start, end in POSE_CONNECTIONS:
+        if visible(start) and visible(end):
+            cv2.line(frame, (int(points[start][0]), int(points[start][1])),
+                     (int(points[end][0]), int(points[end][1])), POSE_COLOUR,
+                     max(1, profile.line_width), cv2.LINE_AA)
+    for index, point in enumerate(points):
+        if visible(index):
+            cv2.circle(frame, (int(point[0]), int(point[1])),
+                       max(2, profile.line_width + 1), POSE_COLOUR,
+                       -1, cv2.LINE_AA)

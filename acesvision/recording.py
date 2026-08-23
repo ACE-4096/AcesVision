@@ -177,21 +177,38 @@ def resolve_path(requested, source_id, now=None, environ=None) -> Path:
                             recording_name(source_id, now))
 
 
+def _audio_input(audio_source):
+    """FFmpeg arguments for an explicitly selected local Pulse source only."""
+    if not audio_source:
+        return []
+    return ["-thread_queue_size", "512", "-f", "pulse", "-i", str(audio_source)]
+
+
+def _audio_output(audio_source):
+    if not audio_source:
+        return ["-an"]
+    # Video stdin is input 0 and Pulse is input 1. ``-shortest`` lets EOF on
+    # the video pipe finalise both streams when the user stops recording.
+    return ["-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-b:a", "192k",
+            "-shortest"]
+
+
 def software_command(path, width, height, fps, *, crf=DEFAULT_CRF,
-                     preset=DEFAULT_PRESET) -> list[str]:
+                     preset=DEFAULT_PRESET, audio_source=None) -> list[str]:
     return [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         "-f", "rawvideo", "-pix_fmt", "bgr24",
         "-s", f"{width}x{height}", "-r", str(fps), "-i", "-",
-        "-an",
+        *_audio_input(audio_source),
         "-c:v", "libx264", "-preset", str(preset), "-crf", str(crf),
         "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+        *_audio_output(audio_source),
         str(path),
     ]
 
 
 def hardware_command(path, width, height, fps, *, qp=DEFAULT_VAAPI_QP,
-                     device=DEFAULT_VAAPI_DEVICE) -> list[str]:
+                     device=DEFAULT_VAAPI_DEVICE, audio_source=None) -> list[str]:
     """VAAPI. Opt-in, because the same GPU is running YOLO.
 
     The reason to want this is not that it is faster end to end — measure it —
@@ -203,10 +220,11 @@ def hardware_command(path, width, height, fps, *, qp=DEFAULT_VAAPI_QP,
         "-vaapi_device", str(device),
         "-f", "rawvideo", "-pix_fmt", "bgr24",
         "-s", f"{width}x{height}", "-r", str(fps), "-i", "-",
-        "-an",
+        *_audio_input(audio_source),
         "-vf", "format=nv12,hwupload",
         "-c:v", "h264_vaapi", "-qp", str(qp),
         "-movflags", "+faststart",
+        *_audio_output(audio_source),
         str(path),
     ]
 
@@ -274,6 +292,7 @@ class RecordingOutput:
                  hardware: bool = False, crf: int = DEFAULT_CRF,
                  preset: str = DEFAULT_PRESET, qp: int = DEFAULT_VAAPI_QP,
                  vaapi_device: str = DEFAULT_VAAPI_DEVICE,
+                 audio_source: str | None = None, audio_label: str = "",
                  spawn=None, sidecar: bool = True):
         self.path = Path(path)
         self.sidecar_path = self.path.with_name(self.path.name + ".json")
@@ -282,6 +301,8 @@ class RecordingOutput:
         self.hardware = bool(hardware)
         self.crf, self.preset = crf, preset
         self.qp, self.vaapi_device = qp, vaapi_device
+        self.audio_source = str(audio_source or "")
+        self.audio_label = str(audio_label or "")
         self.error = ""
         self.command: list[str] = []
         self._spawn = spawn or _spawn
@@ -402,8 +423,10 @@ class RecordingOutput:
         self._started_wall = datetime.now().isoformat(timespec="seconds")
         self._source = scene.source
         builder = hardware_command if self.hardware else software_command
-        kwargs = ({"qp": self.qp, "device": self.vaapi_device} if self.hardware
-                  else {"crf": self.crf, "preset": self.preset})
+        kwargs = ({"qp": self.qp, "device": self.vaapi_device,
+                   "audio_source": self.audio_source} if self.hardware
+                  else {"crf": self.crf, "preset": self.preset,
+                        "audio_source": self.audio_source})
         self.command = builder(self.path, width, height, self.fps, **kwargs)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -445,6 +468,7 @@ class RecordingOutput:
             "objects": [_record_of(item) for item in scene.objects],
             "faces": [_record_of(item) for item in scene.faces],
             "gestures": [_record_of(item) for item in scene.gestures],
+            "poses": [_record_of(item) for item in scene.poses],
             "metadata": dict(scene.metadata),
         })
 
@@ -487,6 +511,8 @@ class RecordingOutput:
                 "hardware": self.hardware,
                 "command": list(self.command),
             },
+            "audio": ({"source": self.audio_source, "label": self.audio_label}
+                      if self.audio_source else None),
             "frames_written": self.frames_written,
             "frames_duplicated": self.frames_duplicated,
             "duration_s": round(self.frames_written / self.fps, 6),

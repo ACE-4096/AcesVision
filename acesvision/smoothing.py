@@ -344,6 +344,10 @@ class SceneSmoother:
             objects=objects,
             faces=faces,
             gestures=gestures,
+            # Body pose has its own confidence/occlusion semantics. Do not
+            # interpolate or fade it as if it were a detection box; retain the
+            # latest complete landmark set from the processor.
+            poses=scene.poses,
             metadata=scene.metadata,
             contract_version=scene.contract_version,
         )

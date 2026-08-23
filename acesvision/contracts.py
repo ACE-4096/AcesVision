@@ -81,5 +81,6 @@ class SceneFrame:
     objects: list[Any] = field(default_factory=list)
     faces: list[Any] = field(default_factory=list)
     gestures: list[Any] = field(default_factory=list)
+    poses: list[Any] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
     contract_version: int = CONTRACT_VERSION
