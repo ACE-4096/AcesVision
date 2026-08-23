@@ -4489,6 +4489,64 @@ class GuiOverlayStudioTests(unittest.TestCase):
         self.assertEqual(len(fired), 1)   # the card appears once, not per apply
 
 
+class GuiRecordingTests(unittest.TestCase):
+    class Recorder:
+        def __init__(self, path, *, profile):
+            self.path = Path(path)
+            self.profile = profile
+            self.error = ""
+            self.frames_written = 0
+
+        def set_profile(self, profile):
+            self.profile = profile
+
+        def describe(self):
+            return "test recording"
+
+        def close(self):
+            pass
+
+    def backend(self, *, fail=False):
+        made = []
+
+        def path_factory(_requested, source_id):
+            self.assertEqual(source_id, "webcam")
+            return Path("/tmp") / "acesvision-test-recording.mp4"
+
+        def factory(path, *, profile):
+            if fail:
+                raise RecordingError("ffmpeg is unavailable")
+            recorder = self.Recorder(path, profile=profile)
+            made.append(recorder)
+            return recorder
+
+        return gui_backend(recording_factory=factory,
+                           recording_path_factory=path_factory), made
+
+    def test_recording_is_a_native_output_of_the_live_pipeline(self):
+        backend, made = self.backend()
+        self.assertFalse(backend.recordingEnabled)
+        backend.setRecordingEnabled(True)
+        self.assertTrue(backend.recordingEnabled)
+        self.assertEqual(len(made), 1)
+        self.assertIn("acesvision-test-recording.mp4", backend.recordingStatus)
+        self.assertIn(made[0], [worker.output for worker in backend.pipeline._workers])
+
+        backend.setOverlayProfile("broadcast")
+        self.assertEqual(made[0].profile.id, "broadcast")
+        backend.setRecordingEnabled(False)
+        self.assertFalse(backend.recordingEnabled)
+        self.assertIn("before the first frame", backend.recordingStatus)
+
+    def test_recording_start_failure_is_visible_and_does_not_add_an_output(self):
+        backend, made = self.backend(fail=True)
+        backend.setRecordingEnabled(True)
+        self.assertFalse(backend.recordingEnabled)
+        self.assertEqual(made, [])
+        self.assertIn("could not start", backend.recordingStatus)
+        self.assertIn("ffmpeg", backend.lastError)
+
+
 class GuiNotifyingPropertyTests(unittest.TestCase):
     """`constant=True` on anything that can change is a stale-UI bug."""
 
@@ -5053,7 +5111,9 @@ class QmlSourceTests(unittest.TestCase):
                         "vision.captureFps", "vision.inferenceFps",
                         "vision.inferenceMs", "vision.sourceLabel",
                         "vision.setObjectModel(", "vision.setObsEnabled(",
-                        "vision.setEventsEnabled(", "vision.setOverlayProfile(",
+                        "vision.setEventsEnabled(", "vision.recordingEnabled",
+                        "vision.recordingStatus", "vision.setRecordingEnabled(",
+                        "vision.setOverlayProfile(",
                         "vision.applyOverlayStyle(", "vision.setCameraTuning(",
                         "vision.scanDroidCams()", "vision.useDroidCam(",
                         "vision.refreshWebcams()", "vision.useWebcamIndex(",

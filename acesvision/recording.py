@@ -362,6 +362,10 @@ class RecordingOutput:
         if self._started_at is not None and self._write_sidecar:
             self._save_sidecar()
 
+    def set_profile(self, profile: OverlayProfile) -> None:
+        """Use the current GUI overlay profile for subsequently rendered frames."""
+        self.profile = profile
+
     # ---- the optional loss hook -------------------------------------------
 
     def note_dropped(self, count: int = 1) -> None:

@@ -106,6 +106,19 @@ Then open **AcesVision** from your application launcher. Reopening it starts
 the same managed service rather than creating a second process that competes
 for the camera.
 
+## Native recording
+
+Use the **Record video** switch in the Live page's **Destinations** panel. It
+records the exact overlaid feed shown by the app without opening another camera
+process. Turning it off finalises a constant-frame-rate MP4 and writes a JSON
+sidecar with the raw detections and timing for each frame.
+
+By default, recordings go to `~/Videos/AcesVision`. Set
+`ACESVISION_RECORDINGS` before starting the desktop service to choose another
+directory outside the checkout. Recordings can contain faces, rooms, and
+recognition labels; keep the MP4 and its JSON sidecar together and delete both
+when you no longer need them.
+
 ## Using the live view
 
 The Live page is designed around the picture:

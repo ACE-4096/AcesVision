@@ -30,6 +30,7 @@ from .outputs import LatestFrameOutput, ObsVirtualCameraOutput
 from .overlay import MINIMAL, PROFILES, OverlayProfile
 from .pipeline import VisionPipeline
 from .policy import CONNECTORS, Rule, RuleEngine, RuleStore, known_actors
+from .recording import RecordingError, RecordingOutput, resolve_path
 from .server import VisionServer, load_or_create_token
 from .processor import (
     DEFAULT_DETECT_EVERY,
@@ -196,6 +197,7 @@ class VisionBackend(QObject):
     previewChanged = Signal()
     obsChanged = Signal()
     eventsChanged = Signal()
+    recordingChanged = Signal()
     overlayChanged = Signal()
     gestureChanged = Signal()
     rulesChanged = Signal()
@@ -234,7 +236,9 @@ class VisionBackend(QObject):
                  load_saved_rules=True, executor=None, parent=None,
                  clock=time.monotonic, processor=None,
                  detect_every=DEFAULT_DETECT_EVERY, face_hz=DEFAULT_FACE_HZ,
-                 gesture_hz=DEFAULT_GESTURE_HZ):
+                 gesture_hz=DEFAULT_GESTURE_HZ,
+                 recording_factory=RecordingOutput,
+                 recording_path_factory=resolve_path):
         super().__init__(parent)
         self._clock = clock
         self._status = "starting"
@@ -258,6 +262,10 @@ class VisionBackend(QObject):
         self._preview_stale = False
         self._slow_tick = 0
         self._obs_enabled = False
+        self._recorder = None
+        self._recording_factory = recording_factory
+        self._recording_path_factory = recording_path_factory
+        self._recording_status = "Recording off"
         self._events_enabled = False
         self._overlay = "minimal"
         self._overlay_before_clean = "minimal"
@@ -473,6 +481,12 @@ class VisionBackend(QObject):
             self._pipeline_error = state.last_error
             if self.lastError != visible:
                 self.errorChanged.emit()
+        if self._recorder is not None and self._recorder.error:
+            message = f"Recording failed: {self._recorder.error}"
+            if message != self._recording_status:
+                self._recording_status = message
+                self.recordingChanged.emit()
+            self._set_action_error(message)
         self._slow_tick += 1
         if self._slow_tick >= SLOW_REFRESH_TICKS:
             self._slow_tick = 0
@@ -654,6 +668,20 @@ class VisionBackend(QObject):
     @Property(bool, notify=eventsChanged)
     def eventsEnabled(self):
         return self._events_enabled
+
+    @Property(bool, notify=recordingChanged)
+    def recordingEnabled(self):
+        """Whether this GUI process owns a recording output.
+
+        Recording is another output of the already-running pipeline. It never
+        opens a second camera, so enabling it cannot create a preview feedback
+        loop or fight the live view for a device handle.
+        """
+        return self._recorder is not None
+
+    @Property(str, notify=recordingChanged)
+    def recordingStatus(self):
+        return self._recording_status
 
     @Property(str, notify=overlayChanged)
     def overlayProfile(self):
@@ -1081,6 +1109,45 @@ class VisionBackend(QObject):
         self.obsChanged.emit()
 
     @Slot(bool)
+    def setRecordingEnabled(self, enabled):
+        """Start or finalise a local MP4 using the live GUI pipeline.
+
+        ``RecordingOutput`` is added as a lossless worker, unlike the preview.
+        That deliberately trades a visible capture-rate dip for a recording
+        with accounted-for continuity rather than silently dropping time.
+        """
+        enabled = bool(enabled)
+        if enabled == self.recordingEnabled:
+            return
+        if enabled:
+            source = self.pipeline.state().source
+            try:
+                path = self._recording_path_factory("", source.id)
+                recorder = self._recording_factory(
+                    path, profile=PROFILES[self._overlay])
+                self.pipeline.add_output(recorder, lossless=True)
+            except (OSError, ValueError, RecordingError) as exc:
+                self._recording_status = "Recording could not start"
+                self._set_action_error(f"Recording could not start: {exc}")
+                self.recordingChanged.emit()
+                return
+            self._recorder = recorder
+            self._recording_status = f"Recording to {recorder.path}"
+            self.recordingChanged.emit()
+            return
+
+        recorder, self._recorder = self._recorder, None
+        self.pipeline.remove_output(recorder)
+        if recorder.error:
+            self._recording_status = f"Recording failed: {recorder.error}"
+            self._set_action_error(self._recording_status)
+        elif recorder.frames_written:
+            self._recording_status = f"Saved {recorder.describe()}"
+        else:
+            self._recording_status = "Recording stopped before the first frame"
+        self.recordingChanged.emit()
+
+    @Slot(bool)
     def setEventsEnabled(self, enabled):
         self.gestures.set_enabled(enabled)
         self._events_enabled = enabled
@@ -1109,6 +1176,8 @@ class VisionBackend(QObject):
         self.latest.set_profile(profile)
         if self._obs is not None:
             self._obs.set_profile(profile)
+        if self._recorder is not None:
+            self._recorder.set_profile(profile)
         self.overlayChanged.emit()
 
     @Slot()
@@ -1153,6 +1222,8 @@ class VisionBackend(QObject):
         self.latest.set_profile(profile)
         if self._obs is not None:
             self._obs.set_profile(profile)
+        if self._recorder is not None:
+            self._recorder.set_profile(profile)
         if first_custom:
             self.overlayProfilesChanged.emit()
         self.overlayChanged.emit()

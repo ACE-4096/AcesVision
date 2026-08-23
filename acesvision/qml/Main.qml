@@ -1315,15 +1315,22 @@ ApplicationWindow {
                                                     checked: vision.eventsEnabled
                                                     onToggled: vision.setEventsEnabled(checked)
                                                 }
-                                                // The record button lands here, beside the
-                                                // output it mirrors: a Switch bound to a
-                                                // setRecordingEnabled slot shaped exactly
-                                                // like setObsEnabled above. This Flow wraps,
-                                                // so adding it needs no layout change.
-                                                // Deliberately not built here.
+                                                Switch {
+                                                    objectName: "recordSwitch"
+                                                    text: "Record video"
+                                                    checked: vision.recordingEnabled
+                                                    onToggled: vision.setRecordingEnabled(checked)
+                                                }
                                             }
                                             Hint {
-                                                text: "The OBS virtual camera carries the overlay profile selected above it. Gesture events feed the rule engine on the Gestures and Rules page."
+                                                text: "Current input: " + vision.sourceLabel
+                                                      + " · " + vision.captureFps.toFixed(1) + " FPS"
+                                            }
+                                            Hint {
+                                                text: vision.recordingStatus
+                                            }
+                                            Hint {
+                                                text: "Record video writes an MP4 and JSON sidecar outside this checkout. It uses this live pipeline, never a second camera."
                                             }
                                             Hint { text: vision.lastGesture }
                                             Hint { text: vision.lastDecision }
