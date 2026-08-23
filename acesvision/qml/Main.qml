@@ -442,6 +442,12 @@ ApplicationWindow {
                                     onClicked: vision.setRecordingEnabled(!vision.recordingEnabled)
                                 }
                                 Button {
+                                    objectName: "quickAudioButton"
+                                    text: "Mic"
+                                    visible: dashboardCard.width >= 700
+                                    onClicked: audioPopup.open()
+                                }
+                                Button {
                                     text: vision.workoutEnabled
                                           ? vision.workoutReps + " reps" : "Workout"
                                     onClicked: workoutPopup.open()
@@ -554,8 +560,81 @@ ApplicationWindow {
                                                 window.controlsExpanded = true
                                             }
                                         }
+                                        Button {
+                                            text: "Recording audio"
+                                            onClicked: {
+                                                sourcePopup.close()
+                                                audioPopup.open()
+                                            }
+                                        }
                                     }
                                     Hint { text: vision.droidScanStatus }
+                                }
+                            }
+
+                            Popup {
+                                id: audioPopup
+                                parent: Overlay.overlay
+                                x: Math.max(12, (window.width - width) / 2)
+                                y: Math.max(12, (window.height - height) / 2)
+                                width: Math.min(500, window.width - 24)
+                                padding: 14
+                                modal: false
+                                closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+                                background: Rectangle {
+                                    color: window.panel
+                                    border.color: window.border
+                                    border.width: 1
+                                    radius: 10
+                                }
+                                contentItem: ColumnLayout {
+                                    spacing: 10
+                                    SectionTitle { text: "Recording audio" }
+                                    ComboBox {
+                                        objectName: "quickAudioSourcePicker"
+                                        Layout.fillWidth: true
+                                        model: vision.audioSources
+                                        textRole: "label"
+                                        currentIndex: vision.audioSourceIndex
+                                        onActivated: vision.setRecordingAudioSource(
+                                            vision.audioSources[currentIndex].id)
+                                    }
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        enabled: vision.recordingMicrophoneSelected
+                                        Text {
+                                            text: "Mic gain"
+                                            color: window.textMuted
+                                            font.pixelSize: 12
+                                        }
+                                        Slider {
+                                            objectName: "quickAudioGain"
+                                            from: 0; to: 150; stepSize: 1
+                                            value: vision.recordingAudioGain
+                                            Layout.fillWidth: true
+                                            onMoved: vision.setRecordingAudioGain(value)
+                                        }
+                                        Text {
+                                            text: vision.recordingAudioGain + "%"
+                                            color: window.textMain
+                                            font.bold: true
+                                            Layout.preferredWidth: 42
+                                        }
+                                    }
+                                    ProgressBar {
+                                        objectName: "quickAudioMeter"
+                                        Layout.fillWidth: true
+                                        from: 0; to: 1; value: vision.recordingAudioLevel
+                                        enabled: vision.recordingMicrophoneSelected
+                                    }
+                                    Text {
+                                        text: vision.recordingMicrophoneSelected
+                                              ? vision.recordingAudioLevelDb.toFixed(1) + " dBFS"
+                                              : "Microphone gain is available only for microphone sources."
+                                        color: window.textMain
+                                        font.bold: vision.recordingMicrophoneSelected
+                                    }
+                                    Hint { text: vision.recordingAudioMeterStatus }
                                 }
                             }
 
@@ -1638,8 +1717,44 @@ ApplicationWindow {
                                                 onActivated: vision.setRecordingAudioSource(
                                                     vision.audioSources[currentIndex].id)
                                             }
+                                            RowLayout {
+                                                Layout.fillWidth: true
+                                                enabled: vision.recordingMicrophoneSelected
+                                                Text {
+                                                    text: "Mic gain"
+                                                    color: window.textMuted
+                                                    font.pixelSize: 12
+                                                }
+                                                Slider {
+                                                    objectName: "audioGain"
+                                                    from: 0; to: 150; stepSize: 1
+                                                    value: vision.recordingAudioGain
+                                                    Layout.fillWidth: true
+                                                    onMoved: vision.setRecordingAudioGain(value)
+                                                }
+                                                Text {
+                                                    text: vision.recordingAudioGain + "%"
+                                                    color: window.textMain
+                                                    font.bold: true
+                                                    Layout.preferredWidth: 42
+                                                }
+                                            }
+                                            ProgressBar {
+                                                objectName: "audioMeter"
+                                                Layout.fillWidth: true
+                                                from: 0; to: 1; value: vision.recordingAudioLevel
+                                                enabled: vision.recordingMicrophoneSelected
+                                            }
+                                            Text {
+                                                text: vision.recordingMicrophoneSelected
+                                                      ? vision.recordingAudioLevelDb.toFixed(1) + " dBFS"
+                                                      : "Microphone gain is available only for microphone sources."
+                                                color: window.textMain
+                                                font.bold: vision.recordingMicrophoneSelected
+                                            }
+                                            Hint { text: vision.recordingAudioMeterStatus }
                                             Hint {
-                                                text: "Audio is off by default. Choose a Microphone for narration or an explicit System audio monitor for desktop sound. The choice applies to the next recording."
+                                                text: "Audio is off by default. Choose a Microphone for narration or an explicit System audio monitor for desktop sound. Aim for spoken peaks around −12 to −6 dBFS; system-audio monitors are read-only here."
                                             }
                                             Hint {
                                                 text: "Record video writes an MP4 and JSON sidecar outside this checkout. It uses this live pipeline, never a second camera."

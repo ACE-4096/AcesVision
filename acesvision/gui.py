@@ -17,7 +17,8 @@ from PySide6.QtQml import QQmlApplicationEngine
 from gesture_catalog import ANY_ACTOR, GESTURE_IDS
 
 from .connectors import OverlayConnector, default_registry
-from .audio import discover_audio_sources
+from .audio import (AudioLevelMeter, discover_audio_sources,
+                    set_source_volume_percent, source_volume_percent)
 from .contracts import SceneFrame, SourceSpec
 from .emitter import EventBus, GestureEmitter, PublishFilter
 from .events import GestureEventOutput
@@ -224,6 +225,7 @@ class VisionBackend(QObject):
     recordingFpsChanged = Signal()
     rotationChanged = Signal()
     audioSourcesChanged = Signal()
+    audioControlChanged = Signal()
     workoutChanged = Signal()
     sceneCountsChanged = Signal()
     overlayChanged = Signal()
@@ -255,6 +257,7 @@ class VisionBackend(QObject):
 
     gestureFromWorker = Signal(str)
     droidScanFinished = Signal(str)
+    audioMeterSample = Signal(str, float, str)
     # A rule is evaluated on the pipeline worker. Presentation state belongs
     # to Qt's GUI thread, so the local overlay connector asks that thread to
     # perform the toggle instead of touching QObjects from the worker.
@@ -266,7 +269,8 @@ class VisionBackend(QObject):
                  detect_every=DEFAULT_DETECT_EVERY, face_hz=DEFAULT_FACE_HZ,
                  gesture_hz=DEFAULT_GESTURE_HZ, pose_hz=DEFAULT_POSE_HZ,
                  recording_factory=RecordingOutput,
-                 recording_path_factory=resolve_path):
+                 recording_path_factory=resolve_path, audio_run=None,
+                 audio_meter_factory=AudioLevelMeter):
         super().__init__(parent)
         self._clock = clock
         self._status = "starting"
@@ -322,6 +326,11 @@ class VisionBackend(QObject):
         self._pose_count = 0
         self._audio_sources = discover_audio_sources()
         self._audio_source = ""
+        self._audio_run = audio_run
+        self._audio_gain = 100
+        self._audio_level_db = AudioLevelMeter.FLOOR_DB
+        self._audio_meter_status = "Choose a microphone to show its live level"
+        self._audio_meter = audio_meter_factory(self._emit_audio_meter_sample)
         self._workout_enabled = False
         self._workout_exercise = "squat"
         self._workout_reps = 0
@@ -439,6 +448,7 @@ class VisionBackend(QObject):
         self.gestureFromWorker.connect(self._set_gesture)
         self.droidScanFinished.connect(self._apply_droid_scan)
         self.overlayToggleRequested.connect(self.toggleCleanOverlay)
+        self.audioMeterSample.connect(self._apply_audio_meter_sample)
         self._poll = QTimer(self)
         self._poll.setInterval(100)
         self._poll.timeout.connect(self._refresh)
@@ -450,6 +460,7 @@ class VisionBackend(QObject):
 
     def stop(self):
         self._poll.stop()
+        self._audio_meter.stop()
         if self.pipeline.is_alive():
             self.pipeline.stop()
             self.pipeline.join(timeout=5.0)
@@ -703,7 +714,48 @@ class VisionBackend(QObject):
             self._audio_sources = sources
             selection_changed = True
         if selection_changed:
+            self._refresh_audio_control()
             self.audioSourcesChanged.emit()
+
+    def _selected_audio_source(self):
+        return next((item for item in self._audio_sources
+                     if item["id"] == self._audio_source), None)
+
+    def _emit_audio_meter_sample(self, source, level_db, status):
+        """Thread-safe handoff from AudioLevelMeter into Qt's GUI thread."""
+        self.audioMeterSample.emit(str(source), float(level_db), str(status))
+
+    @Slot(str, float, str)
+    def _apply_audio_meter_sample(self, source, level_db, status):
+        if source != self._audio_source:
+            return                         # sample from a just-replaced mic
+        level_db = max(AudioLevelMeter.FLOOR_DB, min(0.0, float(level_db)))
+        if (round(level_db, 1), status) == (round(self._audio_level_db, 1),
+                                            self._audio_meter_status):
+            return
+        self._audio_level_db = level_db
+        self._audio_meter_status = status or (
+            "Speak normally; aim for peaks around −12 to −6 dB")
+        self.audioControlChanged.emit()
+
+    def _refresh_audio_control(self):
+        """Bind gain/meter only to a selected physical microphone."""
+        self._audio_meter.stop()
+        source = self._selected_audio_source()
+        self._audio_level_db = AudioLevelMeter.FLOOR_DB
+        if source is None or source.get("kind") == "none":
+            self._audio_meter_status = "Choose a microphone to show its live level"
+        elif source.get("kind") != "microphone":
+            self._audio_meter_status = (
+                "System-audio monitors are read-only; adjust the originating app instead")
+        else:
+            try:
+                self._audio_gain = source_volume_percent(
+                    self._audio_source, run=self._audio_run)
+                self._audio_meter_status = self._audio_meter.start(self._audio_source)
+            except (OSError, ValueError, RuntimeError) as exc:
+                self._audio_meter_status = f"Microphone control unavailable: {exc}"
+        self.audioControlChanged.emit()
 
     @Slot(str)
     def setRecordingAudioSource(self, source_id):
@@ -715,7 +767,22 @@ class VisionBackend(QObject):
         if source_id == self._audio_source:
             return
         self._audio_source = source_id
+        self._refresh_audio_control()
         self.audioSourcesChanged.emit()
+
+    @Slot(int)
+    def setRecordingAudioGain(self, percent):
+        source = self._selected_audio_source()
+        if source is None or source.get("kind") != "microphone":
+            self._set_action_error("Choose a microphone before adjusting input gain")
+            return
+        try:
+            self._audio_gain = set_source_volume_percent(
+                self._audio_source, percent, run=self._audio_run)
+        except (OSError, ValueError, RuntimeError) as exc:
+            self._set_action_error(f"Could not set microphone gain: {exc}")
+            return
+        self.audioControlChanged.emit()
 
     @Slot(int)
     def setRecordingRate(self, rate):
@@ -880,6 +947,30 @@ class VisionBackend(QObject):
             if item["id"] == self._audio_source:
                 return item["label"]
         return "No audio (video only)"
+
+    @Property(bool, notify=audioControlChanged)
+    def recordingMicrophoneSelected(self):
+        source = self._selected_audio_source()
+        return bool(source and source.get("kind") == "microphone")
+
+    @Property(int, notify=audioControlChanged)
+    def recordingAudioGain(self):
+        return self._audio_gain
+
+    @Property(float, notify=audioControlChanged)
+    def recordingAudioLevelDb(self):
+        return self._audio_level_db
+
+    @Property(float, notify=audioControlChanged)
+    def recordingAudioLevel(self):
+        # Map a practical -60..0 dBFS meter onto Qt's 0..1 ProgressBar range.
+        return max(0.0, min(1.0,
+                            (self._audio_level_db - AudioLevelMeter.FLOOR_DB)
+                            / -AudioLevelMeter.FLOOR_DB))
+
+    @Property(str, notify=audioControlChanged)
+    def recordingAudioMeterStatus(self):
+        return self._audio_meter_status
 
     @Property("QVariantList", notify=workoutChanged)
     def workoutExercises(self):

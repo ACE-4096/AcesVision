@@ -119,6 +119,12 @@ for desktop sound; the selector applies to the next recording. A system-audio
 monitor can include calls and other applications, so AcesVision never enables
 one automatically.
 
+With a microphone selected, use the **Mic** button in the compact Live bar (or
+the Output controls) to adjust its local PipeWire/Pulse gain and watch the
+live dBFS meter. For spoken video, aim for peaks around **−12 to −6 dBFS**;
+avoid the 0 dBFS ceiling. System-audio monitors stay read-only because their
+level belongs to the originating applications, not the recording tool.
+
 In **Recording rate**, leave Auto selected to record DroidCam at 60 FPS and
 physical webcams at 30 FPS, or choose 30/60 FPS explicitly for a delivery
 timeline. The recorder keeps a constant frame rate: if capture cannot sustain

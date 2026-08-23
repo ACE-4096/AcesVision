@@ -22,6 +22,7 @@ import uuid
 from collections import namedtuple
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import cv2
@@ -4720,6 +4721,75 @@ class GuiRecordingTests(unittest.TestCase):
         self.assertEqual(backend.recordingFps, 30)
 
 
+class GuiAudioControlTests(unittest.TestCase):
+    class Meter:
+        def __init__(self, callback):
+            self.callback = callback
+            self.started = []
+            self.stopped = 0
+
+        def start(self, source):
+            self.started.append(source)
+            return "Speak normally; aim for peaks around −12 to −6 dB"
+
+        def stop(self):
+            self.stopped += 1
+
+    def backend(self):
+        gain = {"value": 82}
+        calls, meters = [], []
+
+        def run(command, **_kwargs):
+            calls.append(command)
+            if command[1] == "set-source-volume":
+                gain["value"] = int(command[-1].rstrip("%"))
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f"Volume: mono: 65536 / {gain['value']}% / 0.00 dB\n",
+                stderr="")
+
+        def meter_factory(callback):
+            meter = self.Meter(callback)
+            meters.append(meter)
+            return meter
+
+        backend = gui_backend(audio_run=run, audio_meter_factory=meter_factory)
+        backend._audio_sources = [
+            {"id": "", "label": "No audio (video only)", "kind": "none"},
+            {"id": "mic.test", "label": "Microphone — Test", "kind": "microphone"},
+            {"id": "desktop.monitor", "label": "System audio — Test", "kind": "monitor"},
+        ]
+        return backend, gain, calls, meters[0]
+
+    def test_selected_microphone_gets_a_native_gain_and_live_meter(self):
+        backend, gain, calls, meter = self.backend()
+        backend.setRecordingAudioSource("mic.test")
+        self.assertTrue(backend.recordingMicrophoneSelected)
+        self.assertEqual(backend.recordingAudioGain, 82)
+        self.assertEqual(meter.started, ["mic.test"])
+
+        backend.setRecordingAudioGain(135)
+        self.assertEqual(gain["value"], 135)
+        self.assertEqual(backend.recordingAudioGain, 135)
+        self.assertIn(["pactl", "set-source-volume", "mic.test", "135%"], calls)
+
+        meter.callback("mic.test", -9.5, "")
+        backend._apply_audio_meter_sample("mic.test", -9.5, "")
+        self.assertAlmostEqual(backend.recordingAudioLevelDb, -9.5)
+        self.assertGreater(backend.recordingAudioLevel, 0.8)
+
+    def test_system_monitor_never_exposes_a_microphone_gain_control(self):
+        backend, _gain, calls, meter = self.backend()
+        backend.setRecordingAudioSource("desktop.monitor")
+        self.assertFalse(backend.recordingMicrophoneSelected)
+        self.assertEqual(meter.started, [])
+        self.assertIn("read-only", backend.recordingAudioMeterStatus)
+        backend.setRecordingAudioGain(120)
+        self.assertIn("Choose a microphone", backend.lastError)
+        self.assertFalse(any(command[1] == "set-source-volume" for command in calls))
+
+
 class GuiNotifyingPropertyTests(unittest.TestCase):
     """`constant=True` on anything that can change is a stale-UI bug."""
 
@@ -4729,7 +4799,10 @@ class GuiNotifyingPropertyTests(unittest.TestCase):
                        "stageStats", "shushWarning", "shushDegraded",
                        "latestInferenceMs", "modelInferenceMs", "objectCount",
                        "faceCount", "gestureCount", "poseCount", "audioSources",
-                       "audioSourceIndex", "recordingAudioLabel", "workoutExercises",
+                       "audioSourceIndex", "recordingAudioLabel",
+                       "recordingMicrophoneSelected", "recordingAudioGain",
+                       "recordingAudioLevelDb", "recordingAudioLevel",
+                       "recordingAudioMeterStatus", "workoutExercises",
                        "recordingRateOptions", "recordingRateIndex", "recordingFps",
                        "workoutEnabled", "workoutReps", "workoutPhase",
                        "workoutAngle", "workoutProgress", "workoutFeedback",
@@ -5342,6 +5415,11 @@ class QmlSourceTests(unittest.TestCase):
                         "vision.recordingFps", "vision.setRecordingRate(",
                         "vision.audioSources", "vision.audioSourceIndex",
                         "vision.setRecordingAudioSource(",
+                        "vision.recordingMicrophoneSelected",
+                        "vision.recordingAudioGain", "vision.recordingAudioLevel",
+                        "vision.recordingAudioLevelDb",
+                        "vision.recordingAudioMeterStatus",
+                        "vision.setRecordingAudioGain(",
                         "vision.workoutExercises", "vision.workoutEnabled",
                         "vision.workoutReps", "vision.workoutPhase",
                         "vision.workoutAngle", "vision.workoutProgress",
@@ -5366,6 +5444,8 @@ class QmlSourceTests(unittest.TestCase):
         self.assertIn('objectName: "dashboardRecordButton"', self.qml)
         self.assertIn('objectName: "quickSourceButton"', self.qml)
         self.assertIn('objectName: "quickRotationPicker"', self.qml)
+        self.assertIn('objectName: "quickAudioButton"', self.qml)
+        self.assertIn('objectName: "quickAudioMeter"', self.qml)
         self.assertIn('id: sourcePopup', self.qml)
         self.assertIn('text: "Advanced source controls"', self.qml)
         self.assertIn('property bool controlsExpanded: false', self.qml)
