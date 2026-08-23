@@ -4382,6 +4382,26 @@ class GuiPreviewFreshnessTests(unittest.TestCase):
         backend._refresh()
         self.assertNotEqual(backend.previewSource, first)
 
+    def test_preview_presentation_is_paced_without_marking_live_capture_stale(self):
+        """A fast camera must not force QML to restart JPEG decoding per frame."""
+        from acesvision import gui as gui_module
+
+        clock = FakeClock()
+        backend = gui_backend(clock=clock)
+        pipeline_state(backend, status="live", sequence=1)
+        backend._refresh()
+        first = backend.previewSource
+
+        pipeline_state(backend, status="live", sequence=2)
+        backend._refresh()
+        self.assertEqual(backend.previewSource, first)
+        self.assertFalse(backend.previewStale)
+
+        clock.advance(gui_module.PREVIEW_REFRESH_S + 0.001)
+        pipeline_state(backend, status="live", sequence=3)
+        backend._refresh()
+        self.assertNotEqual(backend.previewSource, first)
+
 
 class GuiExposureCapabilityTests(unittest.TestCase):
     """OSS blocker: one webcam's quirk must not disable a control for everyone."""
@@ -4554,7 +4574,8 @@ class GuiNotifyingPropertyTests(unittest.TestCase):
                        "manualExposureSupported", "connectorNames",
                        "gestureNames", "computeDevice", "stageIds",
                        "stageStats", "shushWarning", "shushDegraded",
-                       "latestInferenceMs", "modelInferenceMs")
+                       "latestInferenceMs", "modelInferenceMs", "objectCount",
+                       "faceCount", "gestureCount")
 
     def test_none_of_the_live_properties_are_declared_constant(self):
         backend = gui_backend()
@@ -5110,6 +5131,8 @@ class QmlSourceTests(unittest.TestCase):
                         "vision.latestInferenceMs", "vision.modelInferenceMs",
                         "vision.captureFps", "vision.inferenceFps",
                         "vision.inferenceMs", "vision.sourceLabel",
+                        "vision.objectCount", "vision.faceCount",
+                        "vision.gestureCount",
                         "vision.setObjectModel(", "vision.setObsEnabled(",
                         "vision.setEventsEnabled(", "vision.recordingEnabled",
                         "vision.recordingStatus", "vision.setRecordingEnabled(",
@@ -5124,6 +5147,12 @@ class QmlSourceTests(unittest.TestCase):
                         "vision.exposureNotice", "vision.imageWarning",
                         "vision.manualExposureSupported"):
             self.assertIn(binding, self.qml, binding)
+
+    def test_live_dashboard_exposes_session_health_and_native_controls(self):
+        self.assertIn('objectName: "dashboardCard"', self.qml)
+        self.assertIn('objectName: "dashboardRecordButton"', self.qml)
+        self.assertIn('text: "Source controls"', self.qml)
+        self.assertIn('text: "Output controls"', self.qml)
 
     def test_the_stage_repeater_is_not_driven_off_the_polled_measurements(self):
         # A Repeater rebuilds every delegate when its model changes, and

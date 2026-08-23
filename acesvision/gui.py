@@ -55,6 +55,13 @@ BLACK_FRAME_STD = 3.0
 # the last good frame sits on screen forever and reads as live.
 PREVIEW_STALE_AFTER_S = 2.0
 
+# QML ``Image`` is a JPEG snapshot renderer, not a video sink. Replacing its
+# URL at 30 FPS made it cancel and restart decodes fast enough to visibly flash
+# even while capture itself was perfectly steady. The capture and inference
+# pipelines stay at full rate; only the desktop snapshot presentation is paced.
+PREVIEW_MAX_FPS = 15.0
+PREVIEW_REFRESH_S = 1.0 / PREVIEW_MAX_FPS
+
 # The refresh timer runs at 100 ms. Filesystem and registry re-scans are far
 # too coarse for that, so they ride a slower tick.
 SLOW_REFRESH_TICKS = 20
@@ -198,6 +205,7 @@ class VisionBackend(QObject):
     obsChanged = Signal()
     eventsChanged = Signal()
     recordingChanged = Signal()
+    sceneCountsChanged = Signal()
     overlayChanged = Signal()
     gestureChanged = Signal()
     rulesChanged = Signal()
@@ -258,6 +266,7 @@ class VisionBackend(QObject):
         self._pipeline_error = ""
         self._action_error = ""
         self._preview_tick = 0
+        self._last_preview_emit_at = None
         self._last_frame_at = None
         self._preview_stale = False
         self._slow_tick = 0
@@ -282,6 +291,9 @@ class VisionBackend(QObject):
         self._latest_inference_ms = 0.0
         self._model_inference_ms = 0.0
         self._model_summary = "Models warming up"
+        self._object_count = 0
+        self._face_count = 0
+        self._gesture_count = 0
         # Seeded from the same knobs the processor is built with, so the panel
         # reads true before the first inference cycle publishes anything.
         self._stage_rate = {
@@ -471,10 +483,13 @@ class VisionBackend(QObject):
             self.sourceChanged.emit()
         if state.sequence != self._sequence:
             self._sequence = state.sequence
-            self._preview_tick += 1
             self._last_frame_at = now
             self.sequenceChanged.emit()
-            self.previewChanged.emit()
+            if (self._last_preview_emit_at is None
+                    or now - self._last_preview_emit_at >= PREVIEW_REFRESH_S):
+                self._preview_tick += 1
+                self._last_preview_emit_at = now
+                self.previewChanged.emit()
         self._update_preview_staleness(now)
         if state.last_error != self._pipeline_error:
             visible = self.lastError
@@ -492,6 +507,12 @@ class VisionBackend(QObject):
             self._slow_tick = 0
             self._refresh_slow_capabilities()
         metrics = state.metrics
+        counts = (int(metrics.get("object_count", 0)),
+                  int(metrics.get("face_count", 0)),
+                  int(metrics.get("gesture_count", 0)))
+        if counts != (self._object_count, self._face_count, self._gesture_count):
+            self._object_count, self._face_count, self._gesture_count = counts
+            self.sceneCountsChanged.emit()
         capture_fps = float(metrics.get("capture_fps", 0.0))
         inference_fps = float(metrics.get("inference_fps", 0.0))
         inference_ms = float(metrics.get("inference_ms", 0.0))
@@ -668,6 +689,18 @@ class VisionBackend(QObject):
     @Property(bool, notify=eventsChanged)
     def eventsEnabled(self):
         return self._events_enabled
+
+    @Property(int, notify=sceneCountsChanged)
+    def objectCount(self):
+        return self._object_count
+
+    @Property(int, notify=sceneCountsChanged)
+    def faceCount(self):
+        return self._face_count
+
+    @Property(int, notify=sceneCountsChanged)
+    def gestureCount(self):
+        return self._gesture_count
 
     @Property(bool, notify=recordingChanged)
     def recordingEnabled(self):

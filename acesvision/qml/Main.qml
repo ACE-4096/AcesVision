@@ -437,6 +437,71 @@ ApplicationWindow {
                         height: Math.max(implicitHeight, livePage.availableHeight)
                         spacing: 12
 
+                        // A glanceable operating dashboard. It is part of the
+                        // Live page so source, recording and detection state
+                        // stay visible while making footage rather than being
+                        // hidden behind a separate admin screen.
+                        Card {
+                            objectName: "dashboardCard"
+                            Layout.fillWidth: true
+                            implicitHeight: dashboardBody.implicitHeight + 24
+                            ColumnLayout {
+                                id: dashboardBody
+                                anchors.fill: parent
+                                anchors.margins: 12
+                                spacing: 10
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    SectionTitle { text: "Session dashboard" }
+                                    Text {
+                                        text: vision.status === "live" ? "LIVE" : vision.status.toUpperCase()
+                                        color: vision.status === "live" ? window.good : window.warning
+                                        font.bold: true
+                                        font.pixelSize: 12
+                                    }
+                                }
+                                Flow {
+                                    Layout.fillWidth: true
+                                    // Compact enough to remain a one-line
+                                    // dashboard on a small laptop. The Source
+                                    // button below exposes the full label.
+                                    spacing: 14
+                                    Metric { label: "Input"; value: vision.sourceLabel; maximumWidth: 160 }
+                                    Metric { label: "Capture"; value: vision.captureFps.toFixed(1) + " FPS" }
+                                    Metric { label: "Inference"; value: vision.inferenceFps.toFixed(1) + " FPS" }
+                                    Metric { label: "Objects"; value: String(vision.objectCount) }
+                                    Metric { label: "Faces"; value: String(vision.faceCount) }
+                                    Metric { label: "Gestures"; value: String(vision.gestureCount) }
+                                    Metric { label: "Recording"; value: vision.recordingEnabled ? "ON" : "Off" }
+                                }
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 8
+                                    Button {
+                                        objectName: "dashboardRecordButton"
+                                        text: vision.recordingEnabled ? "Stop recording" : "Record video"
+                                        onClicked: vision.setRecordingEnabled(!vision.recordingEnabled)
+                                    }
+                                    Button {
+                                        text: "Source controls"
+                                        onClicked: window.currentTool = 2
+                                    }
+                                    Button {
+                                        text: "Output controls"
+                                        onClicked: window.currentTool = 4
+                                    }
+                                    Item { Layout.fillWidth: true }
+                                    Text {
+                                        text: vision.recordingStatus
+                                        color: window.textMuted
+                                        font.pixelSize: 12
+                                        elide: Text.ElideLeft
+                                        Layout.maximumWidth: 420
+                                    }
+                                }
+                            }
+                        }
+
                         // The guard, and it is not decoration. Without a face
                         // box a shush is not merely dropped: MediaPipe labels
                         // the same hand Pointing_Up, which the example
@@ -527,13 +592,16 @@ ApplicationWindow {
                         // ---- the feed itself ----------------------------
                         Card {
                             objectName: "feedCard"
-                            SplitView.minimumHeight: 160
+                            // Leave enough room for an actual video frame even
+                            // when the session dashboard and tool dock are both
+                            // visible in a compact window.
+                            SplitView.minimumHeight: 170
                             SplitView.fillHeight: true
                             // The 16:9 feed is the initial split. Once dragged,
                             // SplitView owns this preference rather than snapping
                             // the video back when the dock refreshes.
                             SplitView.preferredHeight:
-                                Math.max(160, Math.min(width * 9 / 16,
+                                Math.max(170, Math.min(width * 9 / 16,
                                                        livePage.availableHeight * 0.54))
                             color: "#050608"
                             clip: true
@@ -551,7 +619,11 @@ ApplicationWindow {
                                         ? vision.previewSource + "&retry=" + retryTick
                                         : ""
                                 cache: false
-                                asynchronous: true
+                                // Keep the last decoded frame on screen while
+                                // the paced next snapshot is decoded. An async
+                                // replacement per capture frame caused a white/
+                                // black flash even with a stable camera.
+                                asynchronous: false
                                 fillMode: Image.PreserveAspectFit
                                 onStatusChanged: if (status === Image.Error) previewRetry.restart()
                             }

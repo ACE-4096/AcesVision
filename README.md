@@ -123,6 +123,8 @@ when you no longer need them.
 
 The Live page is designed around the picture:
 
+- The Session dashboard shows input, capture and inference rates, scene counts,
+  recording state, and direct Source/Output controls in one place.
 - Drag the splitters around the video to resize the workspace.
 - Collapse the left navigation rail when you want a larger preview.
 - Use the overlay controls to show or hide object boxes, face labels, hand
@@ -131,6 +133,10 @@ The Live page is designed around the picture:
   perception stages or event output.
 - After a model or source change, allow a short warm-up before judging whether
   detections are active.
+
+The preview is intentionally presented at a smooth 15 FPS while capture and
+inference continue at their configured rate. This avoids a desktop-renderer
+flicker caused by replacing a decoded JPEG snapshot for every incoming frame.
 
 Hand joints are drawn whenever MediaPipe supplies hand landmarks, including
 hands that have not yet been classified as a named gesture. Full body pose
