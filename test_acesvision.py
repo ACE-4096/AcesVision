@@ -4586,9 +4586,10 @@ class GuiOverlayStudioTests(unittest.TestCase):
 
 class GuiRecordingTests(unittest.TestCase):
     class Recorder:
-        def __init__(self, path, *, profile):
+        def __init__(self, path, *, profile, fps=30):
             self.path = Path(path)
             self.profile = profile
+            self.fps = fps
             self.error = ""
             self.frames_written = 0
 
@@ -4601,17 +4602,17 @@ class GuiRecordingTests(unittest.TestCase):
         def close(self):
             pass
 
-    def backend(self, *, fail=False):
+    def backend(self, *, fail=False, recording_source_id="webcam"):
         made = []
 
         def path_factory(_requested, source_id):
-            self.assertEqual(source_id, "webcam")
+            self.assertEqual(source_id, recording_source_id)
             return Path("/tmp") / "acesvision-test-recording.mp4"
 
-        def factory(path, *, profile):
+        def factory(path, *, profile, fps):
             if fail:
                 raise RecordingError("ffmpeg is unavailable")
-            recorder = self.Recorder(path, profile=profile)
+            recorder = self.Recorder(path, profile=profile, fps=fps)
             made.append(recorder)
             return recorder
 
@@ -4625,6 +4626,7 @@ class GuiRecordingTests(unittest.TestCase):
         self.assertTrue(backend.recordingEnabled)
         self.assertEqual(len(made), 1)
         self.assertIn("acesvision-test-recording.mp4", backend.recordingStatus)
+        self.assertIn("30 FPS", backend.recordingStatus)
         self.assertIn(made[0], [worker.output for worker in backend.pipeline._workers])
 
         backend.setOverlayProfile("broadcast")
@@ -4659,6 +4661,15 @@ class GuiRecordingTests(unittest.TestCase):
         self.assertEqual(captured[0]["audio_source"], "mic.test")
         self.assertIn("Microphone", backend.recordingStatus)
 
+    def test_auto_rate_preserves_a_droidcam_as_60_fps(self):
+        backend, made = self.backend(recording_source_id="droidcam")
+        backend.useDroidCam("http://camera.test:4747/video")
+        self.assertEqual(backend.recordingFps, 60)
+        backend.setRecordingEnabled(True)
+        self.assertEqual(made[0].fps, 60)
+        backend.setRecordingRate(30)
+        self.assertEqual(backend.recordingFps, 30)
+
 
 class GuiNotifyingPropertyTests(unittest.TestCase):
     """`constant=True` on anything that can change is a stale-UI bug."""
@@ -4670,6 +4681,7 @@ class GuiNotifyingPropertyTests(unittest.TestCase):
                        "latestInferenceMs", "modelInferenceMs", "objectCount",
                        "faceCount", "gestureCount", "poseCount", "audioSources",
                        "audioSourceIndex", "recordingAudioLabel", "workoutExercises",
+                       "recordingRateOptions", "recordingRateIndex", "recordingFps",
                        "workoutEnabled", "workoutReps", "workoutPhase",
                        "workoutAngle", "workoutProgress", "workoutFeedback",
                        "workoutFilter", "workoutExerciseIndex")
@@ -5277,6 +5289,8 @@ class QmlSourceTests(unittest.TestCase):
                         "vision.setObjectModel(", "vision.setObsEnabled(",
                         "vision.setEventsEnabled(", "vision.recordingEnabled",
                         "vision.recordingStatus", "vision.setRecordingEnabled(",
+                        "vision.recordingRateOptions", "vision.recordingRateIndex",
+                        "vision.recordingFps", "vision.setRecordingRate(",
                         "vision.audioSources", "vision.audioSourceIndex",
                         "vision.setRecordingAudioSource(",
                         "vision.workoutExercises", "vision.workoutEnabled",

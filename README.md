@@ -119,6 +119,12 @@ for desktop sound; the selector applies to the next recording. A system-audio
 monitor can include calls and other applications, so AcesVision never enables
 one automatically.
 
+In **Recording rate**, leave Auto selected to record DroidCam at 60 FPS and
+physical webcams at 30 FPS, or choose 30/60 FPS explicitly for a delivery
+timeline. The recorder keeps a constant frame rate: if capture cannot sustain
+the chosen rate, it records this in the sidecar rather than pretending the
+camera delivered frames it did not.
+
 By default, recordings go to `~/Videos/AcesVision`. Set
 `ACESVISION_RECORDINGS` before starting the desktop service to choose another
 directory outside the checkout. Recordings can contain faces, rooms, and
@@ -141,8 +147,9 @@ The Live page is designed around the picture:
   detections are active.
 
 The preview is intentionally presented at a smooth 15 FPS while capture and
-inference continue at their configured rate. This avoids a desktop-renderer
-flicker caused by replacing a decoded JPEG snapshot for every incoming frame.
+inference continue at their configured rate. Each new JPEG is decoded behind
+the current image and displayed only when ready, avoiding a desktop-renderer
+flicker while never affecting the direct recording output.
 
 Hand joints are drawn whenever MediaPipe supplies hand landmarks, including
 hands that have not yet been classified as a named gesture. The **Body pose**

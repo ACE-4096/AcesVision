@@ -655,41 +655,110 @@ ApplicationWindow {
                                                        livePage.availableHeight * 0.54))
                             color: "#050608"
                             clip: true
-                            Image {
-                                id: previewImage
-                                objectName: "previewImage"
-                                // Bumped only to force a refetch after a failure.
-                                property int retryTick: 0
-                                readonly property bool failed: status === Image.Error
+                            // Decode the next JPEG behind the current frame,
+                            // then swap visibility only once it is ready. A
+                            // single Image with a new URL clears its texture
+                            // while decoding, which was the whole-preview
+                            // flicker seen even with a stable camera source.
+                            Item {
+                                id: previewStack
                                 anchors.fill: parent
                                 anchors.margins: 1
-                                // Nothing to fetch before the first frame exists —
-                                // asking earlier just logged a 503 per attempt.
-                                source: vision.sequence > 0
-                                        ? vision.previewSource + "&retry=" + retryTick
-                                        : ""
-                                cache: false
-                                // Keep the last decoded frame on screen while
-                                // the paced next snapshot is decoded. An async
-                                // replacement per capture frame caused a white/
-                                // black flash even with a stable camera.
-                                asynchronous: false
-                                fillMode: Image.PreserveAspectFit
-                                onStatusChanged: if (status === Image.Error) previewRetry.restart()
+                                property bool showA: true
+                                property bool loading: false
+                                property bool hasFrame: false
+                                property bool failed: false
+                                property string pendingSource: ""
+                                property int retryTick: 0
+
+                                function requestFrame(url) {
+                                    if (!url.length) return
+                                    pendingSource = url
+                                    loadPending()
+                                }
+                                function loadPending() {
+                                    if (loading || !pendingSource.length) return
+                                    var target = showA ? previewB : previewA
+                                    loading = true
+                                    target.loading = true
+                                    target.source = pendingSource
+                                    pendingSource = ""
+                                }
+                                function decoded(image) {
+                                    if (!image.loading) return
+                                    image.loading = false
+                                    loading = false
+                                    showA = image === previewA
+                                    hasFrame = true
+                                    failed = false
+                                    loadPending()
+                                }
+                                function decodeFailed(image) {
+                                    if (!image.loading) return
+                                    image.loading = false
+                                    loading = false
+                                    if (!hasFrame) failed = true
+                                    previewRetry.restart()
+                                }
+
+                                Image {
+                                    id: previewA
+                                    objectName: "previewImage"
+                                    property bool loading: false
+                                    anchors.fill: parent
+                                    visible: previewStack.showA
+                                    cache: false
+                                    asynchronous: true
+                                    fillMode: Image.PreserveAspectFit
+                                    onStatusChanged: {
+                                        if (status === Image.Ready) previewStack.decoded(previewA)
+                                        else if (status === Image.Error) previewStack.decodeFailed(previewA)
+                                    }
+                                }
+                                Image {
+                                    id: previewB
+                                    property bool loading: false
+                                    anchors.fill: parent
+                                    visible: !previewStack.showA
+                                    cache: false
+                                    asynchronous: true
+                                    fillMode: Image.PreserveAspectFit
+                                    onStatusChanged: {
+                                        if (status === Image.Ready) previewStack.decoded(previewB)
+                                        else if (status === Image.Error) previewStack.decodeFailed(previewB)
+                                    }
+                                }
+                                Connections {
+                                    target: vision
+                                    function onPreviewChanged() {
+                                        if (vision.sequence > 0)
+                                            previewStack.requestFrame(
+                                                vision.previewSource + "&retry="
+                                                + previewStack.retryTick)
+                                    }
+                                }
+                                Component.onCompleted: {
+                                    if (vision.sequence > 0)
+                                        requestFrame(vision.previewSource + "&retry=" + retryTick)
+                                }
                             }
                             // The preview server answers 503 until the first frame
                             // exists. Retry quietly instead of leaving a dead tile.
                             Timer {
                                 id: previewRetry
                                 interval: 1000
-                                onTriggered: previewImage.retryTick++
+                                onTriggered: {
+                                    previewStack.retryTick++
+                                    previewStack.requestFrame(vision.previewSource + "&retry="
+                                                              + previewStack.retryTick)
+                                }
                             }
                             // A stalled feed keeps the last good frame on screen and
                             // reads as live video. Scrim it and say what happened.
                             Rectangle {
                                 anchors.fill: parent
                                 anchors.margins: 1
-                                visible: previewImage.failed || vision.previewStale
+                                visible: previewStack.failed || vision.previewStale
                                 color: "#b0050608"
                             }
                             Text {
@@ -697,12 +766,12 @@ ApplicationWindow {
                                 width: parent.width - 40
                                 horizontalAlignment: Text.AlignHCenter
                                 wrapMode: Text.Wrap
-                                visible: previewImage.failed || vision.previewStale
+                                visible: previewStack.failed || vision.previewStale
                                          || vision.status !== "live"
-                                color: previewImage.failed || vision.previewStale
+                                color: previewStack.failed || vision.previewStale
                                        ? window.warning : window.textMuted
                                 font.pixelSize: 18
-                                text: previewImage.failed
+                                text: previewStack.failed
                                       ? "Preview feed unavailable — retrying"
                                       : vision.status === "reconnecting"
                                         ? "Waiting for camera"
@@ -1451,6 +1520,20 @@ ApplicationWindow {
                                             }
                                             Hint {
                                                 text: vision.recordingStatus
+                                            }
+                                            SectionTitle { text: "Recording rate" }
+                                            ComboBox {
+                                                objectName: "recordingRatePicker"
+                                                Layout.fillWidth: true
+                                                model: vision.recordingRateOptions
+                                                textRole: "label"
+                                                currentIndex: vision.recordingRateIndex
+                                                onActivated: vision.setRecordingRate(
+                                                    vision.recordingRateOptions[currentIndex].id)
+                                            }
+                                            Hint {
+                                                text: "Next recording: " + vision.recordingFps
+                                                      + " FPS. Auto preserves a DroidCam feed at 60 FPS; choose a fixed rate only when you need a fixed delivery timeline."
                                             }
                                             SectionTitle { text: "Recording audio" }
                                             ComboBox {

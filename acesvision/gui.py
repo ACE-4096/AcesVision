@@ -221,6 +221,7 @@ class VisionBackend(QObject):
     obsChanged = Signal()
     eventsChanged = Signal()
     recordingChanged = Signal()
+    recordingFpsChanged = Signal()
     audioSourcesChanged = Signal()
     workoutChanged = Signal()
     sceneCountsChanged = Signal()
@@ -293,6 +294,10 @@ class VisionBackend(QObject):
         self._recording_factory = recording_factory
         self._recording_path_factory = recording_path_factory
         self._recording_status = "Recording off"
+        # Auto is source-aware: a DroidCam normally delivers 60 FPS, while a
+        # physical UVC webcam normally delivers 30. Output controls may force
+        # either rate deliberately for the next recording.
+        self._recording_rate = 0
         self._events_enabled = False
         self._overlay = "minimal"
         self._overlay_before_clean = "minimal"
@@ -511,6 +516,7 @@ class VisionBackend(QObject):
             self._source = label
             self._apply_exposure_capability(label)
             self.sourceChanged.emit()
+            self.recordingFpsChanged.emit()
         if state.sequence != self._sequence:
             self._sequence = state.sequence
             self._last_frame_at = now
@@ -565,6 +571,8 @@ class VisionBackend(QObject):
             self._latest_inference_ms = latest_ms
             self._model_inference_ms = model_ms
             self.performanceChanged.emit()
+            if not self._recording_rate:
+                self.recordingFpsChanged.emit()
         self._absorb_stage_metrics(metrics)
         workout = (
             bool(metrics.get("workout_enabled", self._workout_enabled)),
@@ -706,6 +714,17 @@ class VisionBackend(QObject):
             return
         self._audio_source = source_id
         self.audioSourcesChanged.emit()
+
+    @Slot(int)
+    def setRecordingRate(self, rate):
+        rate = int(rate)
+        if rate not in (0, 30, 60):
+            self._set_action_error("Recording rate must be Auto, 30 FPS, or 60 FPS")
+            return
+        if rate == self._recording_rate:
+            return
+        self._recording_rate = rate
+        self.recordingFpsChanged.emit()
 
     def _workout_setter(self, name):
         setter = getattr(self.processor, name, None)
@@ -895,6 +914,25 @@ class VisionBackend(QObject):
     @Property(str, notify=recordingChanged)
     def recordingStatus(self):
         return self._recording_status
+
+    @Property("QVariantList", notify=recordingFpsChanged)
+    def recordingRateOptions(self):
+        return [
+            {"id": 0, "label": "Auto (DroidCam 60 / webcam 30)"},
+            {"id": 30, "label": "30 FPS"},
+            {"id": 60, "label": "60 FPS"},
+        ]
+
+    @Property(int, notify=recordingFpsChanged)
+    def recordingRateIndex(self):
+        return {0: 0, 30: 1, 60: 2}.get(self._recording_rate, 0)
+
+    @Property(int, notify=recordingFpsChanged)
+    def recordingFps(self):
+        if self._recording_rate:
+            return self._recording_rate
+        source = self.pipeline.state().source
+        return 60 if source.kind == "droidcam" else 30
 
     @Property(str, notify=overlayChanged)
     def overlayProfile(self):
@@ -1338,7 +1376,8 @@ class VisionBackend(QObject):
             source = self.pipeline.state().source
             try:
                 path = self._recording_path_factory("", source.id)
-                kwargs = {"profile": PROFILES[self._overlay]}
+                kwargs = {"profile": PROFILES[self._overlay],
+                          "fps": self.recordingFps}
                 if self._audio_source:
                     kwargs.update(audio_source=self._audio_source,
                                   audio_label=self.recordingAudioLabel)
@@ -1352,7 +1391,8 @@ class VisionBackend(QObject):
             self._recorder = recorder
             suffix = (f" with {self.recordingAudioLabel}"
                       if self._audio_source else " (video only)")
-            self._recording_status = f"Recording to {recorder.path}{suffix}"
+            self._recording_status = (f"Recording to {recorder.path} at "
+                                      f"{recorder.fps} FPS{suffix}")
             self.recordingChanged.emit()
             return
 
