@@ -24,6 +24,7 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import cv2
 import numpy as np
 
 import camera
@@ -104,8 +105,10 @@ from acesvision.pipeline import (
     DROP_OLD_JOIN_S,
     LOSSLESS_QUEUE_FRAMES,
     PipelineState,
+    ROTATION_DEGREES,
     VisionPipeline,
     _OutputWorker,
+    rotate_frame,
 )
 from acesvision.recording import (
     DEFAULT_FPS,
@@ -1793,6 +1796,37 @@ class StageControlTests(unittest.TestCase):
 
 
 class PipelineTests(unittest.TestCase):
+    def test_rotation_is_applied_before_perception_and_outputs(self):
+        source = SourceSpec.from_mapping({"type": "webcam", "index": 0})
+        frame = np.arange(18, dtype=np.uint8).reshape(2, 3, 3)
+        capture = ScriptedCapture([frame])
+        received, complete = [], threading.Event()
+
+        def processor(input_frame, src, sequence, captured_at):
+            received.append(input_frame.copy())
+            return SceneFrame(src, sequence, captured_at, input_frame)
+
+        pipeline = VisionPipeline(
+            source, processor, [CallbackOutput(lambda _scene: complete.set())],
+            opener=lambda _: capture, retry_min_s=0.001, retry_max_s=0.002,
+        )
+        pipeline.set_rotation(90)
+        pipeline.start()
+        self.assertTrue(complete.wait(1.0))
+        pipeline.stop()
+        pipeline.join(1.0)
+
+        self.assertTrue(np.array_equal(received[0],
+                                       cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)))
+        self.assertEqual(pipeline.state().metrics["rotation_degrees"], 90)
+
+    def test_rotation_accepts_only_quarter_turns(self):
+        frame = np.zeros((2, 3, 3), dtype=np.uint8)
+        self.assertIs(rotate_frame(frame, 0), frame)
+        self.assertEqual(ROTATION_DEGREES, (0, 90, 180, 270))
+        with self.assertRaises(ValueError):
+            rotate_frame(frame, 45)
+
     def test_camera_controls_are_clamped_and_applied(self):
         cap = FakeCapture([])
         cap.set = Mock(return_value=True)
@@ -4200,6 +4234,21 @@ def pipeline_state(backend, **kwargs):
     backend.pipeline._set_state(**kwargs)
 
 
+class GuiRotationTests(unittest.TestCase):
+    def test_rotation_is_exposed_and_recording_holds_its_geometry(self):
+        backend = gui_backend()
+        self.assertEqual([item["id"] for item in backend.rotationOptions],
+                         [0, 90, 180, 270])
+        backend.setRotation(90)
+        self.assertEqual(backend.rotationDegrees, 90)
+        self.assertEqual(backend.pipeline._rotation_degrees, 90)
+
+        backend._recorder = object()
+        backend.setRotation(0)
+        self.assertEqual(backend.rotationDegrees, 90)
+        self.assertIn("Stop recording", backend.lastError)
+
+
 class GuiErrorChannelTests(unittest.TestCase):
     """An error the operator never sees is the same as no error at all."""
 
@@ -5300,6 +5349,8 @@ class QmlSourceTests(unittest.TestCase):
                         "vision.setWorkoutExercise(", "vision.resetWorkout()",
                         "vision.setOverlayProfile(",
                         "vision.applyOverlayStyle(", "vision.setCameraTuning(",
+                        "vision.rotationOptions", "vision.rotationIndex",
+                        "vision.setRotation(",
                         "vision.scanDroidCams()", "vision.useDroidCam(",
                         "vision.refreshWebcams()", "vision.useWebcamIndex(",
                         "vision.scanPlanTarget", "vision.refreshActors()",
@@ -5310,11 +5361,14 @@ class QmlSourceTests(unittest.TestCase):
                         "vision.manualExposureSupported"):
             self.assertIn(binding, self.qml, binding)
 
-    def test_live_dashboard_exposes_session_health_and_native_controls(self):
+    def test_live_dashboard_keeps_frequent_actions_out_of_the_video_split(self):
         self.assertIn('objectName: "dashboardCard"', self.qml)
         self.assertIn('objectName: "dashboardRecordButton"', self.qml)
-        self.assertIn('text: "Source controls"', self.qml)
-        self.assertIn('text: "Output controls"', self.qml)
+        self.assertIn('objectName: "quickSourceButton"', self.qml)
+        self.assertIn('objectName: "quickRotationPicker"', self.qml)
+        self.assertIn('id: sourcePopup', self.qml)
+        self.assertIn('text: "Advanced source controls"', self.qml)
+        self.assertIn('property bool controlsExpanded: false', self.qml)
 
     def test_the_stage_repeater_is_not_driven_off_the_polled_measurements(self):
         # A Repeater rebuilds every delegate when its model changes, and
@@ -5495,6 +5549,10 @@ def measure(width, height):
     data["metrics"] = box(find("metricStrip"))
     data["dock"] = box(find("toolDock"))
     data["tools"] = [box(find("tool%%d" %% slot)) for slot in range(5)]
+    # The production view starts compact. Expand only for the probe below so
+    # it can continue to judge every advanced panel for fit and reachability.
+    window.setProperty("controlsExpanded", True)
+    settle(120)
     for slot in range(5):
         window.setProperty("currentTool", slot)
         settle(170)
@@ -5509,6 +5567,7 @@ def measure(width, height):
         data["panels"].append(entry)
 
     window.setProperty("currentTool", 0)
+    window.setProperty("controlsExpanded", False)
     settle(200)
     tuning = find("liveTuning")
     data["tuning"] = None if tuning is None else {
@@ -8539,6 +8598,16 @@ class RecordingClockTests(RecordingTestCase):
 
 
 class RecordingSidecarTests(RecordingTestCase):
+    def test_the_sidecar_names_the_orientation_used_for_portrait_video(self):
+        output = self.recorder(fps=30)
+        output.publish(self.scene(0, 100.0, metadata={"rotation_degrees": 90}))
+        output.close()
+
+        document = self.sidecar(output)
+        self.assertEqual(document["rotation_degrees"], 90)
+        self.assertEqual(document["frames"][0]["metadata"]["rotation_degrees"],
+                         90)
+
     def test_the_sidecar_carries_every_frame_s_true_capture_time(self):
         output = self.recorder(fps=30)
         times = [100.0, 100.02, 100.031, 100.9]

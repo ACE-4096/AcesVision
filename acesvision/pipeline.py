@@ -64,6 +64,25 @@ LOSSLESS_POLL_S = 0.05
 DROP_OLD_JOIN_S = 2.0
 LOSSLESS_JOIN_S = LOSSLESS_DRAIN_TIMEOUT_S + 2.0
 
+# Rotation is deliberately applied before perception rather than just painted
+# onto the preview. That keeps boxes, hand/body landmarks, recordings and
+# sidecar geometry in one coordinate system — essential for portrait footage.
+ROTATION_DEGREES = (0, 90, 180, 270)
+
+
+def rotate_frame(frame, degrees: int):
+    """Return ``frame`` in the requested clockwise presentation orientation."""
+    degrees = int(degrees)
+    if degrees == 0:
+        return frame
+    if degrees == 90:
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    if degrees == 180:
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    if degrees == 270:
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    raise ValueError("rotation must be one of 0, 90, 180, or 270 degrees")
+
 
 class FrameOutput(Protocol):
     def publish(self, scene: SceneFrame) -> None: ...
@@ -266,7 +285,8 @@ class VisionPipeline(threading.Thread):
         self._status = "stopped"
         self._sequence = 0
         self._last_error = ""
-        self._metrics = {"capture_fps": 0.0}
+        self._metrics = {"capture_fps": 0.0, "rotation_degrees": 0}
+        self._rotation_degrees = 0
         self._camera_controls = {
             "auto_exposure": True,
             "exposure": 166,
@@ -329,6 +349,14 @@ class VisionPipeline(threading.Thread):
             self._camera_controls = controls
             self._camera_control_generation += 1
 
+    def set_rotation(self, degrees: int) -> None:
+        """Orient frames before perception and every downstream output."""
+        degrees = int(degrees)
+        if degrees not in ROTATION_DEGREES:
+            raise ValueError("rotation must be one of 0, 90, 180, or 270 degrees")
+        with self._state_lock:
+            self._rotation_degrees = degrees
+
     def state(self) -> PipelineState:
         with self._state_lock:
             return PipelineState(self._status, self._source,
@@ -369,6 +397,7 @@ class VisionPipeline(threading.Thread):
                 with self._state_lock:
                     source = self._source
                     generation = self._source_generation
+                    rotation_degrees = self._rotation_degrees
 
                 if generation != opened_generation and cap is not None:
                     cap.release()
@@ -411,6 +440,8 @@ class VisionPipeline(threading.Thread):
                     self._set_state(status="reconnecting")
                     continue
 
+                frame = rotate_frame(frame, rotation_degrees)
+
                 captured_at = time.monotonic()
                 try:
                     scene = self.processor(frame, source, self._sequence, captured_at)
@@ -418,6 +449,8 @@ class VisionPipeline(threading.Thread):
                     self._set_state(error=f"processor: {exc}")
                     self._sequence += 1
                     continue
+                scene.metadata = {**scene.metadata,
+                                  "rotation_degrees": rotation_degrees}
 
                 with self._workers_lock:
                     workers = tuple(self._workers)
@@ -443,6 +476,7 @@ class VisionPipeline(threading.Thread):
                 metrics.update(quality_metrics)
                 metrics.update(self._output_drop_metrics(workers))
                 metrics["camera_controls"] = camera_controls
+                metrics["rotation_degrees"] = rotation_degrees
                 processor_metrics = getattr(self.processor, "metrics", None)
                 if processor_metrics is not None:
                     metrics.update(processor_metrics())

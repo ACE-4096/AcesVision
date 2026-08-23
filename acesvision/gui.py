@@ -29,7 +29,7 @@ from .discovery import (
 )
 from .outputs import LatestFrameOutput, ObsVirtualCameraOutput
 from .overlay import MINIMAL, PROFILES, OverlayProfile
-from .pipeline import VisionPipeline
+from .pipeline import ROTATION_DEGREES, VisionPipeline
 from .policy import CONNECTORS, Rule, RuleEngine, RuleStore, known_actors
 from .recording import RecordingError, RecordingOutput, resolve_path
 from .server import VisionServer, load_or_create_token
@@ -222,6 +222,7 @@ class VisionBackend(QObject):
     eventsChanged = Signal()
     recordingChanged = Signal()
     recordingFpsChanged = Signal()
+    rotationChanged = Signal()
     audioSourcesChanged = Signal()
     workoutChanged = Signal()
     sceneCountsChanged = Signal()
@@ -298,6 +299,7 @@ class VisionBackend(QObject):
         # physical UVC webcam normally delivers 30. Output controls may force
         # either rate deliberately for the next recording.
         self._recording_rate = 0
+        self._rotation_degrees = 0
         self._events_enabled = False
         self._overlay = "minimal"
         self._overlay_before_clean = "minimal"
@@ -795,6 +797,23 @@ class VisionBackend(QObject):
     def sourceLabel(self):
         return self._source
 
+    @Property("QVariantList", notify=rotationChanged)
+    def rotationOptions(self):
+        return [
+            {"id": degrees,
+             "label": ("0° — landscape" if degrees == 0
+                       else f"{degrees}° clockwise")}
+            for degrees in ROTATION_DEGREES
+        ]
+
+    @Property(int, notify=rotationChanged)
+    def rotationIndex(self):
+        return ROTATION_DEGREES.index(self._rotation_degrees)
+
+    @Property(int, notify=rotationChanged)
+    def rotationDegrees(self):
+        return self._rotation_degrees
+
     @Property(int, notify=sequenceChanged)
     def sequence(self):
         return self._sequence
@@ -1187,6 +1206,40 @@ class VisionBackend(QObject):
             gamma=self._gamma,
         )
         self.cameraTuningChanged.emit()
+
+    @Slot(int)
+    def setRotation(self, degrees):
+        """Set the display/capture orientation for the next frames.
+
+        Rotation happens before local perception, so landmark and detection
+        coordinates remain true to the portrait/landscape video. An active
+        recording holds its geometry intentionally; changing it mid-file would
+        force an unsafe resize, so finish that take first.
+        """
+        try:
+            degrees = int(degrees)
+            if degrees not in ROTATION_DEGREES:
+                raise ValueError
+        except (TypeError, ValueError):
+            self._set_action_error(
+                "Rotation must be 0°, 90°, 180°, or 270° clockwise")
+            return
+        if degrees == self._rotation_degrees:
+            return
+        if self.recordingEnabled:
+            self._set_action_error(
+                "Stop recording before changing orientation; each MP4 keeps one frame size.")
+            return
+        self.pipeline.set_rotation(degrees)
+        if self._obs is not None:
+            # pyvirtualcam fixes its frame dimensions when it opens. Reopen
+            # the virtual camera for a quarter-turn instead of stretching a
+            # portrait frame back into the old landscape output.
+            self.pipeline.remove_output(self._obs)
+            self._obs = ObsVirtualCameraOutput(PROFILES[self._overlay])
+            self.pipeline.add_output(self._obs)
+        self._rotation_degrees = degrees
+        self.rotationChanged.emit()
 
     @Slot(str)
     def setObjectModel(self, model_id):

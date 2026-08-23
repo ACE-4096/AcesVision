@@ -315,6 +315,7 @@ class RecordingOutput:
         self._started_at: float | None = None
         self._started_wall = ""
         self._source = None
+        self._rotation_degrees = 0
 
         # frames_written counts what went down the pipe, so it is what the MP4
         # duration is made of; scenes_published counts what the pipeline gave
@@ -422,6 +423,7 @@ class RecordingOutput:
         self._started_at = scene.captured_at
         self._started_wall = datetime.now().isoformat(timespec="seconds")
         self._source = scene.source
+        self._rotation_degrees = int(scene.metadata.get("rotation_degrees", 0))
         builder = hardware_command if self.hardware else software_command
         kwargs = ({"qp": self.qp, "device": self.vaapi_device,
                    "audio_source": self.audio_source} if self.hardware
@@ -507,6 +509,7 @@ class RecordingOutput:
             "fps": self.fps,
             "width": width,
             "height": height,
+            "rotation_degrees": self._rotation_degrees,
             "encoder": {
                 "hardware": self.hardware,
                 "command": list(self.command),

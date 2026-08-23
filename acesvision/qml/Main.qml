@@ -35,6 +35,9 @@ ApplicationWindow {
     // Which panel the tooling dock under the feed is showing. Separate from the
     // page so navigating away and back does not lose the operator's place.
     property int currentTool: 0
+    // Advanced controls remain available, but start collapsed so their panel
+    // never taxes the live video just to change a source or start recording.
+    property bool controlsExpanded: false
     readonly property int pageCount: 4
     readonly property int toolCount: 5
     readonly property int pageMargin: 20
@@ -179,7 +182,10 @@ ApplicationWindow {
         required property int slot
         checkable: true
         checked: window.currentTool === slot
-        onClicked: window.currentTool = slot
+        onClicked: {
+            window.currentTool = slot
+            window.controlsExpanded = true
+        }
         hoverEnabled: true
         leftPadding: 14
         rightPadding: 14
@@ -253,26 +259,23 @@ ApplicationWindow {
         spacing: 0
 
         // ---------------------------------------------------------------
-        // Status bar. This is where the old sidebar footer went: it was a
-        // fixed-height card at the bottom of a column that got squeezed, and
-        // it was invisible whenever the window was short. Up here it is one
-        // wrapping row that is present on every page at every size.
+        // App bar. The detailed live telemetry belongs beside the video, not
+        // in a second dashboard above every page. Keep only the application
+        // identity and runtime health here so the camera retains its height.
         // ---------------------------------------------------------------
         Rectangle {
             objectName: "statusBar"
             Layout.fillWidth: true
-            implicitHeight: statusFlow.implicitHeight + 20
+            implicitHeight: 42
             color: "#121419"
             border.color: window.border
             border.width: 1
 
-            Flow {
-                id: statusFlow
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.top: parent.top
-                anchors.margins: 10
-                spacing: 18
+            RowLayout {
+                anchors.fill: parent
+                anchors.leftMargin: 12
+                anchors.rightMargin: 12
+                spacing: 10
 
                 Text {
                     text: "AcesVision"
@@ -306,62 +309,12 @@ ApplicationWindow {
                     }
                 }
 
-                Row {
-                    spacing: 7
-                    Text {
-                        text: "Source"
-                        color: window.textMuted
-                        font.pixelSize: 12
-                        anchors.verticalCenter: parent.verticalCenter
-                    }
-                    Text {
-                        // Capped against the bar, never against its own text:
-                        // a long v4l2 device name used to push everything after
-                        // it off the edge.
-                        width: Math.min(implicitWidth, Math.max(80, statusFlow.width - 120))
-                        text: vision.sourceLabel
-                        color: window.textMain
-                        font.pixelSize: 12
-                        font.bold: true
-                        elide: Text.ElideRight
-                        anchors.verticalCenter: parent.verticalCenter
-                    }
-                }
-
-                Row {
-                    spacing: 7
-                    Text {
-                        text: "Capture"
-                        color: window.textMuted
-                        font.pixelSize: 12
-                    }
-                    Text {
-                        text: vision.captureFps.toFixed(1) + " FPS"
-                        color: window.textMain
-                        font.pixelSize: 12
-                        font.bold: true
-                    }
-                }
-
-                Row {
-                    spacing: 7
-                    Text {
-                        text: "Inference"
-                        color: window.textMuted
-                        font.pixelSize: 12
-                    }
-                    Text {
-                        text: vision.inferenceFps.toFixed(1) + " FPS"
-                        color: window.textMain
-                        font.pixelSize: 12
-                        font.bold: true
-                    }
-                }
-
+                Item { Layout.fillWidth: true }
                 Text {
-                    text: "Frame " + vision.sequence
+                    text: "Local vision runtime"
                     color: window.textMuted
                     font.pixelSize: 12
+                    visible: window.width >= 780
                 }
             }
         }
@@ -437,117 +390,226 @@ ApplicationWindow {
                         height: Math.max(implicitHeight, livePage.availableHeight)
                         spacing: 12
 
-                        // A glanceable operating dashboard. It is part of the
-                        // Live page so source, recording and detection state
-                        // stay visible while making footage rather than being
-                        // hidden behind a separate admin screen.
+                        // A compact session bar. The full dashboard used to
+                        // consume more vertical room than the live controls it
+                        // replaced; camera work needs the picture first.
                         Card {
+                            id: dashboardCard
                             objectName: "dashboardCard"
                             Layout.fillWidth: true
-                            implicitHeight: dashboardBody.implicitHeight + 24
-                            ColumnLayout {
+                            implicitHeight: 48
+                            RowLayout {
                                 id: dashboardBody
                                 anchors.fill: parent
-                                anchors.margins: 12
-                                spacing: 10
-                                RowLayout {
-                                    Layout.fillWidth: true
-                                    SectionTitle { text: "Session dashboard" }
-                                    Text {
-                                        text: vision.status === "live" ? "LIVE" : vision.status.toUpperCase()
-                                        color: vision.status === "live" ? window.good : window.warning
-                                        font.bold: true
-                                        font.pixelSize: 12
-                                    }
+                                anchors.margins: 8
+                                spacing: 8
+                                Text {
+                                    text: vision.status === "live" ? "LIVE" : vision.status.toUpperCase()
+                                    color: vision.status === "live" ? window.good : window.warning
+                                    font.bold: true
+                                    font.pixelSize: 12
                                 }
-                                Flow {
-                                    Layout.fillWidth: true
-                                    // Compact enough to remain a one-line
-                                    // dashboard on a small laptop. The Source
-                                    // button below exposes the full label.
-                                    spacing: 14
-                                    Metric { label: "Input"; value: vision.sourceLabel; maximumWidth: 160 }
-                                    Metric { label: "Capture"; value: vision.captureFps.toFixed(1) + " FPS" }
-                                    Metric { label: "Inference"; value: vision.inferenceFps.toFixed(1) + " FPS" }
-                                    Metric { label: "Objects"; value: String(vision.objectCount) }
-                                    Metric { label: "Faces"; value: String(vision.faceCount) }
-                                    Metric { label: "Gestures"; value: String(vision.gestureCount) }
-                                    Metric { label: "Bodies"; value: String(vision.poseCount) }
-                                    Metric { label: "Recording"; value: vision.recordingEnabled ? "ON" : "Off" }
+                                Text {
+                                    text: vision.sourceLabel
+                                    color: window.textMain
+                                    elide: Text.ElideRight
+                                    Layout.preferredWidth: Math.min(240, dashboardCard.width * 0.27)
+                                    Layout.minimumWidth: 90
                                 }
-                                RowLayout {
-                                    Layout.fillWidth: true
-                                    spacing: 8
-                                    Button {
-                                        objectName: "dashboardRecordButton"
-                                        text: vision.recordingEnabled ? "Stop recording" : "Record video"
-                                        onClicked: vision.setRecordingEnabled(!vision.recordingEnabled)
-                                    }
-                                    Button {
-                                        text: "Source controls"
-                                        onClicked: window.currentTool = 2
-                                    }
-                                    Button {
-                                        text: "Output controls"
-                                        onClicked: window.currentTool = 4
-                                    }
-                                    Item { Layout.fillWidth: true }
+                                Text {
+                                    text: vision.captureFps.toFixed(0) + " / "
+                                          + vision.inferenceFps.toFixed(0) + " FPS"
+                                    color: window.textMuted
+                                    font.pixelSize: 12
+                                }
+                                Text {
+                                    text: vision.objectCount + " obj · " + vision.poseCount
+                                          + " body · " + vision.faceCount + " face · "
+                                          + vision.gestureCount + " gesture"
+                                    color: window.textMuted
+                                    font.pixelSize: 12
+                                    visible: dashboardCard.width >= 760
+                                }
+                                Item { Layout.fillWidth: true }
+                                Button {
+                                    objectName: "quickSourceButton"
+                                    text: "Source"
+                                    onClicked: sourcePopup.open()
+                                }
+                                Button {
+                                    objectName: "dashboardRecordButton"
+                                    text: vision.recordingEnabled ? "Stop" : "Record"
+                                    onClicked: vision.setRecordingEnabled(!vision.recordingEnabled)
+                                }
+                                Button {
+                                    text: vision.workoutEnabled
+                                          ? vision.workoutReps + " reps" : "Workout"
+                                    onClicked: workoutPopup.open()
+                                }
+                                Button {
+                                    text: window.controlsExpanded ? "Hide controls" : "Controls"
+                                    onClicked: window.controlsExpanded = !window.controlsExpanded
+                                }
+                            }
+
+                            // Source changes are a common live action, so this
+                            // overlay never participates in the vertical split.
+                            Popup {
+                                id: sourcePopup
+                                parent: Overlay.overlay
+                                x: Math.max(12, (window.width - width) / 2)
+                                y: Math.max(12, (window.height - height) / 2)
+                                width: Math.min(560, window.width - 24)
+                                padding: 14
+                                modal: false
+                                closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+                                background: Rectangle {
+                                    color: window.panel
+                                    border.color: window.border
+                                    border.width: 1
+                                    radius: 10
+                                }
+                                contentItem: ColumnLayout {
+                                    spacing: 10
+                                    SectionTitle { text: "Switch source" }
                                     Text {
-                                        text: vision.recordingStatus
+                                        text: "Current: " + vision.sourceLabel
                                         color: window.textMuted
-                                        font.pixelSize: 12
-                                        elide: Text.ElideLeft
-                                        Layout.maximumWidth: 420
+                                        elide: Text.ElideRight
+                                        Layout.fillWidth: true
                                     }
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        Text {
+                                            text: "Orientation"
+                                            color: window.textMuted
+                                            font.pixelSize: 12
+                                        }
+                                        ComboBox {
+                                            id: quickRotationPicker
+                                            objectName: "quickRotationPicker"
+                                            model: vision.rotationOptions
+                                            textRole: "label"
+                                            currentIndex: vision.rotationIndex
+                                            Layout.fillWidth: true
+                                            enabled: !vision.recordingEnabled
+                                            onActivated: vision.setRotation(
+                                                vision.rotationOptions[currentIndex].id)
+                                        }
+                                    }
+                                    Hint {
+                                        text: vision.recordingEnabled
+                                              ? "Stop this recording before changing orientation."
+                                              : "Rotation happens before detection, overlays, and recording — choose 90° for vertical footage."
+                                    }
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        ComboBox {
+                                            id: quickWebcamPicker
+                                            model: vision.webcams
+                                            textRole: "label"
+                                            valueRole: "index"
+                                            Layout.fillWidth: true
+                                            displayText: count > 0 ? currentText
+                                                                   : "No physical cameras found"
+                                        }
+                                        Button { text: "Rescan"; onClicked: vision.refreshWebcams() }
+                                        Button {
+                                            text: "Use camera"
+                                            enabled: quickWebcamPicker.count > 0
+                                            onClicked: {
+                                                vision.useWebcamIndex(quickWebcamPicker.currentValue)
+                                                sourcePopup.close()
+                                            }
+                                        }
+                                    }
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        TextField {
+                                            id: quickDroidUrl
+                                            placeholderText: "http://PHONE_IP:4747/video"
+                                            Layout.fillWidth: true
+                                        }
+                                        Button {
+                                            text: "Use DroidCam"
+                                            onClicked: {
+                                                vision.useDroidCam(quickDroidUrl.text)
+                                                sourcePopup.close()
+                                            }
+                                        }
+                                    }
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        Button {
+                                            text: vision.droidScanActive ? "Scanning..." : "Scan DroidCam"
+                                            enabled: !vision.droidScanActive
+                                            onClicked: vision.scanDroidCams()
+                                        }
+                                        Item { Layout.fillWidth: true }
+                                        Button {
+                                            text: "Advanced source controls"
+                                            onClicked: {
+                                                sourcePopup.close()
+                                                window.currentTool = 2
+                                                window.controlsExpanded = true
+                                            }
+                                        }
+                                    }
+                                    Hint { text: vision.droidScanStatus }
                                 }
-                                Rectangle {
-                                    Layout.fillWidth: true
-                                    Layout.preferredHeight: 1
-                                    color: window.border
+                            }
+
+                            Popup {
+                                id: workoutPopup
+                                parent: Overlay.overlay
+                                x: Math.max(12, (window.width - width) / 2)
+                                y: Math.max(12, (window.height - height) / 2)
+                                width: Math.min(500, window.width - 24)
+                                padding: 14
+                                modal: false
+                                closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+                                background: Rectangle {
+                                    color: window.panel
+                                    border.color: window.border
+                                    border.width: 1
+                                    radius: 10
                                 }
-                                RowLayout {
-                                    objectName: "workoutDashboard"
-                                    Layout.fillWidth: true
-                                    spacing: 8
+                                contentItem: ColumnLayout {
+                                    spacing: 10
+                                    SectionTitle { text: "Workout analysis" }
                                     Switch {
                                         objectName: "workoutEnabled"
-                                        text: "Workout analysis"
+                                        text: "Enable rep counting"
                                         checked: vision.workoutEnabled
                                         onToggled: vision.setWorkoutEnabled(checked)
                                     }
                                     ComboBox {
                                         objectName: "workoutExercise"
-                                        Layout.preferredWidth: 150
+                                        Layout.fillWidth: true
                                         model: vision.workoutExercises
                                         textRole: "label"
                                         currentIndex: vision.workoutExerciseIndex
                                         onActivated: vision.setWorkoutExercise(
                                             vision.workoutExercises[currentIndex].id)
                                     }
-                                    Button {
-                                        text: "Reset reps"
-                                        onClicked: vision.resetWorkout()
-                                    }
-                                    Text {
-                                        text: vision.workoutReps + " reps · "
-                                              + vision.workoutPhase + " · "
-                                              + vision.workoutAngle.toFixed(0) + "°"
-                                        color: window.textMain
-                                        font.bold: true
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        Button { text: "Reset reps"; onClicked: vision.resetWorkout() }
+                                        Text {
+                                            text: vision.workoutReps + " reps · "
+                                                  + vision.workoutPhase + " · "
+                                                  + vision.workoutAngle.toFixed(0) + "°"
+                                            color: window.textMain
+                                            font.bold: true
+                                        }
+                                        Item { Layout.fillWidth: true }
                                     }
                                     ProgressBar {
-                                        Layout.preferredWidth: 100
-                                        from: 0; to: 1
-                                        value: vision.workoutProgress
+                                        Layout.fillWidth: true
+                                        from: 0; to: 1; value: vision.workoutProgress
                                     }
-                                    Item { Layout.fillWidth: true }
-                                    Text {
-                                        text: vision.workoutFeedback
-                                        color: window.textMuted
-                                        font.pixelSize: 12
-                                        elide: Text.ElideLeft
-                                        Layout.maximumWidth: 260
-                                    }
+                                    Hint { text: vision.workoutFeedback }
+                                    Hint { text: vision.workoutFilter }
                                 }
                             }
                         }
@@ -871,22 +933,25 @@ ApplicationWindow {
                         Card {
                             objectName: "toolDock"
                             Layout.fillWidth: true
-                            Layout.fillHeight: true
-                            Layout.minimumHeight: 170
+                            Layout.fillHeight: window.controlsExpanded
+                            Layout.minimumHeight: window.controlsExpanded ? 170 : 44
+                            Layout.maximumHeight: window.controlsExpanded ? 16777215 : 44
                             // Keyed to the space the page actually has, not to
                             // the window: the status bar wraps in a narrow window
                             // and takes a second row with it, and a dock sized off
                             // the window height ignored that and pushed the page
                             // into a scroll it did not need.
                             Layout.preferredHeight:
-                                Math.max(170, Math.min(340,
-                                                       livePage.availableHeight * 0.28))
+                                window.controlsExpanded
+                                ? Math.max(170, Math.min(340,
+                                                         livePage.availableHeight * 0.28))
+                                : 44
 
                             ColumnLayout {
                                 id: dockBody
                                 anchors.fill: parent
-                                anchors.margins: 14
-                                spacing: 10
+                                anchors.margins: window.controlsExpanded ? 14 : 6
+                                spacing: window.controlsExpanded ? 10 : 6
 
                                 Flow {
                                     objectName: "toolTabs"
@@ -903,6 +968,7 @@ ApplicationWindow {
                                     Layout.fillWidth: true
                                     Layout.preferredHeight: 1
                                     color: window.border
+                                    visible: window.controlsExpanded
                                 }
 
                                 StackLayout {
@@ -910,6 +976,7 @@ ApplicationWindow {
                                     Layout.fillWidth: true
                                     Layout.fillHeight: true
                                     currentIndex: window.currentTool
+                                    visible: window.controlsExpanded
 
                                     // ---- 0: Image -----------------------
                                     ToolPanel {
@@ -1236,6 +1303,32 @@ ApplicationWindow {
                                             }
                                             Hint {
                                                 text: "Named devices are read from Linux without opening or locking the camera. Metadata-only nodes are hidden."
+                                            }
+
+                                            SectionTitle { text: "Orientation" }
+                                            RowLayout {
+                                                Layout.fillWidth: true
+                                                Text {
+                                                    text: "Rotate clockwise"
+                                                    color: window.textMuted
+                                                    font.pixelSize: 12
+                                                }
+                                                ComboBox {
+                                                    id: rotationPicker
+                                                    objectName: "rotationPicker"
+                                                    model: vision.rotationOptions
+                                                    textRole: "label"
+                                                    currentIndex: vision.rotationIndex
+                                                    Layout.fillWidth: true
+                                                    enabled: !vision.recordingEnabled
+                                                    onActivated: vision.setRotation(
+                                                        vision.rotationOptions[currentIndex].id)
+                                                }
+                                            }
+                                            Hint {
+                                                text: vision.recordingEnabled
+                                                      ? "Stop this recording before changing orientation."
+                                                      : "Applies before local perception, overlays and MP4 recording. Use 90° for vertical media."
                                             }
 
                                             Rectangle {

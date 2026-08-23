@@ -135,8 +135,16 @@ when you no longer need them.
 
 The Live page is designed around the picture:
 
-- The Session dashboard shows input, capture and inference rates, scene counts,
-  recording state, and direct Source/Output controls in one place.
+- A compact session bar shows the active source, capture/inference rate, scene
+  counts, and Record. **Source** opens an overlay picker, so changing cameras
+  never takes height from the video.
+- The Source picker includes 0°/90°/180°/270° orientation. Rotation happens
+  before local detection, overlays, and recording; choose **90° clockwise**
+  for vertical media. Stop a recording before changing it, so one MP4 never
+  mixes incompatible frame sizes.
+- The advanced dock starts collapsed. Select one of its tabs, or choose
+  **Controls**, only when you need image, stages, source, overlay, or output
+  settings.
 - Drag the splitters around the video to resize the workspace.
 - Collapse the left navigation rail when you want a larger preview.
 - Use the overlay controls to show or hide object boxes, face labels, hand
