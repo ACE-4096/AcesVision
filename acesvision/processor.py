@@ -7,6 +7,7 @@ from collections import deque
 
 from .contracts import SceneFrame
 from .perception import YoloSubprocessDetector
+from .workout import WorkoutAnalyzer
 
 #: The perception stages, in the order the inference loop runs them.
 #: Shared with the GUI so the control panel and the loop cannot disagree about
@@ -52,7 +53,8 @@ class FaceGestureProcessor:
                  detect_every: int = DEFAULT_DETECT_EVERY,
                  face_hz: float = DEFAULT_FACE_HZ,
                  gesture_hz: float = DEFAULT_GESTURE_HZ,
-                 pose_detector=None, pose_hz: float = DEFAULT_POSE_HZ):
+                 pose_detector=None, pose_hz: float = DEFAULT_POSE_HZ,
+                 workout_analyzer=None):
         if face_detector is None:
             from engine import build_detector
             face_detector = build_detector()
@@ -65,6 +67,7 @@ class FaceGestureProcessor:
         self.face_detector = face_detector
         self.gesture_detector = gesture_detector
         self.pose_detector = pose_detector
+        self.workout = workout_analyzer or WorkoutAnalyzer()
         self.object_detector = object_detector or YoloSubprocessDetector()
         self.object_detector_factory = (object_detector_factory or
                                         (lambda model: YoloSubprocessDetector(model=model)))
@@ -109,6 +112,7 @@ class FaceGestureProcessor:
             "pose_enabled": True,
             "pose_count": 0,
             "pose_error": str(getattr(self.pose_detector, "error", "")),
+            **self.workout.update([], 0.0),
         }
         self._thread = threading.Thread(
             target=self._run, daemon=True, name="vision-inference"
@@ -225,6 +229,25 @@ class FaceGestureProcessor:
         with self._condition:
             self._stage_enabled[stage] = bool(enabled)
             self._metadata[f"{stage}_enabled"] = bool(enabled)
+            self._condition.notify()
+
+    def set_workout_enabled(self, enabled):
+        with self._condition:
+            self.workout.enabled = bool(enabled)
+            self.workout.reset()
+            self._metadata.update(self.workout.update([], 0.0))
+            self._condition.notify()
+
+    def set_workout_exercise(self, exercise):
+        with self._condition:
+            self.workout.set_exercise(exercise)
+            self._metadata.update(self.workout.update([], 0.0))
+            self._condition.notify()
+
+    def reset_workout(self):
+        with self._condition:
+            self.workout.reset()
+            self._metadata.update(self.workout.update([], 0.0))
             self._condition.notify()
 
     def _run(self):
@@ -345,6 +368,8 @@ class FaceGestureProcessor:
                 pose_ms = (time.monotonic() - pose_started) * 1000.0
                 pose_refreshed = True
                 last_pose_at = time.monotonic()
+            with self._condition:
+                workout = self.workout.update(poses, captured_at)
             finished = time.monotonic()
             elapsed_ms = (finished - started) * 1000.0
             cycle_latencies.append(elapsed_ms)
@@ -397,6 +422,7 @@ class FaceGestureProcessor:
                     "pose_enabled": self._stage_enabled["pose"],
                     "pose_count": len(poses),
                     "pose_error": str(getattr(self.pose_detector, "error", "")),
+                    **workout,
                     "inference_sequence": sequence,
                     "inference_age_ms": max(0.0, (finished - captured_at) * 1000.0),
                     "dropped_inference_frames": dropped,

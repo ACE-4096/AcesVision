@@ -500,6 +500,55 @@ ApplicationWindow {
                                         Layout.maximumWidth: 420
                                     }
                                 }
+                                Rectangle {
+                                    Layout.fillWidth: true
+                                    Layout.preferredHeight: 1
+                                    color: window.border
+                                }
+                                RowLayout {
+                                    objectName: "workoutDashboard"
+                                    Layout.fillWidth: true
+                                    spacing: 8
+                                    Switch {
+                                        objectName: "workoutEnabled"
+                                        text: "Workout analysis"
+                                        checked: vision.workoutEnabled
+                                        onToggled: vision.setWorkoutEnabled(checked)
+                                    }
+                                    ComboBox {
+                                        objectName: "workoutExercise"
+                                        Layout.preferredWidth: 150
+                                        model: vision.workoutExercises
+                                        textRole: "label"
+                                        currentIndex: vision.workoutExerciseIndex
+                                        onActivated: vision.setWorkoutExercise(
+                                            vision.workoutExercises[currentIndex].id)
+                                    }
+                                    Button {
+                                        text: "Reset reps"
+                                        onClicked: vision.resetWorkout()
+                                    }
+                                    Text {
+                                        text: vision.workoutReps + " reps · "
+                                              + vision.workoutPhase + " · "
+                                              + vision.workoutAngle.toFixed(0) + "°"
+                                        color: window.textMain
+                                        font.bold: true
+                                    }
+                                    ProgressBar {
+                                        Layout.preferredWidth: 100
+                                        from: 0; to: 1
+                                        value: vision.workoutProgress
+                                    }
+                                    Item { Layout.fillWidth: true }
+                                    Text {
+                                        text: vision.workoutFeedback
+                                        color: window.textMuted
+                                        font.pixelSize: 12
+                                        elide: Text.ElideLeft
+                                        Layout.maximumWidth: 260
+                                    }
+                                }
                             }
                         }
 

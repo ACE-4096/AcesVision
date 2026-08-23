@@ -40,6 +40,7 @@ from .processor import (
     DEFAULT_POSE_HZ,
     FaceGestureProcessor,
 )
+from .workout import EXERCISES
 from .perception import file_sha256
 
 QML_PATH = Path(__file__).parent / "qml" / "Main.qml"
@@ -221,6 +222,7 @@ class VisionBackend(QObject):
     eventsChanged = Signal()
     recordingChanged = Signal()
     audioSourcesChanged = Signal()
+    workoutChanged = Signal()
     sceneCountsChanged = Signal()
     overlayChanged = Signal()
     gestureChanged = Signal()
@@ -313,6 +315,14 @@ class VisionBackend(QObject):
         self._pose_count = 0
         self._audio_sources = discover_audio_sources()
         self._audio_source = ""
+        self._workout_enabled = False
+        self._workout_exercise = "squat"
+        self._workout_reps = 0
+        self._workout_phase = "find rest"
+        self._workout_angle = 0.0
+        self._workout_progress = 0.0
+        self._workout_feedback = "Workout paused"
+        self._workout_filter = ""
         # Seeded from the same knobs the processor is built with, so the panel
         # reads true before the first inference cycle publishes anything.
         self._stage_rate = {
@@ -556,6 +566,25 @@ class VisionBackend(QObject):
             self._model_inference_ms = model_ms
             self.performanceChanged.emit()
         self._absorb_stage_metrics(metrics)
+        workout = (
+            bool(metrics.get("workout_enabled", self._workout_enabled)),
+            str(metrics.get("workout_exercise", self._workout_exercise)),
+            int(metrics.get("workout_reps", self._workout_reps)),
+            str(metrics.get("workout_phase", self._workout_phase)),
+            float(metrics.get("workout_angle", self._workout_angle) or 0.0),
+            float(metrics.get("workout_progress", self._workout_progress)),
+            str(metrics.get("workout_feedback", self._workout_feedback)),
+            str(metrics.get("workout_filter", self._workout_filter)),
+        )
+        if workout != (self._workout_enabled, self._workout_exercise,
+                       self._workout_reps, self._workout_phase,
+                       self._workout_angle, self._workout_progress,
+                       self._workout_feedback, self._workout_filter):
+            (self._workout_enabled, self._workout_exercise,
+             self._workout_reps, self._workout_phase, self._workout_angle,
+             self._workout_progress, self._workout_feedback,
+             self._workout_filter) = workout
+            self.workoutChanged.emit()
         image_warning = str(metrics.get("image_warning", ""))
         image_mean = float(metrics.get("image_mean", 0.0))
         image_std = float(metrics.get("image_std", 0.0))
@@ -678,6 +707,46 @@ class VisionBackend(QObject):
         self._audio_source = source_id
         self.audioSourcesChanged.emit()
 
+    def _workout_setter(self, name):
+        setter = getattr(self.processor, name, None)
+        if setter is None:
+            self._set_action_error(
+                "Workout analysis is unavailable: no inference loop is running.")
+            return None
+        return setter
+
+    @Slot(bool)
+    def setWorkoutEnabled(self, enabled):
+        setter = self._workout_setter("set_workout_enabled")
+        if setter is None:
+            return
+        setter(bool(enabled))
+        self._workout_enabled = bool(enabled)
+        self.workoutChanged.emit()
+
+    @Slot(str)
+    def setWorkoutExercise(self, exercise):
+        setter = self._workout_setter("set_workout_exercise")
+        if setter is None:
+            return
+        try:
+            setter(str(exercise))
+        except ValueError as exc:
+            self._set_action_error(str(exc))
+            return
+        self._workout_exercise = str(exercise)
+        self.workoutChanged.emit()
+
+    @Slot()
+    def resetWorkout(self):
+        setter = self._workout_setter("reset_workout")
+        if setter is None:
+            return
+        setter()
+        self._workout_reps = 0
+        self._workout_phase = "find rest"
+        self.workoutChanged.emit()
+
     @Slot()
     def refreshModels(self):
         """Re-verify the model manifest against what is actually on disk."""
@@ -773,6 +842,45 @@ class VisionBackend(QObject):
             if item["id"] == self._audio_source:
                 return item["label"]
         return "No audio (video only)"
+
+    @Property("QVariantList", notify=workoutChanged)
+    def workoutExercises(self):
+        return [{"id": item.id, "label": item.label} for item in EXERCISES]
+
+    @Property(bool, notify=workoutChanged)
+    def workoutEnabled(self):
+        return self._workout_enabled
+
+    @Property(int, notify=workoutChanged)
+    def workoutReps(self):
+        return self._workout_reps
+
+    @Property(str, notify=workoutChanged)
+    def workoutPhase(self):
+        return self._workout_phase
+
+    @Property(float, notify=workoutChanged)
+    def workoutAngle(self):
+        return self._workout_angle
+
+    @Property(float, notify=workoutChanged)
+    def workoutProgress(self):
+        return self._workout_progress
+
+    @Property(str, notify=workoutChanged)
+    def workoutFeedback(self):
+        return self._workout_feedback
+
+    @Property(str, notify=workoutChanged)
+    def workoutFilter(self):
+        return self._workout_filter
+
+    @Property(int, notify=workoutChanged)
+    def workoutExerciseIndex(self):
+        for index, item in enumerate(EXERCISES):
+            if item.id == self._workout_exercise:
+                return index
+        return 0
 
     @Property(bool, notify=recordingChanged)
     def recordingEnabled(self):

@@ -800,18 +800,65 @@ class OverlayTests(unittest.TestCase):
         self.assertFalse(np.array_equal(joints, self.raw))
         self.assertTrue(np.array_equal(hidden, self.raw))
 
+
+class WorkoutAnalyzerTests(unittest.TestCase):
+    """Rep counting must be harder to trigger than moving past one noisy frame."""
+
+    @staticmethod
+    def pose_with_squat_angle(degrees_value, visibility=0.9):
+        from math import cos, pi, sin
+        from acesvision.pose import BodyPose
+
+        points = [(0.0, 0.0, visibility)] * 33
+        radians = pi - degrees_value * pi / 180.0
+        triple = ((-10.0, 0.0, visibility), (0.0, 0.0, visibility),
+                  (10.0 * cos(radians), 10.0 * sin(radians), visibility))
+        for first, pivot, last in ((23, 25, 27), (24, 26, 28)):
+            points[first], points[pivot], points[last] = triple
+        return BodyPose(tuple(points))
+
+    def test_a_rep_needs_stable_rest_active_rest_transitions(self):
+        from acesvision.workout import WorkoutAnalyzer
+
+        workout = WorkoutAnalyzer("squat", enabled=True)
+        # First establish rest, then active; neither half is a rep.
+        for timestamp, angle in ((0.0, 170), (0.3, 170), (0.6, 95),
+                                 (0.9, 95), (1.2, 95), (1.5, 95),
+                                 (1.8, 95)):
+            state = workout.update([self.pose_with_squat_angle(angle)], timestamp)
+        self.assertEqual(state["workout_reps"], 0)
+        # A full stable return is the one and only count.
+        for timestamp in (2.1, 2.4, 2.7, 3.0, 3.3, 3.6, 3.9):
+            state = workout.update([self.pose_with_squat_angle(170)], timestamp)
+        self.assertEqual(state["workout_reps"], 1)
+
+    def test_jitter_and_occlusion_do_not_create_reps(self):
+        from acesvision.workout import WorkoutAnalyzer
+
+        workout = WorkoutAnalyzer("squat", enabled=True)
+        for timestamp, angle in ((0.0, 170), (0.3, 170),
+                                 (0.6, 120), (0.9, 112), (1.2, 118)):
+            state = workout.update([self.pose_with_squat_angle(angle)], timestamp)
+        self.assertEqual(state["workout_reps"], 0)
+        state = workout.update([self.pose_with_squat_angle(170, visibility=0.1)],
+                               1.5)
+        self.assertEqual(state["workout_reps"], 0)
+        self.assertIn("visible", state["workout_feedback"])
+
     def test_body_joints_render_independently_of_hand_landmarks(self):
         from acesvision.pose import BodyPose
 
         points = [(10 + index * 2, 40, 0.9) for index in range(33)]
-        scene = SceneFrame(self.source, 1, 1.0, self.raw,
+        raw = np.zeros((100, 120, 3), dtype=np.uint8)
+        source = SourceSpec.from_mapping({"type": "webcam"})
+        scene = SceneFrame(source, 1, 1.0, raw,
                            poses=[BodyPose(tuple(points))])
         visible = render(scene, OverlayProfile(show_pose=True,
                                                show_landmarks=False))
         hidden = render(scene, OverlayProfile(show_pose=False,
                                               show_landmarks=False))
-        self.assertFalse(np.array_equal(visible, self.raw))
-        self.assertTrue(np.array_equal(hidden, self.raw))
+        self.assertFalse(np.array_equal(visible, raw))
+        self.assertTrue(np.array_equal(hidden, raw))
 
 
 class FakeClock:
@@ -4622,7 +4669,10 @@ class GuiNotifyingPropertyTests(unittest.TestCase):
                        "stageStats", "shushWarning", "shushDegraded",
                        "latestInferenceMs", "modelInferenceMs", "objectCount",
                        "faceCount", "gestureCount", "poseCount", "audioSources",
-                       "audioSourceIndex", "recordingAudioLabel")
+                       "audioSourceIndex", "recordingAudioLabel", "workoutExercises",
+                       "workoutEnabled", "workoutReps", "workoutPhase",
+                       "workoutAngle", "workoutProgress", "workoutFeedback",
+                       "workoutFilter", "workoutExerciseIndex")
 
     def test_none_of_the_live_properties_are_declared_constant(self):
         backend = gui_backend()
@@ -4762,6 +4812,14 @@ class RecordingProcessor:
             "pose_refreshed": True,
             "pose_refresh_hz": 8.0,
             "pose_enabled": True,
+            "workout_enabled": False,
+            "workout_exercise": "squat",
+            "workout_reps": 0,
+            "workout_phase": "find rest",
+            "workout_angle": None,
+            "workout_progress": 0.0,
+            "workout_feedback": "Workout paused",
+            "workout_filter": "EMA angle smoothing + 250 ms endpoint dwell + full-range hysteresis",
         }
         self.metrics_dict.update(overrides)
 
@@ -4790,6 +4848,18 @@ class RecordingProcessor:
     def set_pose_hz(self, hz):
         self.calls.append(("set_pose_hz", hz))
         self.metrics_dict["pose_refresh_hz"] = hz
+
+    def set_workout_enabled(self, enabled):
+        self.calls.append(("set_workout_enabled", bool(enabled)))
+        self.metrics_dict["workout_enabled"] = bool(enabled)
+
+    def set_workout_exercise(self, exercise):
+        self.calls.append(("set_workout_exercise", exercise))
+        self.metrics_dict["workout_exercise"] = exercise
+
+    def reset_workout(self):
+        self.calls.append(("reset_workout",))
+        self.metrics_dict["workout_reps"] = 0
 
     def close(self):
         pass
@@ -4906,6 +4976,17 @@ class GuiStageControlTests(StagePanelTestCase):
         backend, _ = self.controlled_backend()
         backend.setStageEnabled("faces", False)
         self.assertIn("Unknown perception stage", backend.lastError)
+
+    def test_workout_controls_reach_the_live_processor(self):
+        backend, processor = self.controlled_backend()
+        backend.setWorkoutEnabled(True)
+        backend.setWorkoutExercise("curl")
+        backend.resetWorkout()
+        self.assertEqual(processor.calls, [
+            ("set_workout_enabled", True),
+            ("set_workout_exercise", "curl"),
+            ("reset_workout",),
+        ])
 
     def test_stage_control_is_refused_when_no_inference_loop_is_running(self):
         """Better to decline the click than to show a stage off while it runs."""
@@ -5198,6 +5279,11 @@ class QmlSourceTests(unittest.TestCase):
                         "vision.recordingStatus", "vision.setRecordingEnabled(",
                         "vision.audioSources", "vision.audioSourceIndex",
                         "vision.setRecordingAudioSource(",
+                        "vision.workoutExercises", "vision.workoutEnabled",
+                        "vision.workoutReps", "vision.workoutPhase",
+                        "vision.workoutAngle", "vision.workoutProgress",
+                        "vision.workoutFeedback", "vision.setWorkoutEnabled(",
+                        "vision.setWorkoutExercise(", "vision.resetWorkout()",
                         "vision.setOverlayProfile(",
                         "vision.applyOverlayStyle(", "vision.setCameraTuning(",
                         "vision.scanDroidCams()", "vision.useDroidCam(",

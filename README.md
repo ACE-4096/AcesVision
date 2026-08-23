@@ -152,6 +152,20 @@ ankles, and the rest of MediaPipe Pose's 33 landmarks. For workout form or
 posture, frame your entire body, avoid severe backlighting, and use the stage's
 refresh-rate control to balance responsiveness against inference cost.
 
+## Workout analysis
+
+Enable **Workout analysis** in the Live Session dashboard, choose Squat, Bicep
+Curl, Push-up, or Shoulder Press, and begin from the indicated rest position.
+The counter uses the visible working joints, an exponential moving-average
+angle filter, 250 ms endpoint dwell, and a complete rest → active → rest cycle.
+It is intentionally conservative: a brief shaky frame, incomplete movement,
+or occluded joint does not count as a rep. The live angle, phase, progress and
+feedback are recorded in the MP4 sidecar with the pose landmarks.
+
+This is a local range-of-motion counter, not a medical or biomechanical
+assessment. Camera angle and framing change the measured 2D angle; use it for
+consistent self-tracking and establish a baseline for each exercise.
+
 ## Enrolment and recognition
 
 Enrol a person locally:
