@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import array
+import json
 import math
 import subprocess
 import sys
@@ -17,6 +18,35 @@ def discover_audio_sources(run=None):
     """
     run = run or subprocess.run
     fallback = [{"id": "", "label": "No audio (video only)", "kind": "none"}]
+    rows = list(fallback)
+    try:
+        completed = run(["pactl", "-f", "json", "list", "sources"],
+                        capture_output=True, text=True, check=False)
+    except OSError:
+        return fallback
+    if not completed.returncode:
+        try:
+            sources = json.loads(completed.stdout)
+        except (TypeError, ValueError):
+            sources = None
+        if isinstance(sources, list):
+            for item in sources:
+                source = str(item.get("name") or "")
+                if not source:
+                    continue
+                monitor = source.endswith(".monitor")
+                description = str(item.get("description") or source)
+                rows.append({
+                    "id": source,
+                    "kind": "monitor" if monitor else "microphone",
+                    "label": ("System audio — " if monitor else "Microphone — ")
+                             + description,
+                })
+            return rows
+
+    # Older pactl versions have no structured format. Keep a readable
+    # fallback rather than hiding working microphones just because the labels
+    # cannot be polished on that host.
     try:
         completed = run(["pactl", "list", "short", "sources"],
                         capture_output=True, text=True, check=False)
@@ -24,7 +54,6 @@ def discover_audio_sources(run=None):
         return fallback
     if completed.returncode:
         return fallback
-    rows = list(fallback)
     for line in completed.stdout.splitlines():
         fields = line.split("\t")
         if len(fields) < 2 or not fields[1]:
